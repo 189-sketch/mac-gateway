@@ -550,6 +550,19 @@ const scenarioCapabilities = `
     input_schema: { type: object }
     outputs: { result: out }
     retry_if_lost: true
+  - name: test.copy
+    adapter: cli
+    command: [@TOOL@, copy, "{{workdir}}/out.bin", "{{files.source}}"]
+    env: { TOOL_NODE: @NODE@, MARKER_DIR: @MARKERS@ }
+    input_schema: { type: object }
+    input_files: [source]
+    outputs: { result: out.bin }
+  - name: test.large
+    adapter: cli
+    command: [@TOOL@, large, "{{workdir}}/out.bin", "{{input.megabytes}}"]
+    env: { TOOL_NODE: @NODE@, MARKER_DIR: @MARKERS@ }
+    input_schema: { type: object, required: [megabytes], properties: { megabytes: { type: integer } } }
+    outputs: { result: out.bin }
   - name: test.missing-output
     adapter: cli
     command: [@TOOL@, normal, "{{workdir}}/elsewhere", "1"]

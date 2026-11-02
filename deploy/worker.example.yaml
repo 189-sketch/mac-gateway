@@ -37,3 +37,21 @@ capabilities:
     # Rerunning is safe here because it only produces a file. Leave this false for
     # anything with side effects that must not happen twice.
     retry_if_lost: true
+
+  # A capability that takes a file. Uncomment it after installing ffmpeg, and use
+  # the path `which ffmpeg` prints. The agent sends the file with:
+  #   fleet run video.transcode -f source=clip.mov -o out.mp4
+  #
+  # - name: video.transcode
+  #   adapter: cli
+  #   command: [/opt/homebrew/bin/ffmpeg, -nostdin, -i, "{{files.source}}", "{{workdir}}/out.mp4"]
+  #   input_schema: { type: object }
+  #   input_files: [source]
+  #   outputs:
+  #     video: out.mp4
+  #   progress:
+  #     regex: "time=(?P<current>[0-9:.]+)"
+  #   requires:
+  #     cpu_heavy: 1
+  #   timeout: 2h
+  #   retry_if_lost: true

@@ -41,6 +41,7 @@ const (
 	CodeStartFailed       = "START_FAILED"
 	CodeTimedOut          = "TIMED_OUT"
 	CodeOutputMissing     = "OUTPUT_MISSING"
+	CodeDownloadFailed    = "DOWNLOAD_FAILED"
 	CodeUploadFailed      = "UPLOAD_FAILED"
 	CodeWorkerRestarted   = "WORKER_RESTARTED"
 	CodeUnknownCapability = "UNKNOWN_CAPABILITY"
@@ -68,6 +69,15 @@ type Capability struct {
 	Requires       map[string]int  `json:"requires,omitempty"`
 	TimeoutSeconds int64           `json:"timeout_seconds"`
 	RetryIfLost    bool            `json:"retry_if_lost"`
+	InputFiles     []string        `json:"input_files,omitempty"`
+}
+
+// InputFile is a file a worker must download before running a job.
+type InputFile struct {
+	Field  string `json:"field"`
+	Name   string `json:"name"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
 }
 
 // AttemptState is a worker's report of an attempt it still holds on disk.
@@ -106,6 +116,7 @@ type Assign struct {
 	AttemptID  string          `json:"attempt_id"`
 	Capability string          `json:"capability"`
 	Input      json.RawMessage `json:"input"`
+	Files      []InputFile     `json:"files,omitempty"`
 }
 
 // Event is one numbered, durable fact about an attempt. Seq starts at 1 for

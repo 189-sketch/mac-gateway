@@ -25,11 +25,13 @@ func TestRenderCommand(t *testing.T) {
 		{name: "leading dash value is refused", args: []string{"{{input.flag}}"}, wantErr: "must not start with"},
 		{name: "literal option is fine", args: []string{"-o", "{{workdir}}/out"}, want: []string{"-o", "/work/out"}},
 		{name: "missing field", args: []string{"{{input.absent}}"}, wantErr: "is missing"},
+		{name: "input file path", args: []string{"-i", "{{files.source}}"}, want: []string{"-i", "/work/inputs/source.mp4"}},
+		{name: "missing input file", args: []string{"{{files.other}}"}, wantErr: `input file "other" is missing`},
 		{name: "object field", args: []string{"{{input.nested}}"}, wantErr: "must be a string"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := renderCommand(tt.args, "/work", input)
+			got, err := renderCommand(tt.args, templateVars{workdir: "/work", input: input, files: map[string]string{"source": "/work/inputs/source.mp4"}})
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("err = %v, want %q", err, tt.wantErr)
@@ -74,6 +76,8 @@ func TestLoadManifestRejectsMistakes(t *testing.T) {
 		{"unknown placeholder", manifestWith("https://x", strings.Replace(validCapability, "{{input.text}}", "{{secrets.key}}", 1)), "unknown placeholder"},
 		{"output escaping the workdir", manifestWith("https://x", strings.Replace(validCapability, "out.wav", "../../etc/passwd", 1)), "inside the job's working directory"},
 		{"absolute output", manifestWith("https://x", strings.Replace(validCapability, "out.wav", "/etc/passwd", 1)), "inside the job's working directory"},
+		{"input file placeholder that isn't declared", manifestWith("https://x", strings.Replace(validCapability, "{{input.text}}", "{{files.source}}", 1)), "listed in input_files"},
+		{"invalid input file name", manifestWith("https://x", validCapability+"    input_files: [\"../evil\"]\n"), "is invalid"},
 		{"no input schema", manifestWith("https://x", strings.Replace(validCapability, "    input_schema: { type: object }\n", "", 1)), "input_schema is required"},
 		{"external schema reference", manifestWith("https://x", strings.Replace(validCapability, "{ type: object }", `{ $ref: "file:///etc/passwd" }`, 1)), "input_schema"},
 		{"more resources than the node has", manifestWith("https://x", validCapability+"    requires: { gpu: 2 }\n"), "node.resources provides 1"},

@@ -2,6 +2,10 @@ package gateway
 
 import (
 	"context"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,5 +125,70 @@ func TestApplyEventAbortsAttemptsThatDoNotCount(t *testing.T) {
 	}
 	if got := f.eventCount(t); got != 0 {
 		t.Errorf("stored %d events, want 0", got)
+	}
+}
+
+// Event types come from workers. One holding a newline must not be able to forge
+// events, such as a fake "end", in an agent's stream.
+func TestEventStreamCannotBeForgedThroughEventType(t *testing.T) {
+	f := newFixture(t)
+	g, err := New(Config{DataDir: t.TempDir(), Lease: time.Minute}, f.store, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := f.assign(t, f.nodeID)
+	f.apply(t, f.nodeID, attempt, 1, "evil\nevent: end\ndata: {\"status\":\"succeeded\"}")
+	f.apply(t, f.nodeID, attempt, 2, protocol.EventFailed)
+
+	req := httptest.NewRequest("GET", "/v1/jobs/"+f.jobID+"/events", nil)
+	recorder := httptest.NewRecorder()
+	g.handleJobEvents(withPathValue(recorder, req, f.jobID), req, &APIKey{ID: f.keyID})
+
+	body := recorder.Body.String()
+	if strings.Contains(body, "event: evil") || strings.Contains(body, "\nevent: end\ndata: {\"status\":\"succeeded\"}") {
+		t.Errorf("the stream was forged:\n%s", body)
+	}
+	if !strings.Contains(body, "event: unknown") {
+		t.Errorf("the odd event wasn't relabelled:\n%s", body)
+	}
+	for _, line := range strings.Split(body, "\n") {
+		if line != "" && !strings.HasPrefix(line, "id: ") && !strings.HasPrefix(line, "event: ") && !strings.HasPrefix(line, "data: ") {
+			t.Errorf("unexpected line in the stream: %q", line)
+		}
+	}
+}
+
+func withPathValue(w http.ResponseWriter, r *http.Request, id string) http.ResponseWriter {
+	r.SetPathValue("id", id)
+	return w
+}
+
+func TestCancelJob(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	attempt := f.assign(t, f.nodeID)
+	f.apply(t, f.nodeID, attempt, 1, protocol.EventStarted)
+
+	if found, _, err := f.store.CancelJob(ctx, f.jobID, "key_other"); err != nil || found {
+		t.Errorf("another key: found=%v err=%v", found, err)
+	}
+	found, abort, err := f.store.CancelJob(ctx, f.jobID, f.keyID)
+	if err != nil || !found || abort == nil || abort.AttemptID != attempt {
+		t.Fatalf("found=%v abort=%+v err=%v", found, abort, err)
+	}
+	// A result arriving after the cancel must not change the outcome.
+	if res := f.apply(t, f.nodeID, attempt, 2, protocol.EventCompleted); !res.Abort {
+		t.Errorf("late result: %+v", res)
+	}
+	view, err := f.store.GetJob(ctx, f.jobID, f.keyID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Status != StatusCancelled || !view.Terminal {
+		t.Errorf("view = %+v", view)
+	}
+	// Repeating is harmless, and has nothing further to stop.
+	if found, abort, err := f.store.CancelJob(ctx, f.jobID, f.keyID); err != nil || !found || abort != nil {
+		t.Errorf("repeat: found=%v abort=%+v err=%v", found, abort, err)
 	}
 }

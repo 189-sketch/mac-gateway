@@ -22,6 +22,16 @@ env)
 	env >"$out"
 	exit 0
 	;;
+copy)
+	# The third argument is an input file here.
+	cp "$steps" "$out"
+	exit 0
+	;;
+large)
+	# The third argument is a size in megabytes here.
+	head -c "$((steps * 1048576))" /dev/urandom >"$out"
+	exit 0
+	;;
 grandchild)
 	# A long-lived child in the same process group. Stopping the job must kill it.
 	sleep 300 &

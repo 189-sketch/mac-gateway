@@ -15,34 +15,35 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"mactunnel/internal/protocol"
 	"mactunnel/internal/schema"
+	"mactunnel/internal/transfer"
 )
 
 const (
-	termGrace        = 5 * time.Second
-	progressInterval = time.Second
-	logTailLines     = 20
-	maxLineBytes     = 32 << 10
-	uploadStall      = 60 * time.Second
-	maxUploadBackoff = time.Minute
+	termGrace          = 5 * time.Second
+	progressInterval   = time.Second
+	logTailLines       = 20
+	maxLineBytes       = 32 << 10
+	maxTransferBackoff = time.Minute
 )
 
 func itoa(n int) string { return strconv.Itoa(n) }
 
 // run executes one attempt from validation to its final event.
-func (w *Worker) run(ctx context.Context, a *attempt, capabilityName string, rawInput []byte) {
+func (w *Worker) run(ctx context.Context, a *attempt, assign protocol.Assign) {
 	defer close(a.done)
 
-	capability := w.manifest.byName[capabilityName]
+	rawInput := []byte(assign.Input)
+	capability := w.manifest.byName[assign.Capability]
 	if capability == nil {
-		w.fail(a, protocol.CodeUnknownCapability, "this node does not offer "+capabilityName)
+		w.fail(a, protocol.CodeUnknownCapability, "this node does not offer "+assign.Capability)
 		return
 	}
 	// The gateway checked this too, but this machine trusts only its own check.
@@ -59,12 +60,21 @@ func (w *Worker) run(ctx context.Context, a *attempt, capabilityName string, raw
 	}
 
 	work := filepath.Join(a.dir, workDir)
-	args, err := renderCommand(capability.Command[1:], work, input)
+	files, failure := w.fetchInputs(ctx, a, capability, assign.Files, work)
+	if failure != nil {
+		// A fenced or aborted attempt has nobody left to report to.
+		if ctx.Err() == nil && !a.isAborted(w) {
+			w.fail(a, failure.Code, failure.Message)
+		}
+		return
+	}
+	vars := templateVars{workdir: work, input: input, files: files}
+	args, err := renderCommand(capability.Command[1:], vars)
 	if err != nil {
 		w.fail(a, protocol.CodeInvalidInput, err.Error())
 		return
 	}
-	stdin, err := render(capability.Stdin, work, input)
+	stdin, err := render(capability.Stdin, vars)
 	if err != nil {
 		w.fail(a, protocol.CodeInvalidInput, err.Error())
 		return
@@ -289,7 +299,10 @@ func (w *Worker) deliverOutputs(ctx context.Context, a *attempt, c *Capability, 
 			return
 		}
 		w.emit(a, protocol.EventProgress, protocol.Progress{Stage: "uploading", Message: ref.Name})
-		if err := w.uploadWithRetry(ctx, a, root, rel, ref); err != nil {
+		err = w.retryTransfer(ctx, a, ref.Name, func() error {
+			return w.uploadOnce(ctx, a, root, rel, ref)
+		})
+		if err != nil {
 			if !errors.Is(err, errAttemptFenced) && ctx.Err() == nil {
 				w.fail(a, protocol.CodeUploadFailed, err.Error())
 			}
@@ -325,27 +338,30 @@ func inspectOutput(root *os.Root, rel, artifactName string) (protocol.ArtifactRe
 
 var errAttemptFenced = errors.New("attempt was fenced by the gateway")
 
-type uploadError struct {
-	permanent bool
-	message   string
+// transferError marks a failure that retrying can't fix.
+type transferError struct {
+	message string
 }
 
-func (e *uploadError) Error() string { return e.message }
+func (e *transferError) Error() string { return e.message }
 
-func (w *Worker) uploadWithRetry(ctx context.Context, a *attempt, root *os.Root, rel string, ref protocol.ArtifactRef) error {
+// retryTransfer repeats a file transfer until it succeeds, can't succeed, or runs
+// out the retry window. Home connections drop often, so a transfer may wait out
+// a long outage rather than throw away a finished job's work.
+func (w *Worker) retryTransfer(ctx context.Context, a *attempt, what string, transfer func() error) error {
 	deadline := time.Now().Add(w.manifest.uploadWindow)
 	backoff := time.Second
 	for {
-		err := w.uploadOnce(ctx, a, root, rel, ref)
+		err := transfer()
 		if err == nil {
 			return nil
 		}
 		if errors.Is(err, errAttemptFenced) {
-			w.abortAttempt(a.meta.AttemptID, "gateway refused the upload")
+			w.abortAttempt(a.meta.AttemptID, "gateway refused the transfer")
 			return err
 		}
-		var upload *uploadError
-		if errors.As(err, &upload) && upload.permanent {
+		var permanent *transferError
+		if errors.As(err, &permanent) {
 			return err
 		}
 		if ctx.Err() != nil {
@@ -354,40 +370,103 @@ func (w *Worker) uploadWithRetry(ctx context.Context, a *attempt, root *os.Root,
 		if time.Now().After(deadline) {
 			return fmt.Errorf("gave up after %s: %w", w.manifest.uploadWindow, err)
 		}
-		w.log.Warn("upload failed, will retry", "attempt", a.meta.AttemptID, "artifact", ref.Name, "error", err)
+		w.log.Warn("transfer failed, will retry", "attempt", a.meta.AttemptID, "file", what, "error", err)
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-		backoff = min(backoff*2, maxUploadBackoff)
+		backoff = min(backoff*2, maxTransferBackoff)
 	}
 }
 
+func (w *Worker) artifactURL(a *attempt, name string) string {
+	return fmt.Sprintf("%s/v1/worker/attempts/%s/artifacts/%s", w.manifest.GatewayURL, url.PathEscape(a.meta.AttemptID), url.PathEscape(name))
+}
+
+func (w *Worker) newUploadRequest(ctx context.Context, method, target string, body io.Reader, ref protocol.ArtifactRef) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, target, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+w.token)
+	req.Header.Set("X-Content-SHA256", ref.SHA256)
+	return req, nil
+}
+
+// uploadPosition asks the gateway how much of a file it already has.
+func (w *Worker) uploadPosition(ctx context.Context, a *attempt, ref protocol.ArtifactRef) (offset int64, complete bool, err error) {
+	statusCtx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	req, err := w.newUploadRequest(statusCtx, http.MethodHead, w.artifactURL(a, ref.Name), nil, ref)
+	if err != nil {
+		return 0, false, &transferError{message: err.Error()}
+	}
+	resp, err := w.httpClient.Do(req)
+	if err != nil {
+		return 0, false, err
+	}
+	resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusGone:
+		return 0, false, errAttemptFenced
+	default:
+		return 0, false, fmt.Errorf("gateway returned %d for the upload status", resp.StatusCode)
+	}
+	if resp.Header.Get("Upload-Complete") == "true" {
+		return 0, true, nil
+	}
+	offset, err = strconv.ParseInt(resp.Header.Get("Upload-Offset"), 10, 64)
+	if err != nil || offset < 0 || offset > ref.Size {
+		// Nothing useful on the gateway's side matches this file, so start over.
+		return 0, false, nil
+	}
+	return offset, false, nil
+}
+
 func (w *Worker) uploadOnce(ctx context.Context, a *attempt, root *os.Root, rel string, ref protocol.ArtifactRef) error {
+	offset, complete, err := w.uploadPosition(ctx, a, ref)
+	if err != nil {
+		return err
+	}
+	if complete {
+		return nil
+	}
+	if offset > 0 {
+		w.log.Info("resuming upload", "attempt", a.meta.AttemptID, "artifact", ref.Name, "offset", offset, "size", ref.Size)
+	}
+
 	file, err := root.Open(rel)
 	if err != nil {
-		return &uploadError{permanent: true, message: err.Error()}
+		return &transferError{message: err.Error()}
 	}
 	// The HTTP transport closes the file when it finishes with the body.
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		file.Close()
+		return &transferError{message: err.Error()}
+	}
 
 	uploadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	body := &stallReader{reader: file, closer: file}
-	body.touch()
-	stop := watchStall(uploadCtx, body, cancel)
+	body := &transfer.StallReader{Reader: file, Closer: file}
+	stop := transfer.WatchStall(uploadCtx, body, cancel)
 	defer stop()
 
-	target := fmt.Sprintf("%s/v1/worker/attempts/%s/artifacts/%s", w.manifest.GatewayURL, url.PathEscape(a.meta.AttemptID), url.PathEscape(ref.Name))
-	req, err := http.NewRequestWithContext(uploadCtx, http.MethodPut, target, body)
+	req, err := w.newUploadRequest(uploadCtx, http.MethodPut, w.artifactURL(a, ref.Name), body, ref)
 	if err != nil {
 		file.Close()
-		return &uploadError{permanent: true, message: err.Error()}
+		return &transferError{message: err.Error()}
 	}
-	req.ContentLength = ref.Size
-	req.Header.Set("Authorization", "Bearer "+w.token)
+	req.ContentLength = ref.Size - offset
+	if req.ContentLength == 0 {
+		// A nil-length body would otherwise be sent as chunked.
+		body.Close()
+		req.Body = http.NoBody
+	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Content-SHA256", ref.SHA256)
+	req.Header.Set("Upload-Offset", strconv.FormatInt(offset, 10))
+	req.Header.Set("Upload-Length", strconv.FormatInt(ref.Size, 10))
 
 	resp, err := w.httpClient.Do(req)
 	if err != nil {
@@ -401,57 +480,76 @@ func (w *Worker) uploadOnce(ctx context.Context, a *attempt, root *os.Root, rel 
 	case resp.StatusCode == http.StatusGone:
 		return errAttemptFenced
 	case resp.StatusCode == http.StatusInsufficientStorage, resp.StatusCode == http.StatusRequestEntityTooLarge:
-		return &uploadError{permanent: true, message: fmt.Sprintf("gateway refused the upload: %s", message)}
+		return &transferError{message: fmt.Sprintf("gateway refused the upload: %s", message)}
 	default:
 		return fmt.Errorf("gateway returned %d: %s", resp.StatusCode, message)
 	}
 }
 
-// stallReader records when the network last accepted data. A total timeout
-// wouldn't work, because a large video can legitimately take hours to upload.
-type stallReader struct {
-	reader io.Reader
-	closer io.Closer
-	lastNS atomic.Int64
-	done   atomic.Bool
-}
+// --- Input files ---
 
-func (s *stallReader) touch() { s.lastNS.Store(time.Now().UnixNano()) }
+var inputExtRE = regexp.MustCompile(`^\.[A-Za-z0-9]{1,16}$`)
 
-func (s *stallReader) Read(p []byte) (int, error) {
-	n, err := s.reader.Read(p)
-	s.touch()
-	if err != nil {
-		s.done.Store(true)
+// fetchInputs downloads a job's input files and returns their local paths. Local
+// names come from the manifest's field name plus a checked extension, so an
+// uploaded file's name can't influence the path beyond that.
+func (w *Worker) fetchInputs(ctx context.Context, a *attempt, c *Capability, files []protocol.InputFile, work string) (map[string]string, *protocol.Failure) {
+	paths := make(map[string]string, len(files))
+	if len(files) == 0 && len(c.InputFiles) == 0 {
+		return paths, nil
 	}
-	return n, err
-}
-
-func (s *stallReader) Close() error {
-	s.done.Store(true)
-	return s.closer.Close()
-}
-
-// watchStall cancels the upload if no data moves for uploadStall. Once the body
-// is fully read, the transport's response timeout takes over.
-func watchStall(ctx context.Context, body *stallReader, cancel context.CancelFunc) (stop func()) {
-	stopped := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stopped:
-				return
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if !body.done.Load() && time.Since(time.Unix(0, body.lastNS.Load())) > uploadStall {
-					cancel()
-					return
-				}
-			}
+	byField := make(map[string]protocol.InputFile, len(files))
+	for _, f := range files {
+		byField[f.Field] = f
+	}
+	if len(byField) != len(c.InputFiles) {
+		return nil, &protocol.Failure{Code: protocol.CodeInvalidInput, Message: "the job's input files don't match this capability"}
+	}
+	dir := filepath.Join(work, "inputs")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, &protocol.Failure{Code: protocol.CodeDownloadFailed, Message: err.Error()}
+	}
+	for _, field := range c.InputFiles {
+		f, ok := byField[field]
+		if !ok {
+			return nil, &protocol.Failure{Code: protocol.CodeInvalidInput, Message: fmt.Sprintf("input file %q is missing", field)}
 		}
-	}()
-	return func() { close(stopped) }
+		name := field
+		if ext := filepath.Ext(f.Name); inputExtRE.MatchString(ext) {
+			name += ext
+		}
+		dest := filepath.Join(dir, name)
+		w.emit(a, protocol.EventProgress, protocol.Progress{Stage: "downloading", Message: field})
+		err := w.retryTransfer(ctx, a, field, func() error {
+			return w.downloadOnce(ctx, a, f, dest)
+		})
+		if err != nil {
+			return nil, &protocol.Failure{Code: protocol.CodeDownloadFailed, Message: err.Error()}
+		}
+		paths[field] = dest
+	}
+	return paths, nil
+}
+
+func (w *Worker) downloadOnce(ctx context.Context, a *attempt, f protocol.InputFile, dest string) error {
+	err := transfer.Download(ctx, w.httpClient, transfer.DownloadRequest{
+		URL:    fmt.Sprintf("%s/v1/worker/attempts/%s/files/%s", w.manifest.GatewayURL, url.PathEscape(a.meta.AttemptID), url.PathEscape(f.Field)),
+		Token:  w.token,
+		Dest:   dest,
+		Size:   f.Size,
+		SHA256: f.SHA256,
+		OnResume: func(offset int64) {
+			w.log.Info("resuming download", "attempt", a.meta.AttemptID, "file", f.Field, "offset", offset, "size", f.Size)
+		},
+	})
+	var status *transfer.StatusError
+	if errors.As(err, &status) {
+		switch status.Code {
+		case http.StatusGone:
+			return errAttemptFenced
+		case http.StatusNotFound:
+			return &transferError{message: "the gateway no longer has this input file"}
+		}
+	}
+	return err
 }

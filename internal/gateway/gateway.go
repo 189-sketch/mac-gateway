@@ -65,11 +65,14 @@ type Gateway struct {
 
 	mu    sync.Mutex
 	conns map[string]*nodeConn
+
+	uploadsMu sync.Mutex
+	uploads   map[string]*uploadSlot
 }
 
 // New creates a gateway and prepares its data directories.
 func New(cfg Config, store *Store, log *slog.Logger) (*Gateway, error) {
-	for _, dir := range []string{cfg.filesDir(), cfg.tmpDir()} {
+	for _, dir := range []string{cfg.filesDir(), cfg.tmpDir(), cfg.partialDir()} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("create %s: %w", dir, err)
 		}
@@ -81,11 +84,12 @@ func New(cfg Config, store *Store, log *slog.Logger) (*Gateway, error) {
 		}
 	}
 	return &Gateway{
-		cfg:   cfg,
-		store: store,
-		log:   log,
-		wake:  make(chan struct{}, 1),
-		conns: map[string]*nodeConn{},
+		cfg:     cfg,
+		store:   store,
+		log:     log,
+		wake:    make(chan struct{}, 1),
+		conns:   map[string]*nodeConn{},
+		uploads: map[string]*uploadSlot{},
 		policy: RetryPolicy{
 			Lease:         cfg.Lease,
 			LostGrace:     cfg.LostGrace,
@@ -97,6 +101,10 @@ func New(cfg Config, store *Store, log *slog.Logger) (*Gateway, error) {
 
 func (c Config) filesDir() string { return filepath.Join(c.DataDir, "files") }
 func (c Config) tmpDir() string   { return filepath.Join(c.DataDir, "tmp") }
+
+// partialDir holds interrupted uploads, which survive a gateway restart so that
+// workers can continue them.
+func (c Config) partialDir() string { return filepath.Join(c.DataDir, "partial") }
 
 // Run serves until ctx is cancelled.
 func (g *Gateway) Run(ctx context.Context) error {
@@ -184,6 +192,12 @@ func (g *Gateway) maintain(ctx context.Context) {
 	if err != nil {
 		g.logError(ctx, "remove artifacts", err)
 	}
+	deadInputs, err := g.store.RemoveDeadInputFiles(ctx)
+	if err != nil {
+		g.logError(ctx, "remove input files", err)
+	}
+	dead = append(dead, deadInputs...)
+	g.removeStalePartials()
 	for _, id := range dead {
 		if err := os.Remove(filepath.Join(g.cfg.filesDir(), id)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			g.log.Warn("could not delete artifact file", "file", id, "error", err)
@@ -246,6 +260,11 @@ func (g *Gateway) schedule(ctx context.Context) {
 		if offer == nil {
 			continue
 		}
+		files, err := g.store.JobInputFiles(ctx, job.ID)
+		if err != nil {
+			g.logError(ctx, "list input files", err)
+			continue
+		}
 		attemptID, previous, ok, err := g.store.CreateAttempt(ctx, job, *offer, g.policy)
 		if err != nil {
 			g.logError(ctx, "create attempt", err)
@@ -271,6 +290,7 @@ func (g *Gateway) schedule(ctx context.Context) {
 			AttemptID:  attemptID,
 			Capability: job.Capability,
 			Input:      json.RawMessage(job.Input),
+			Files:      files,
 		})
 		g.log.Info("job assigned", "job", job.ID, "attempt", attemptID, "node", offer.NodeName)
 	}
@@ -383,6 +403,11 @@ func validateHello(h protocol.Hello, node *Node) error {
 		}
 		if _, err := schema.Compile(c.InputSchema); err != nil {
 			return fmt.Errorf("capability %s: %w", c.Name, err)
+		}
+		for _, field := range c.InputFiles {
+			if !inputFieldName.MatchString(field) {
+				return fmt.Errorf("capability %s: invalid input file name %q", c.Name, field)
+			}
 		}
 	}
 	return nil

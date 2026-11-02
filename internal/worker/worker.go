@@ -432,7 +432,7 @@ func (w *Worker) startAttempt(assign protocol.Assign) {
 		return
 	}
 	w.log.Info("attempt started", "job", assign.JobID, "attempt", assign.AttemptID, "capability", assign.Capability)
-	go w.run(ctx, a, assign.Capability, assign.Input)
+	go w.run(ctx, a, assign)
 }
 
 func prepareAttemptDir(a *attempt) error {
@@ -461,6 +461,12 @@ func (w *Worker) recordProcess(a *attempt, pid int) {
 	if err := writeMeta(a.dir, meta); err != nil {
 		w.log.Warn("could not record process", "attempt", meta.AttemptID, "error", err)
 	}
+}
+
+func (a *attempt) isAborted(w *Worker) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return a.aborted
 }
 
 func (w *Worker) forgetProcess(a *attempt) {

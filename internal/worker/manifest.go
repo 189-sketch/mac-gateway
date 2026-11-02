@@ -29,6 +29,7 @@ var (
 	outputNameRE     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 	placeholderRE    = regexp.MustCompile(`\{\{\s*([A-Za-z0-9_.]+)\s*\}\}`)
 	inputVarRE       = regexp.MustCompile(`^input\.[A-Za-z0-9_]+$`)
+	inputFileRE      = regexp.MustCompile(`^[A-Za-z0-9_]{1,64}$`)
 )
 
 // Manifest is the worker's local configuration. It is the only place that says
@@ -68,6 +69,7 @@ type Capability struct {
 	Stdin       string            `yaml:"stdin"`
 	Env         map[string]string `yaml:"env"`
 	InputSchema map[string]any    `yaml:"input_schema"`
+	InputFiles  []string          `yaml:"input_files"`
 	Outputs     map[string]string `yaml:"outputs"`
 	Progress    *ProgressConfig   `yaml:"progress"`
 	Requires    map[string]int    `yaml:"requires"`
@@ -196,12 +198,22 @@ func (c *Capability) validate(resources map[string]int) error {
 	if c.executable, err = filepath.Abs(executable); err != nil {
 		return err
 	}
+	seenFiles := make(map[string]bool, len(c.InputFiles))
+	for _, field := range c.InputFiles {
+		if !inputFileRE.MatchString(field) {
+			return fmt.Errorf("input file name %q is invalid", field)
+		}
+		if seenFiles[field] {
+			return fmt.Errorf("input file %q is declared twice", field)
+		}
+		seenFiles[field] = true
+	}
 	for _, arg := range c.Command[1:] {
-		if err := checkPlaceholders(arg); err != nil {
+		if err := checkPlaceholders(arg, seenFiles); err != nil {
 			return err
 		}
 	}
-	if err := checkPlaceholders(c.Stdin); err != nil {
+	if err := checkPlaceholders(c.Stdin, seenFiles); err != nil {
 		return err
 	}
 
@@ -251,25 +263,45 @@ func (c *Capability) validate(resources map[string]int) error {
 	return nil
 }
 
-func checkPlaceholders(tpl string) error {
+func checkPlaceholders(tpl string, files map[string]bool) error {
 	for _, match := range placeholderRE.FindAllStringSubmatch(tpl, -1) {
+		if field, isFile := strings.CutPrefix(match[1], "files."); isFile {
+			if !files[field] {
+				return fmt.Errorf("placeholder %q needs %q listed in input_files", match[0], field)
+			}
+			continue
+		}
 		if match[1] != "workdir" && !inputVarRE.MatchString(match[1]) {
-			return fmt.Errorf("unknown placeholder %q (use {{workdir}} or {{input.field}})", match[0])
+			return fmt.Errorf("unknown placeholder %q (use {{workdir}}, {{input.field}} or {{files.field}})", match[0])
 		}
 	}
 	return nil
 }
 
+// templateVars holds the values placeholders can refer to.
+type templateVars struct {
+	workdir string
+	input   map[string]any
+	files   map[string]string // Input file field to its local path.
+}
+
 // render fills a template in one pass, so placeholder syntax inside a value is
 // never expanded again.
-func render(tpl, workdir string, input map[string]any) (string, error) {
+func render(tpl string, vars templateVars) (string, error) {
 	var firstErr error
 	out := placeholderRE.ReplaceAllStringFunc(tpl, func(match string) string {
 		name := placeholderRE.FindStringSubmatch(match)[1]
 		if name == "workdir" {
-			return workdir
+			return vars.workdir
 		}
-		value, err := inputText(strings.TrimPrefix(name, "input."), input)
+		if field, isFile := strings.CutPrefix(name, "files."); isFile {
+			path, ok := vars.files[field]
+			if !ok && firstErr == nil {
+				firstErr = fmt.Errorf("input file %q is missing", field)
+			}
+			return path
+		}
+		value, err := inputText(strings.TrimPrefix(name, "input."), vars.input)
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -297,15 +329,15 @@ func inputText(field string, input map[string]any) (string, error) {
 
 // renderCommand builds argv. A value starting with '-' in the leading position
 // of an argument is refused, because the program would read it as an option.
-func renderCommand(args []string, workdir string, input map[string]any) ([]string, error) {
+func renderCommand(args []string, vars templateVars) ([]string, error) {
 	out := make([]string, 0, len(args))
 	for _, arg := range args {
-		rendered, err := render(arg, workdir, input)
+		rendered, err := render(arg, vars)
 		if err != nil {
 			return nil, err
 		}
 		if strings.HasPrefix(rendered, "-") {
-			if loc := placeholderRE.FindStringSubmatchIndex(arg); loc != nil && loc[0] == 0 && arg[loc[2]:loc[3]] != "workdir" {
+			if loc := placeholderRE.FindStringSubmatchIndex(arg); loc != nil && loc[0] == 0 && strings.HasPrefix(arg[loc[2]:loc[3]], "input.") {
 				return nil, fmt.Errorf("the value for argument %q must not start with '-'", arg)
 			}
 		}
@@ -325,6 +357,7 @@ func (m *Manifest) protocolCapabilities() []protocol.Capability {
 			Requires:       c.Requires,
 			TimeoutSeconds: int64(c.timeout.Seconds()),
 			RetryIfLost:    c.RetryIfLost,
+			InputFiles:     c.InputFiles,
 		})
 	}
 	return out

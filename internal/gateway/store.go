@@ -27,6 +27,7 @@ const (
 	StatusSucceeded = "succeeded"
 	StatusFailed    = "failed"
 	StatusTimedOut  = "timed_out"
+	StatusCancelled = "cancelled"
 )
 
 // Attempt statuses.
@@ -130,6 +131,22 @@ CREATE TABLE IF NOT EXISTS artifacts (
 	UNIQUE (attempt_id, name)
 );
 CREATE INDEX IF NOT EXISTS artifacts_expiry ON artifacts(expires_ms);
+CREATE TABLE IF NOT EXISTS input_files (
+	id TEXT PRIMARY KEY,
+	api_key_id TEXT NOT NULL REFERENCES api_keys(id),
+	name TEXT NOT NULL,
+	sha256 TEXT NOT NULL,
+	size INTEGER NOT NULL,
+	expires_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS input_files_expiry ON input_files(expires_ms);
+CREATE TABLE IF NOT EXISTS job_files (
+	job_id TEXT NOT NULL REFERENCES jobs(id),
+	field TEXT NOT NULL,
+	file_id TEXT NOT NULL,
+	PRIMARY KEY (job_id, field)
+);
+CREATE INDEX IF NOT EXISTS job_files_file ON job_files(file_id);
 `
 
 // Store is the gateway's SQLite persistence layer. It uses a single database
@@ -155,6 +172,10 @@ func OpenStore(dataDir string) (*Store, error) {
 	if _, err := db.Exec(schemaSQL); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
+	}
+	if err := ensureColumn(db, "capabilities", "input_files", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("upgrade schema: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -313,8 +334,12 @@ func (s *Store) RegisterNode(ctx context.Context, nodeID string, h protocol.Hell
 			if err != nil {
 				return err
 			}
-			if _, err := tx.Exec(`INSERT INTO capabilities (node_id, name, input_schema, requires, timeout_seconds, retry_if_lost) VALUES (?,?,?,?,?,?)`,
-				nodeID, c.Name, string(c.InputSchema), string(requires), c.TimeoutSeconds, boolInt(c.RetryIfLost)); err != nil {
+			inputFiles, err := json.Marshal(orEmptySlice(c.InputFiles))
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`INSERT INTO capabilities (node_id, name, input_schema, requires, timeout_seconds, retry_if_lost, input_files) VALUES (?,?,?,?,?,?,?)`,
+				nodeID, c.Name, string(c.InputSchema), string(requires), c.TimeoutSeconds, boolInt(c.RetryIfLost), string(inputFiles)); err != nil {
 				return err
 			}
 		}
@@ -334,12 +359,13 @@ type CapabilityRow struct {
 	Labels         map[string]string
 	Resources      map[string]int
 	MaxJobs        int
+	InputFiles     []string
 }
 
 // CapabilityRows lists capabilities for active nodes. An empty name lists all.
 func (s *Store) CapabilityRows(ctx context.Context, name string) ([]CapabilityRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT c.node_id, n.name, c.name, c.input_schema, c.requires, c.timeout_seconds, c.retry_if_lost, n.labels, n.resources, n.max_jobs
+		SELECT c.node_id, n.name, c.name, c.input_schema, c.requires, c.timeout_seconds, c.retry_if_lost, n.labels, n.resources, n.max_jobs, c.input_files
 		FROM capabilities c JOIN nodes n ON n.id = c.node_id
 		WHERE n.revoked_ms IS NULL AND (? = '' OR c.name = ?)
 		ORDER BY c.name, n.name`, name, name)
@@ -350,16 +376,16 @@ func (s *Store) CapabilityRows(ctx context.Context, name string) ([]CapabilityRo
 	var out []CapabilityRow
 	for rows.Next() {
 		var c CapabilityRow
-		var requires, labels, resources string
+		var requires, labels, resources, inputFiles string
 		var retry int
-		if err := rows.Scan(&c.NodeID, &c.NodeName, &c.Name, &c.InputSchema, &requires, &c.TimeoutSeconds, &retry, &labels, &resources, &c.MaxJobs); err != nil {
+		if err := rows.Scan(&c.NodeID, &c.NodeName, &c.Name, &c.InputSchema, &requires, &c.TimeoutSeconds, &retry, &labels, &resources, &c.MaxJobs, &inputFiles); err != nil {
 			return nil, err
 		}
 		c.RetryIfLost = retry != 0
 		for _, field := range []struct {
 			raw string
 			dst any
-		}{{requires, &c.Requires}, {labels, &c.Labels}, {resources, &c.Resources}} {
+		}{{requires, &c.Requires}, {labels, &c.Labels}, {resources, &c.Resources}, {inputFiles, &c.InputFiles}} {
 			if err := json.Unmarshal([]byte(field.raw), field.dst); err != nil {
 				return nil, err
 			}
@@ -380,6 +406,7 @@ type NewJob struct {
 	IdempotencyKey string
 	RequestHash    string
 	QueueTimeout   time.Duration
+	Files          map[string]string // Input field name to file ID.
 }
 
 // ErrIdempotencyConflict means a key was reused for a different request.
@@ -414,7 +441,10 @@ func (s *Store) CreateJob(ctx context.Context, j NewJob) (id string, created boo
 			VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 			id, j.APIKeyID, j.Capability, j.Input, j.Selector, key, j.RequestHash, StatusQueued,
 			j.QueueTimeout.Milliseconds(), now+j.QueueTimeout.Milliseconds(), now)
-		return err
+		if err != nil {
+			return err
+		}
+		return checkAndAttachFiles(tx, j, id)
 	})
 	return id, created, err
 }
@@ -438,6 +468,7 @@ type ArtifactView struct {
 
 // EventView is the agent-facing description of a job event.
 type EventView struct {
+	ID      int64           `json:"id"`
 	Attempt string          `json:"attempt_id"`
 	Seq     int64           `json:"seq"`
 	Type    string          `json:"type"`
@@ -463,7 +494,7 @@ type JobView struct {
 }
 
 func isTerminal(status string) bool {
-	return status == StatusSucceeded || status == StatusFailed || status == StatusTimedOut
+	return status == StatusSucceeded || status == StatusFailed || status == StatusTimedOut || status == StatusCancelled
 }
 
 func formatMS(ms int64) string {
@@ -512,7 +543,7 @@ func (s *Store) GetJob(ctx context.Context, jobID, apiKeyID string, withEvents b
 		}
 	}
 	if withEvents {
-		if v.Events, err = s.jobEvents(ctx, jobID); err != nil {
+		if v.Events, err = s.JobEventsAfter(ctx, jobID, 0); err != nil {
 			return nil, err
 		}
 	}
@@ -542,36 +573,20 @@ func (s *Store) jobArtifacts(ctx context.Context, jobID string) ([]ArtifactView,
 	return out, rows.Err()
 }
 
-func (s *Store) jobEvents(ctx context.Context, jobID string) ([]EventView, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT attempt_id, seq, type, payload, created_ms FROM job_events WHERE job_id=? ORDER BY created_ms, attempt_id, seq`, jobID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []EventView
-	for rows.Next() {
-		var e EventView
-		var payload sql.NullString
-		var at int64
-		if err := rows.Scan(&e.Attempt, &e.Seq, &e.Type, &payload, &at); err != nil {
-			return nil, err
-		}
-		if payload.Valid {
-			e.Payload = json.RawMessage(payload.String)
-		}
-		e.At = formatMS(at)
-		out = append(out, e)
-	}
-	return out, rows.Err()
-}
-
 // isRetryable says whether an agent can reasonably resubmit after this error.
 func isRetryable(code string) bool {
 	switch code {
-	case CodeNodeLost, CodeNoNodeOnline, CodeQueueTimeout, CodeDeadline, protocol.CodeWorkerRestarted, protocol.CodeUploadFailed:
+	case CodeNodeLost, CodeNoNodeOnline, CodeQueueTimeout, CodeDeadline, protocol.CodeWorkerRestarted, protocol.CodeUploadFailed, protocol.CodeDownloadFailed:
 		return true
 	}
 	return false
+}
+
+func orEmptySlice(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }
 
 func boolInt(b bool) int {

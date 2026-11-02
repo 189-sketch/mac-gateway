@@ -14,12 +14,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 )
 
-var gatewayBin, workerBin, fakeTool string
+var gatewayBin, workerBin, fleetBin, fakeTool string
 
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "fleet-e2e-bin")
@@ -29,7 +30,8 @@ func TestMain(m *testing.M) {
 	defer os.RemoveAll(dir)
 	gatewayBin = filepath.Join(dir, "fleet-gateway")
 	workerBin = filepath.Join(dir, "fleet-worker")
-	for bin, pkg := range map[string]string{gatewayBin: "mactunnel/cmd/fleet-gateway", workerBin: "mactunnel/cmd/fleet-worker"} {
+	fleetBin = filepath.Join(dir, "fleet")
+	for bin, pkg := range map[string]string{gatewayBin: "mactunnel/cmd/fleet-gateway", workerBin: "mactunnel/cmd/fleet-worker", fleetBin: "mactunnel/cmd/fleet"} {
 		if out, err := exec.Command("go", "build", "-o", bin, pkg).CombinedOutput(); err != nil {
 			panic(fmt.Sprintf("build %s: %v\n%s", pkg, err, out))
 		}
@@ -145,6 +147,9 @@ type proxy struct {
 	mu       sync.Mutex
 	down     bool
 	conns    map[net.Conn]bool
+	// bytesPerSecond limits each direction of each connection when above zero, so
+	// that a cut can land in the middle of a transfer.
+	bytesPerSecond atomic.Int64
 }
 
 func (h *harness) newProxy() *proxy {
@@ -188,9 +193,23 @@ func (p *proxy) serve() {
 }
 
 func (p *proxy) pipe(dst, src net.Conn) {
-	io.Copy(dst, src)
-	dst.Close()
-	src.Close()
+	defer dst.Close()
+	defer src.Close()
+	buf := make([]byte, 16<<10)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+				return
+			}
+			if limit := p.bytesPerSecond.Load(); limit > 0 {
+				time.Sleep(time.Duration(n) * time.Second / time.Duration(limit))
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 // cut drops every connection and refuses new ones until restore.
@@ -350,6 +369,7 @@ type jobError struct {
 }
 
 type jobEvent struct {
+	ID      int64           `json:"id"`
 	Attempt string          `json:"attempt_id"`
 	Seq     int64           `json:"seq"`
 	Type    string          `json:"type"`

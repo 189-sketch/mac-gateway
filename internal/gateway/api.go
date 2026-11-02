@@ -12,8 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path"
-	"path/filepath"
-	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -37,9 +36,14 @@ func (g *Gateway) routes() http.Handler {
 	mux.HandleFunc("GET /v1/capabilities", g.withKey(g.handleCapabilities))
 	mux.HandleFunc("POST /v1/jobs", g.withKey(g.handleCreateJob))
 	mux.HandleFunc("GET /v1/jobs/{id}", g.withKey(g.handleGetJob))
+	mux.HandleFunc("GET /v1/jobs/{id}/events", g.withKey(g.handleJobEvents))
+	mux.HandleFunc("POST /v1/jobs/{id}/cancel", g.withKey(g.handleCancelJob))
+	mux.HandleFunc("POST /v1/files", g.withKey(g.handleCreateFile))
 	mux.HandleFunc("GET /v1/files/{id}", g.withKey(g.handleGetFile))
 	mux.HandleFunc("GET /v1/worker/connect", g.handleWorkerConnect)
 	mux.HandleFunc("PUT /v1/worker/attempts/{attempt}/artifacts/{name}", g.handleUploadArtifact)
+	mux.HandleFunc("HEAD /v1/worker/attempts/{attempt}/artifacts/{name}", g.handleUploadStatus)
+	mux.HandleFunc("GET /v1/worker/attempts/{attempt}/files/{field}", g.handleWorkerFile)
 	return mux
 }
 
@@ -110,6 +114,7 @@ func keyAllows(key *APIKey, capability string) bool {
 type capabilityView struct {
 	Name        string          `json:"name"`
 	InputSchema json.RawMessage `json:"input_schema"`
+	InputFiles  []string        `json:"input_files"`
 	Nodes       []nodeOffer     `json:"nodes"`
 	OnlineNodes int             `json:"online_nodes"`
 }
@@ -133,7 +138,7 @@ func (g *Gateway) handleCapabilities(w http.ResponseWriter, r *http.Request, key
 			continue
 		}
 		if len(views) == 0 || views[len(views)-1].Name != row.Name {
-			views = append(views, capabilityView{Name: row.Name, InputSchema: json.RawMessage(row.InputSchema), Nodes: []nodeOffer{}})
+			views = append(views, capabilityView{Name: row.Name, InputSchema: json.RawMessage(row.InputSchema), InputFiles: orEmptySlice(row.InputFiles), Nodes: []nodeOffer{}})
 		}
 		view := &views[len(views)-1]
 		isOnline := online.ids[row.NodeID]
@@ -151,6 +156,7 @@ type createJobRequest struct {
 	IdempotencyKey string            `json:"idempotency_key"`
 	QueueTimeout   string            `json:"queue_timeout"`
 	Selector       map[string]string `json:"selector"`
+	Files          map[string]string `json:"files"`
 }
 
 func (g *Gateway) handleCreateJob(w http.ResponseWriter, r *http.Request, key *APIKey) {
@@ -199,7 +205,7 @@ func (g *Gateway) handleCreateJob(w http.ResponseWriter, r *http.Request, key *A
 		writeError(w, http.StatusNotFound, "UNKNOWN_CAPABILITY", "no node has registered "+req.Capability, false)
 		return
 	}
-	if status, code, message := checkOffers(offers, req.Selector, input); code != "" {
+	if status, code, message := checkOffers(offers, req.Selector, input, req.Files); code != "" {
 		writeError(w, status, code, message, false)
 		return
 	}
@@ -209,8 +215,13 @@ func (g *Gateway) handleCreateJob(w http.ResponseWriter, r *http.Request, key *A
 		g.internalError(w, r, "encode selector", err)
 		return
 	}
+	files, err := json.Marshal(orEmpty(req.Files)) // Sorted by key, so it's stable.
+	if err != nil {
+		g.internalError(w, r, "encode files", err)
+		return
+	}
 	hash := sha256.New()
-	fmt.Fprintf(hash, "%s\x00%s\x00%s", req.Capability, input, selector)
+	fmt.Fprintf(hash, "%s\x00%s\x00%s\x00%s", req.Capability, input, selector, files)
 
 	id, created, err := g.store.CreateJob(r.Context(), NewJob{
 		APIKeyID:       key.ID,
@@ -220,7 +231,12 @@ func (g *Gateway) handleCreateJob(w http.ResponseWriter, r *http.Request, key *A
 		IdempotencyKey: req.IdempotencyKey,
 		RequestHash:    hex.EncodeToString(hash.Sum(nil)),
 		QueueTimeout:   queueTimeout,
+		Files:          req.Files,
 	})
+	if errors.Is(err, ErrFileUnavailable) {
+		writeError(w, http.StatusUnprocessableEntity, "FILE_UNAVAILABLE", err.Error(), false)
+		return
+	}
 	if errors.Is(err, ErrIdempotencyConflict) {
 		writeError(w, http.StatusConflict, "IDEMPOTENCY_CONFLICT", err.Error(), false)
 		return
@@ -243,7 +259,7 @@ func (g *Gateway) handleCreateJob(w http.ResponseWriter, r *http.Request, key *A
 }
 
 // checkOffers confirms at least one node could run this request.
-func checkOffers(offers []CapabilityRow, selector map[string]string, input []byte) (status int, code, message string) {
+func checkOffers(offers []CapabilityRow, selector map[string]string, input []byte, files map[string]string) (status int, code, message string) {
 	var inputErr error
 	matched := false
 	for _, offer := range offers {
@@ -260,12 +276,31 @@ func checkOffers(offers []CapabilityRow, selector map[string]string, input []byt
 			inputErr = err
 			continue
 		}
+		if err := checkFileFields(offer.InputFiles, files); err != nil {
+			inputErr = err
+			continue
+		}
 		return 0, "", ""
 	}
 	if !matched {
 		return http.StatusUnprocessableEntity, "NO_MATCHING_NODE", "no node offering this capability matches the selector"
 	}
 	return http.StatusUnprocessableEntity, "INVALID_INPUT", inputErr.Error()
+}
+
+// checkFileFields requires exactly the files the capability declares.
+func checkFileFields(required []string, files map[string]string) error {
+	for _, field := range required {
+		if _, ok := files[field]; !ok {
+			return fmt.Errorf("input file %q is required", field)
+		}
+	}
+	for field := range files {
+		if !slices.Contains(required, field) {
+			return fmt.Errorf("this capability has no input file %q", field)
+		}
+	}
+	return nil
 }
 
 func orEmpty(m map[string]string) map[string]string {
@@ -311,116 +346,23 @@ func (g *Gateway) handleGetJob(w http.ResponseWriter, r *http.Request, key *APIK
 }
 
 func (g *Gateway) handleGetFile(w http.ResponseWriter, r *http.Request, key *APIKey) {
-	artifact, err := g.store.ArtifactFor(r.Context(), r.PathValue("id"), key.ID)
+	id := r.PathValue("id")
+	stored, err := g.store.ArtifactFor(r.Context(), id, key.ID)
 	if err != nil {
 		g.internalError(w, r, "read artifact", err)
 		return
 	}
-	if artifact == nil {
+	if stored == nil {
+		if stored, err = g.store.InputFileFor(r.Context(), id, key.ID); err != nil {
+			g.internalError(w, r, "read input file", err)
+			return
+		}
+	}
+	if stored == nil {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "file not found or expired", false)
 		return
 	}
-	file, err := os.Open(filepath.Join(g.cfg.filesDir(), artifact.ID))
-	if err != nil {
-		g.internalError(w, r, "open artifact", err)
-		return
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil {
-		g.internalError(w, r, "stat artifact", err)
-		return
-	}
-	// Results are untrusted bytes, so never let a browser render them.
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, artifact.Name))
-	w.Header().Set("ETag", `"`+artifact.SHA256+`"`)
-	http.ServeContent(w, r, "", info.ModTime(), file)
-}
-
-// --- Worker uploads ---
-
-var artifactName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
-var sha256Hex = regexp.MustCompile(`^[0-9a-f]{64}$`)
-
-func (g *Gateway) handleUploadArtifact(w http.ResponseWriter, r *http.Request) {
-	node, err := g.authNode(r)
-	if err != nil {
-		g.internalError(w, r, "check node token", err)
-		return
-	}
-	if node == nil {
-		writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "invalid node token", false)
-		return
-	}
-	attemptID, name := r.PathValue("attempt"), r.PathValue("name")
-	wantSum := r.Header.Get("X-Content-SHA256")
-	if !artifactName.MatchString(name) {
-		writeError(w, http.StatusBadRequest, "BAD_REQUEST", "invalid artifact name", false)
-		return
-	}
-	if !sha256Hex.MatchString(wantSum) {
-		writeError(w, http.StatusBadRequest, "BAD_REQUEST", "X-Content-SHA256 must be a lowercase hex digest", false)
-		return
-	}
-	allowed, err := g.store.CanUpload(r.Context(), attemptID, node.ID)
-	if err != nil {
-		g.internalError(w, r, "check attempt", err)
-		return
-	}
-	if !allowed {
-		writeError(w, http.StatusGone, "ATTEMPT_FENCED", "this attempt can no longer upload", false)
-		return
-	}
-
-	used, err := g.store.TotalArtifactBytes(r.Context())
-	if err != nil {
-		g.internalError(w, r, "measure storage", err)
-		return
-	}
-	remaining := g.cfg.MaxArtifactBytes - used
-	if r.ContentLength > remaining {
-		writeError(w, http.StatusInsufficientStorage, "STORAGE_FULL", "artifact storage is full", false)
-		return
-	}
-
-	size, gotSum, tmpPath, err := g.receiveFile(r.Context(), http.MaxBytesReader(w, r.Body, remaining))
-	if err != nil {
-		var tooBig *http.MaxBytesError
-		if errors.As(err, &tooBig) {
-			writeError(w, http.StatusInsufficientStorage, "STORAGE_FULL", "artifact storage is full", false)
-			return
-		}
-		// The usual cause is the network dropping mid-upload; the worker retries.
-		writeError(w, http.StatusBadRequest, "UPLOAD_INTERRUPTED", "could not receive the upload", true)
-		return
-	}
-	defer os.Remove(tmpPath) // A no-op once the file has been renamed.
-	if gotSum != wantSum {
-		writeError(w, http.StatusUnprocessableEntity, "CHECKSUM_MISMATCH", "upload does not match X-Content-SHA256", true)
-		return
-	}
-
-	fileID := newID("file_")
-	if err := os.Rename(tmpPath, filepath.Join(g.cfg.filesDir(), fileID)); err != nil {
-		g.internalError(w, r, "store artifact", err)
-		return
-	}
-	replaced, err := g.store.PutArtifact(r.Context(), attemptID, node.ID, fileID, name, gotSum, size, g.cfg.ArtifactTTL)
-	if err != nil {
-		os.Remove(filepath.Join(g.cfg.filesDir(), fileID))
-		if errors.Is(err, ErrFenced) {
-			writeError(w, http.StatusGone, "ATTEMPT_FENCED", "this attempt can no longer upload", false)
-			return
-		}
-		g.internalError(w, r, "record artifact", err)
-		return
-	}
-	if replaced != "" {
-		os.Remove(filepath.Join(g.cfg.filesDir(), replaced))
-	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": fileID, "size": size, "sha256": gotSum})
+	g.serveStoredFile(w, r, stored)
 }
 
 // receiveFile streams a body to a synced temporary file and hashes it.

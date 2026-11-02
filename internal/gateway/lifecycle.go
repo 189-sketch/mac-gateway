@@ -598,21 +598,21 @@ func (s *Store) CreateAttempt(ctx context.Context, job QueuedJob, c CapabilityRo
 // ErrFenced means an attempt may no longer upload results.
 var ErrFenced = errors.New("attempt is no longer current")
 
-// CanUpload reports whether a node may upload artifacts for an attempt.
+// CanUpload reports whether a node may still transfer files for an attempt.
 func (s *Store) CanUpload(ctx context.Context, attemptID, nodeID string) (bool, error) {
 	var allowed int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM attempts a JOIN jobs j ON j.id = a.job_id
 		WHERE a.id=? AND a.node_id=? AND a.status=? AND j.current_attempt=a.id
-		  AND j.status NOT IN (?,?,?)`,
-		attemptID, nodeID, attemptActive, StatusSucceeded, StatusFailed, StatusTimedOut).Scan(&allowed)
+		  AND j.status NOT IN (?,?,?,?)`,
+		attemptID, nodeID, attemptActive, StatusSucceeded, StatusFailed, StatusTimedOut, StatusCancelled).Scan(&allowed)
 	return allowed > 0, err
 }
 
-// TotalArtifactBytes returns the space used by stored artifacts.
-func (s *Store) TotalArtifactBytes(ctx context.Context) (int64, error) {
+// TotalStoredBytes returns the space used by stored results and input files.
+func (s *Store) TotalStoredBytes(ctx context.Context) (int64, error) {
 	var total int64
-	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(size), 0) FROM artifacts`).Scan(&total)
+	err := s.db.QueryRowContext(ctx, `SELECT (SELECT COALESCE(SUM(size), 0) FROM artifacts) + (SELECT COALESCE(SUM(size), 0) FROM input_files)`).Scan(&total)
 	return total, err
 }
 

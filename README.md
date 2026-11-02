@@ -8,13 +8,9 @@ Agent ──HTTPS──▶ Gateway (cloud server) ◀──outbound WSS + HTTPS�
 
 Workers only make outbound connections, so your home network needs no open ports. Each worker can run only what its local manifest declares. The gateway sends a capability name and input, never a command.
 
-This is step 1 of the design: the gateway, the worker and the CLI adapter. The tests run on Linux with a stand-in tool. Nothing has run on a real Mac yet, so the Mac steps below, including `say` and launchd, are untested.
+This covers steps 1 and 2 of the design: the gateway, the worker, the CLI adapter, progress streaming, cancellation, file transfer and the `fleet` command. The tests run on Linux with a stand-in tool. Nothing has run on a real Mac or through a real server install yet, so the install steps below, including `say`, launchd and Caddy, are untested.
 
 **Not built yet:**
-- SSE progress streaming
-- A cancel endpoint
-- Input file uploads
-- A client CLI
 - The HTTP adapter
 - LLM streaming
 - MCP
@@ -27,74 +23,200 @@ This needs Go 1.27 or newer. The `make` targets are shortcuts, so if `make` isn'
 
 ```sh
 make build   # Binaries for this machine, in bin/
-make dist    # Gateway for Linux and workers for both Mac types, in dist/
+make dist    # Gateway for Linux, workers for both Mac types and the CLI, in dist/
 make test    # All tests, including the end-to-end suite (a few minutes)
+./deploy/test-install.sh   # Tests the install scripts without changing this machine
 ```
 
-## Set up the gateway
+## Install
 
-1. Copy `dist/fleet-gateway-linux-amd64` to `/usr/local/bin/fleet-gateway` on the server.
-2. Create the service user and install the service:
+### What you need
 
-   ```sh
-   sudo useradd --system --no-create-home fleet
-   sudo cp deploy/fleet-gateway.service /etc/systemd/system/
-   sudo systemctl enable --now fleet-gateway
-   ```
+- **Server:** Debian or Ubuntu on x86-64, a normal user with `sudo`, and Go 1.27 or newer to build the binaries.
+- **Domain:** a domain name with its DNS pointing at the server.
+- **Firewall:** ports 80 and 443 open on the server, including in any cloud security group. Caddy needs both to get its HTTPS certificate.
+- **Mac:** macOS on Apple silicon or Intel. Your home network doesn't need any open ports.
 
-3. Put a TLS proxy in front of it. `deploy/Caddyfile.example` is a complete Caddy config once you replace the domain.
-4. Create the credentials. Each secret is printed once and only its hash is stored:
+Run the commands below in your own terminal. They print secrets that are shown only once, so don't paste the output into chats or tickets.
 
-   ```sh
-   sudo -u fleet fleet-gateway node add mac-mini-1 --data /var/lib/fleet
-   sudo -u fleet fleet-gateway key add my-agent --capabilities 'tts.*' --data /var/lib/fleet
-   ```
+### 1. Install the gateway
 
-Use `node revoke <name>` or `key revoke <name>` to withdraw a credential. `--capabilities` takes comma-separated patterns, and `'*'` allows everything.
+On the server:
 
-## Set up a Mac
+```sh
+git clone https://github.com/189-sketch/mac-gateway.git
+cd mac-gateway
+./deploy/install-gateway.sh fleet.example.com mac-mini-1
+```
 
-1. Check the chip with `uname -m`: `arm64` needs `fleet-worker-darwin-arm64`, and `x86_64` needs `fleet-worker-darwin-amd64`.
-2. Copy that binary to `~/fleet/fleet-worker`. If you downloaded it through a browser, run `xattr -d com.apple.quarantine ~/fleet/fleet-worker`.
-3. Copy `deploy/worker.example.yaml` to `~/fleet/worker.yaml`, then set `gateway_url` and `node.name`. Copy `deploy/com.fleet.worker.plist` to `~/fleet/` as well.
-4. Save the node token and check the config:
+The repo is private, so cloning it needs a GitHub login with access. Replace `fleet.example.com` with your domain and `mac-mini-1` with a name for your first machine. The script does the following:
 
-   ```sh
-   cd ~/fleet
-   (umask 077; pbpaste > token)   # With the token on the clipboard
-   ./fleet-worker --config worker.yaml --check
-   ```
+1. Builds the binaries.
+2. Installs the gateway as the `fleet-gateway` service, with its data in `/var/lib/fleet`.
+3. Installs Caddy if it's missing and sets up HTTPS. Your existing Caddy sites are kept.
+4. Publishes the worker installer and worker binaries at `https://your-domain/install/`. They contain no secrets, and anyone can download them.
+5. Prints an API key for your agent and the command to run on your Mac.
 
-5. Run it once in the foreground and submit a test job, as shown below:
+It stops before changing anything if another program is using port 80 or 443. It exits with a warning if the server isn't reachable over HTTPS yet, but still prints your credentials. In that case, fix DNS or the firewall; Caddy keeps retrying, so you don't need to run the script again.
 
-   ```sh
-   ./fleet-worker --config worker.yaml
-   ```
+### 2. Install the worker
 
-6. Stop it, then install it to start automatically. Replace `YOUR_USER` in the plist first:
+Use a dedicated standard (non-admin) macOS account with none of your personal files, because jobs run as that user and can read anything it can, including the token file.
 
-   ```sh
-   cp com.fleet.worker.plist ~/Library/LaunchAgents/
-   launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.fleet.worker.plist
-   ```
+Log in to that account on the Mac, open Terminal and paste the command the gateway script printed. It looks like this:
 
-7. Keep the machine available:
+```sh
+curl -fsSL https://fleet.example.com/install/worker.sh | FLEET_NODE_NAME=mac-mini-1 FLEET_NODE_TOKEN=fn_... sh
+```
 
-   ```sh
-   sudo pmset -a sleep 0 disablesleep 1 autorestart 1
-   ```
+The script does the following:
 
-The plist is a LaunchAgent, so the worker runs inside a logged-in user session, which tools like `say` may need. For the worker to start after a power cut, turn on automatic login for that user.
+1. Downloads the worker for your chip and verifies its checksum.
+2. Installs into `~/fleet`, with a `worker.yaml` that offers one service, `tts.say`.
+3. Starts the worker as a LaunchAgent, then waits until it has connected.
 
-Use a dedicated standard (non-admin) macOS account with none of your personal files. Commands run as that user, so they can read anything it can, including the token file.
+The command contains the machine's token, so your shell history will too. To remove it, close Terminal, then delete that line from `~/.zsh_history`.
+
+### 3. Keep the Mac available
+
+The script doesn't change your power settings, so do these yourself:
+
+```sh
+sudo pmset -a sleep 0 disablesleep 1 autorestart 1
+```
+
+Then turn on automatic login for the worker's account in System Settings. The worker runs inside a logged-in session, so without this it won't come back after a reboot or power cut.
+
+### 4. Test it
+
+On any machine with the `fleet` command (build it with `go build -o fleet ./cmd/fleet`):
+
+```sh
+export FLEET_URL=https://fleet.example.com
+export FLEET_API_KEY=fk_...
+
+fleet capabilities
+fleet run tts.say --input '{"text":"Hello from the Mac mini"}' -o hello.aiff
+```
+
+You should get `hello.aiff` on the machine that ran the command. To confirm jobs survive an outage, unplug the Mac's network during a longer job, then plug it back in. The job should finish with one result.
+
+### Add another machine
+
+On the server, from the repo:
+
+```sh
+./deploy/add-worker.sh mac-mini-2
+```
+
+Then run the command it prints on the new machine. Only macOS workers are available so far.
+
+### Upgrade
+
+Upgrade the server first, then each Mac. Neither command needs a node name or token this time:
+
+```sh
+# On the server, from the repo
+git pull
+./deploy/install-gateway.sh fleet.example.com
+
+# On each Mac
+curl -fsSL https://fleet.example.com/install/worker.sh | sh
+```
+
+Data, API keys, tokens and each Mac's `worker.yaml` are kept. Running jobs on a Mac are interrupted during its upgrade, and rerun only if their capability sets `retry_if_lost`.
+
+### Manage credentials
+
+On the server:
+
+```sh
+sudo -u fleet fleet-gateway key add my-agent --capabilities 'tts.*,video.*' --data /var/lib/fleet
+sudo -u fleet fleet-gateway key revoke my-agent --data /var/lib/fleet
+sudo -u fleet fleet-gateway node revoke mac-mini-1 --data /var/lib/fleet
+```
+
+`--capabilities` takes comma-separated patterns, and `'*'` allows everything. Revoking takes effect within a heartbeat. A revoked name can't be registered again, so a replacement machine needs a new name.
+
+### Troubleshooting
+
+| Problem | What to check |
+|---|---|
+| `https://your-domain` isn't reachable | DNS, ports 80 and 443 in the cloud security group, then `sudo journalctl -u caddy -n 50` |
+| The gateway won't start | `sudo journalctl -u fleet-gateway -n 50` |
+| A Mac says `launchd refused to start it` | You're probably connected over SSH. Log in to that user at the screen or through Screen Sharing, then run the command again |
+| A Mac starts but doesn't connect | `tail ~/fleet/worker.log`. `the gateway rejected this node's token` means the token is wrong or revoked |
+| A job fails with `NO_NODE_ONLINE` | `fleet capabilities` shows which nodes are online. Check that the Mac is awake and logged in |
+| You changed `worker.yaml` | Restart the worker: `launchctl kickstart -k gui/$(id -u)/com.fleet.worker` |
+
+### Uninstall
+
+On a Mac:
+
+```sh
+launchctl bootout "gui/$(id -u)/com.fleet.worker"
+rm -rf ~/fleet ~/Library/LaunchAgents/com.fleet.worker.plist
+```
+
+On the server, this also deletes all jobs, results and credentials:
+
+```sh
+sudo systemctl disable --now fleet-gateway
+sudo rm -rf /var/lib/fleet /srv/fleet /etc/systemd/system/fleet-gateway.service /usr/local/bin/fleet-gateway /etc/caddy/fleet.caddy
+sudo sed -i '/^import fleet.caddy$/d' /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+sudo userdel fleet
+```
+
+Caddy itself stays installed, in case other sites use it.
 
 ## Call it
+
+### With the `fleet` command
+
+This is the simplest way for an agent or a script to use the gateway. Copy the binary for your machine from `dist/`, then set:
+
+```sh
+export FLEET_URL=https://fleet.example.com
+export FLEET_API_KEY=fk_...
+```
+
+```sh
+# See what's available, with input schemas and online status
+fleet capabilities
+
+# Submit a job, follow it and save its result
+fleet run tts.say --input '{"text":"Hello from the Mac mini"}' -o hello.aiff
+
+# Send a local file as an input file
+fleet run video.transcode -f source=clip.mov -o out.mp4
+
+# Start a job without waiting, then check on it
+fleet run tts.say --input @request.json --detach
+fleet status JOB_ID
+fleet watch JOB_ID
+fleet download JOB_ID -o hello.aiff
+fleet cancel JOB_ID
+```
+
+The final result goes to stdout as JSON and progress goes to stderr. `fleet run` reconnects if the gateway or network drops, and Ctrl-C stops following the job without cancelling it. Run `fleet help` for all options.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | The job or command failed, and running it again won't help |
+| 2 | Invalid usage or configuration |
+| 75 | A temporary failure, such as no node being online; running it again may work |
+| 130 | Interrupted; a submitted job keeps running |
+
+If a job succeeds but its result can't be saved, `fleet run` exits with 1 rather than 75, because running it again would repeat the job. Use `fleet download` instead.
+
+### With the HTTP API
 
 ```sh
 export FLEET=https://fleet.example.com
 export KEY=fk_...
 
-# See what's available, with input schemas and online status
 curl -H "Authorization: Bearer $KEY" $FLEET/v1/capabilities
 
 # Submit a job
@@ -105,22 +227,43 @@ curl -X POST -H "Authorization: Bearer $KEY" $FLEET/v1/jobs -d '{
   "queue_timeout": "10m"
 }'
 
-# Wait up to 60 seconds for it to finish, then read its status
+# Follow it until it ends
+curl -N -H "Authorization: Bearer $KEY" $FLEET/v1/jobs/JOB_ID/events
+
+# Or wait up to 60 seconds for it to finish, then read its status
 curl -H "Authorization: Bearer $KEY" "$FLEET/v1/jobs/JOB_ID?wait=60"
 
 # Download a result, using the url from the job's artifacts
 curl -H "Authorization: Bearer $KEY" -o audio.aiff $FLEET/v1/files/FILE_ID
+
+# Upload an input file, then pass its id in the job's "files"
+curl -X POST -H "Authorization: Bearer $KEY" --data-binary @clip.mov "$FLEET/v1/files?name=clip.mov"
 ```
 
 | Route | Purpose |
 |---|---|
-| `GET /v1/capabilities` | Capabilities this key may use |
+| `GET /v1/capabilities` | Capabilities this key may use, with `input_files` listing the files each one needs |
 | `POST /v1/jobs` | Create a job. Returns 202, or 200 when the idempotency key repeats an identical request |
 | `GET /v1/jobs/{id}` | Job status. `?wait=N` waits up to 60 seconds for it to finish, and `?include=events` adds its event history |
-| `GET /v1/files/{id}` | Download a result file. Files expire after 24 hours by default |
+| `GET /v1/jobs/{id}/events` | Follow a job as Server-Sent Events |
+| `POST /v1/jobs/{id}/cancel` | Stop a job. Safe to repeat, and changes nothing if the job has finished |
+| `POST /v1/files?name=NAME` | Upload an input file. The body is the raw file |
+| `GET /v1/files/{id}` | Download a result or your own input file, with `Range` support. Files expire after 24 hours by default |
 | `GET /healthz` | Liveness check, no key needed |
 
 Keys can see only their own jobs and files. Errors have a stable `code`, a `message` and a `retryable` flag.
+
+### Event stream
+
+The stream sends these events:
+
+| Event | Meaning |
+|---|---|
+| `status` | The job's state. Sent on connect and whenever it changes, including changes no worker reported, such as `lost` |
+| `started`, `progress`, `completed`, `failed` | Reported by the worker, each with an `id` |
+| `end` | The final job, including its artifacts. The stream then closes |
+
+To resume after a disconnect, send the last `id` you saw as `Last-Event-ID`, or as `?after=ID`. You'll miss nothing and see nothing twice. Decide the outcome from `status` and `end`: a `failed` event can be followed by a rerun if the job has `retry_if_lost`.
 
 ### Job states
 
@@ -133,6 +276,7 @@ Keys can see only their own jobs and files. Errors have a stable `code`, a `mess
 | `succeeded` | Finished, with results available | Yes |
 | `failed` | Check `error.code` | Yes |
 | `timed_out` | Passed its timeout | Yes |
+| `cancelled` | Stopped by `POST /v1/jobs/{id}/cancel` | Yes |
 
 A job is finished when `terminal` is `true`. If a job is rerun, `attempts` goes up and `progress` starts again.
 
@@ -146,6 +290,8 @@ A job is finished when `terminal` is `true`. If a job is rerun, `attempts` goes 
 | Worker crashes or restarts | The leftover command is killed, then the job reruns if `retry_if_lost` is set. Otherwise it fails with `WORKER_RESTARTED` |
 | Gateway restarts | Jobs continue, and workers reconnect and catch up |
 | No capable node in time | Fails with `NO_NODE_ONLINE`, or `QUEUE_TIMEOUT` if capable nodes were busy |
+| Network drops during a file transfer | The worker retries for up to `upload_retry_window` (6 hours by default) and continues from where it stopped |
+| Job cancelled while its worker is offline | It shows `cancelled` straight away, and the command is stopped when the worker reconnects |
 
 Only set `retry_if_lost` for work that is safe to repeat.
 
@@ -153,7 +299,8 @@ Only set `retry_if_lost` for work that is safe to repeat.
 
 Add a capability to the machine's `worker.yaml` and restart the worker. The gateway needs no changes.
 
-- **Placeholders:** `command` and `stdin` can use `{{workdir}}` and `{{input.field}}`. `command[0]` can't contain any.
+- **Placeholders:** `command` and `stdin` can use `{{workdir}}`, `{{input.field}}` and `{{files.field}}`. `command[0]` can't contain any.
+- **Input files:** `input_files` lists the files a job must supply, and all are required. The worker downloads and verifies them first, then `{{files.field}}` gives the local path.
 - **Option injection:** an argument starting with a placeholder is refused if its value begins with `-`. Prefer `stdin` for free text.
 - **Outputs:** `outputs` maps result names to paths inside the working directory. Symlinks are refused.
 - **Progress:** `progress.regex` reads command output using the named groups `percent`, `current`, `total` and `message`.
@@ -166,10 +313,12 @@ Unknown fields, missing programs and invalid schemas stop the worker at startup.
 
 | Path | Contents |
 |---|---|
-| `cmd/` | The two programs |
+| `cmd/` | The three programs: `fleet-gateway`, `fleet-worker` and `fleet` |
 | `internal/gateway/lifecycle.go` | Every job state transition: leases, fencing, revival and retries |
 | `internal/gateway/` | API, scheduler, worker connections and storage |
 | `internal/worker/` | Manifest, command execution, event spool and connection |
+| `internal/transfer/` | Resumable, verified file downloads, shared by the worker and CLI |
+| `internal/client/` | Client for the agent API, including stream reconnects |
 | `internal/protocol/` | Messages between gateway and worker |
 | `e2e/` | Tests that run the real binaries, with a proxy that simulates network cuts |
-| `deploy/` | Example worker manifest, launchd, systemd and Caddy files |
+| `deploy/` | Install scripts, plus example worker manifest, launchd, systemd and Caddy files |
