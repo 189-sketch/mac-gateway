@@ -55,13 +55,13 @@ Run one of these on the server, replacing `fleet.example.com` with your domain a
 **One line, if the repo is public:**
 
 ```sh
-curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.2.0/install-gateway.sh | bash -s -- fleet.example.com mac-mini-1
+curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.3.0/install-gateway.sh | bash -s -- fleet.example.com mac-mini-1
 ```
 
 **From a downloaded bundle, which also works while the repo is private.** Download `fleet-server-linux-amd64.tar.gz` (or `-arm64`) from the [Releases page](https://github.com/189-sketch/mac-gateway/releases) while logged in, or use the GitHub CLI as below:
 
 ```sh
-gh release download v0.2.0 -R 189-sketch/mac-gateway -p 'fleet-server-linux-amd64.tar.gz'
+gh release download v0.3.0 -R 189-sketch/mac-gateway -p 'fleet-server-linux-amd64.tar.gz'
 tar -xzf fleet-server-linux-amd64.tar.gz
 ./fleet-server-linux-amd64/install-gateway.sh fleet.example.com mac-mini-1
 ```
@@ -115,7 +115,7 @@ Then turn on automatic login for the worker's account in System Settings. The wo
 You need the `fleet` command on the machine you test from. If the repo is public, this installs it to `~/.local/bin`:
 
 ```sh
-curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.2.0/install-cli.sh | sh
+curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.3.0/install-cli.sh | sh
 ```
 
 Otherwise, download `fleet-linux-amd64`, `fleet-darwin-arm64` or the one for your machine from the Releases page, or build it with `go build -o fleet ./cmd/fleet`. Then:
@@ -480,8 +480,8 @@ From a clean checkout, build the files and upload them. Nothing is published unt
 
 ```sh
 ./deploy/test-install.sh
-./deploy/build-release.sh v0.3.0
-gh release create v0.3.0 --prerelease --target "$(git rev-parse HEAD)" --title v0.3.0 dist/release/*
+./deploy/build-release.sh v0.4.0
+gh release create v0.4.0 --prerelease --target "$(git rev-parse HEAD)" --title v0.4.0 dist/release/*
 ```
 
 The version is built into the binaries and into the download address in the install scripts, so each release's scripts fetch that release's files. Update the version in this README's install commands too.
