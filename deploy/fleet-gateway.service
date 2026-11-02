@@ -1,0 +1,30 @@
+[Unit]
+Description=Fleet gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=fleet
+Group=fleet
+ExecStart=/usr/local/bin/fleet-gateway serve --listen 127.0.0.1:8080 --data /var/lib/fleet
+Restart=on-failure
+RestartSec=2
+# Creates /var/lib/fleet, owned by the fleet user.
+StateDirectory=fleet
+StateDirectoryMode=0700
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

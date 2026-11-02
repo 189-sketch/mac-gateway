@@ -1,0 +1,39 @@
+# Worker manifest for a Mac. This file is the only place that decides what the
+# machine will run: the gateway can name a capability here, but can't add one.
+#
+# Relative paths are resolved from this file's directory.
+
+gateway_url: https://fleet.example.com
+token_file: token # Must be chmod 600.
+state_dir: state
+
+node:
+  name: mac-mini-1 # Must match the name given to `fleet-gateway node add`.
+  max_jobs: 2
+  labels:
+    os: macos
+  resources:
+    cpu_heavy: 1
+
+capabilities:
+  - name: tts.say
+    adapter: cli
+    # Each list item is one argument and there is no shell, so input can't inject
+    # commands. The text goes through stdin, so it can't be read as an option.
+    command: [/usr/bin/say, -o, "{{workdir}}/out.aiff"]
+    stdin: "{{input.text}}"
+    input_schema:
+      type: object
+      required: [text]
+      additionalProperties: false
+      properties:
+        text: { type: string, minLength: 1, maxLength: 20000 }
+    # A path inside the job's working directory. The result is named audio.aiff.
+    outputs:
+      audio: out.aiff
+    requires:
+      cpu_heavy: 1
+    timeout: 10m
+    # Rerunning is safe here because it only produces a file. Leave this false for
+    # anything with side effects that must not happen twice.
+    retry_if_lost: true

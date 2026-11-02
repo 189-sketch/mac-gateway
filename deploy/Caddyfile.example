@@ -1,0 +1,6 @@
+# Terminates TLS with an automatic certificate and forwards to the gateway, which
+# listens only on loopback. WebSocket upgrades and large uploads need no extra
+# settings. Your DNS must point this name at the server, with ports 80 and 443 open.
+fleet.example.com {
+	reverse_proxy 127.0.0.1:8080
+}
