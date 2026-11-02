@@ -1,19 +1,30 @@
 #!/usr/bin/env bash
-# Installs the gateway on a Debian or Ubuntu server, from a checkout of this repo.
+# Installs the gateway on a Debian or Ubuntu server. Any of these works:
 #
-#   ./deploy/install-gateway.sh fleet.example.com [node-name]
+#   From a release, with nothing else installed (needs a public repo):
+#     curl -fsSL RELEASE_URL/install-gateway.sh | bash -s -- fleet.example.com [node-name]
 #
-# It builds the binaries, installs the gateway and Caddy as services, and publishes
-# the worker installer at https://DOMAIN/install/. On a first install, it prints an
-# API key and the command to run on your first Mac, named mac-mini-1 by default.
-# Run it as a normal user with sudo rights.
+#   From an unpacked release bundle:
+#     ./install-gateway.sh fleet.example.com [node-name]
+#
+#   From a checkout of the repo, which builds the binaries and needs Go:
+#     ./deploy/install-gateway.sh fleet.example.com [node-name]
+#
+# It installs the gateway and Caddy as services and publishes the worker installer
+# at https://DOMAIN/install/. On a first install, it prints an API key and the
+# command to run on your first Mac, named mac-mini-1 by default. Run it as a normal
+# user with sudo rights.
 #
 # Re-running it upgrades the gateway and keeps existing data and credentials. It
 # only registers another machine if you pass a node name.
 #
 # Before running it, point DOMAIN's DNS at this server and open ports 80 and 443
 # in its firewall or cloud security group. This script can't do either for you.
-set -euo pipefail
+#
+# Everything is inside main, so a download cut off partway can't run half a script.
+
+# build-release.sh fills this in. It stays a placeholder in a checkout.
+RELEASE_URL="${FLEET_RELEASE_URL:-@@RELEASE_URL@@}"
 
 # Only the install script's tests set this, to install into a scratch directory.
 ROOT="${FLEET_INSTALL_ROOT:-}"
@@ -24,89 +35,150 @@ die() {
 }
 step() { echo "==> $*"; }
 
-DOMAIN="${1:-}"
-NODE_NAME_GIVEN="${2:-}"
-NODE_NAME="${NODE_NAME_GIVEN:-mac-mini-1}"
-[ -n "$DOMAIN" ] || die "usage: $0 DOMAIN [first-node-name]"
-[[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}$ ]] || die "'$DOMAIN' doesn't look like a domain name"
-[[ "$NODE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "'$NODE_NAME' isn't a valid node name"
-[ "$(id -u)" -ne 0 ] || die "run this as a normal user with sudo rights, not as root, so the build doesn't run as root"
+server_arch() {
+	case "$(uname -m)" in
+	x86_64) echo amd64 ;;
+	aarch64 | arm64) echo arm64 ;;
+	*) die "unsupported processor: $(uname -m)" ;;
+	esac
+}
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-command -v go >/dev/null || die "Go isn't installed or isn't on PATH; it's needed to build the binaries"
-command -v curl >/dev/null || die "curl isn't installed"
-command -v apt-get >/dev/null || command -v caddy >/dev/null ||
-	die "this script installs Caddy with apt; on other systems, install Caddy first"
-
-step "Asking for sudo rights"
-sudo true
-
-# Stop before changing anything if another web server holds the ports Caddy needs.
-for port in 80 443; do
-	holder="$(sudo ss -Hltnp "sport = :$port" 2>/dev/null || true)"
-	if [ -n "$holder" ] && ! grep -q '"caddy"' <<<"$holder"; then
-		die "port $port is already in use by something other than Caddy: $holder"
+# Puts everything to install in one directory and sets BUNDLE to it.
+find_bundle() {
+	local source_path="${BASH_SOURCE[0]:-}"
+	local script_dir=""
+	if [ -n "$source_path" ] && [ -f "$source_path" ]; then
+		script_dir="$(cd "$(dirname "$source_path")" && pwd)"
 	fi
-done
 
-step "Building binaries (about a minute the first time)"
-cd "$REPO"
-mkdir -p dist
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/fleet-gateway-linux-amd64 ./cmd/fleet-gateway
-for arch in arm64 amd64; do
-	CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" go build -trimpath -o "dist/fleet-worker-darwin-$arch" ./cmd/fleet-worker
-done
-
-step "Installing the gateway service"
-if ! id fleet >/dev/null 2>&1; then
-	sudo useradd --system --no-create-home --shell /usr/sbin/nologin fleet
-fi
-sudo install -d -m 755 "$ROOT/usr/local/bin" "$ROOT/etc/systemd/system"
-sudo install -m 755 dist/fleet-gateway-linux-amd64 "$ROOT/usr/local/bin/fleet-gateway"
-sudo install -m 644 deploy/fleet-gateway.service "$ROOT/etc/systemd/system/fleet-gateway.service"
-sudo install -d -m 700 "$ROOT/var/lib/fleet"
-sudo chown fleet:fleet "$ROOT/var/lib/fleet"
-sudo systemctl daemon-reload
-sudo systemctl enable fleet-gateway >/dev/null 2>&1
-sudo systemctl restart fleet-gateway
-
-ready=""
-for _ in $(seq 1 30); do
-	if curl -fsS --max-time 2 http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
-		ready=yes
-		break
+	if [ -n "$script_dir" ] && [ -f "$script_dir/fleet-gateway" ]; then
+		BUNDLE="$script_dir"
+	elif [ -n "$script_dir" ] && [ -d "$script_dir/../cmd/fleet-gateway" ]; then
+		build_from_source "$script_dir/.."
+	else
+		download_bundle
 	fi
-	sleep 1
-done
-[ -n "$ready" ] || die "the gateway didn't start; see: sudo journalctl -u fleet-gateway -n 50"
+}
 
-step "Publishing the worker installer"
-PUBLIC="$ROOT/srv/fleet/install"
-URL="https://$DOMAIN"
-workdir="$(mktemp -d)"
-trap 'rm -rf "$workdir"' EXIT
-cp dist/fleet-worker-darwin-arm64 dist/fleet-worker-darwin-amd64 "$workdir/"
-sed "s|@@GATEWAY_URL@@|$URL|g" deploy/install-worker.sh >"$workdir/worker.sh"
-(cd "$workdir" && sha256sum fleet-worker-darwin-arm64 fleet-worker-darwin-amd64 >SHA256SUMS)
-sudo install -d -m 755 "$PUBLIC"
-sudo install -m 644 "$workdir"/fleet-worker-darwin-arm64 "$workdir"/fleet-worker-darwin-amd64 "$workdir"/SHA256SUMS "$workdir"/worker.sh "$PUBLIC/"
-echo "$URL" | sudo tee "$ROOT/srv/fleet/gateway-url" >/dev/null
+build_from_source() {
+	local repo="$1"
+	command -v go >/dev/null || die "Go isn't installed or isn't on PATH; it's needed to build from a checkout"
+	step "Building binaries (about a minute the first time)"
+	BUNDLE="$WORKDIR/bundle"
+	mkdir -p "$BUNDLE"
+	(
+		cd "$repo"
+		CGO_ENABLED=0 go build -trimpath -o "$BUNDLE/fleet-gateway" ./cmd/fleet-gateway
+		for arch in arm64 amd64; do
+			CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" go build -trimpath -o "$BUNDLE/fleet-worker-darwin-$arch" ./cmd/fleet-worker
+		done
+		cp deploy/add-worker.sh deploy/install-worker.sh deploy/fleet-gateway.service "$BUNDLE/"
+	)
+}
 
-step "Setting up HTTPS with Caddy"
-if ! command -v caddy >/dev/null; then
-	sudo apt-get update -qq
-	sudo apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https gnupg
-	curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' |
-		sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-	curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' |
-		sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-	sudo apt-get update -qq
-	sudo apt-get install -y -qq caddy
-fi
-sudo install -d -m 755 "$ROOT/etc/caddy"
-# This goes in its own file, so a Caddyfile you already have keeps working.
-sudo tee "$ROOT/etc/caddy/fleet.caddy" >/dev/null <<EOF
-$DOMAIN {
+download_bundle() {
+	case "$RELEASE_URL" in
+	https://*) ;;
+	*) die "run this from a release or a checkout of the repo, so it can find the binaries" ;;
+	esac
+	command -v tar >/dev/null || die "tar isn't installed"
+	local name
+	name="fleet-server-linux-$(server_arch)"
+	step "Downloading $name"
+	curl -fsSL --retry 3 -o "$WORKDIR/$name.tar.gz" "$RELEASE_URL/$name.tar.gz" ||
+		die "couldn't download $RELEASE_URL/$name.tar.gz. If the repo is private, download the bundle while logged in, then run ./install-gateway.sh from inside it"
+	curl -fsSL --retry 3 -o "$WORKDIR/SHA256SUMS" "$RELEASE_URL/SHA256SUMS" ||
+		die "couldn't download the checksums"
+	(cd "$WORKDIR" && grep " $name.tar.gz\$" SHA256SUMS | sha256sum -c - >/dev/null 2>&1) ||
+		die "the download doesn't match its checksum"
+	tar -xzf "$WORKDIR/$name.tar.gz" -C "$WORKDIR"
+	BUNDLE="$WORKDIR/$name"
+}
+
+main() {
+	set -euo pipefail
+
+	local domain="${1:-}"
+	local node_name_given="${2:-}"
+	local node_name="${node_name_given:-mac-mini-1}"
+	[ -n "$domain" ] || die "usage: install-gateway.sh DOMAIN [node-name]"
+	[[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}$ ]] || die "'$domain' doesn't look like a domain name"
+	[[ "$node_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "'$node_name' isn't a valid node name"
+	[ "$(id -u)" -ne 0 ] || die "run this as a normal user with sudo rights, not as root"
+
+	command -v curl >/dev/null || die "curl isn't installed"
+	command -v apt-get >/dev/null || command -v caddy >/dev/null ||
+		die "this script installs Caddy with apt; on other systems, install Caddy first"
+
+	step "Asking for sudo rights"
+	sudo true
+
+	# Stop before changing anything if another web server holds the ports Caddy needs.
+	local port holder
+	for port in 80 443; do
+		holder="$(sudo ss -Hltnp "sport = :$port" 2>/dev/null || true)"
+		if [ -n "$holder" ] && ! grep -q '"caddy"' <<<"$holder"; then
+			die "port $port is already in use by something other than Caddy: $holder"
+		fi
+	done
+
+	WORKDIR="$(mktemp -d)"
+	trap 'rm -rf "$WORKDIR"' EXIT
+	find_bundle
+	"$BUNDLE/fleet-gateway" version >/dev/null 2>&1 ||
+		die "this bundle's gateway can't run on this machine, which is $(uname -m)"
+
+	step "Installing the gateway service"
+	if ! id fleet >/dev/null 2>&1; then
+		sudo useradd --system --no-create-home --shell /usr/sbin/nologin fleet
+	fi
+	sudo install -d -m 755 "$ROOT/usr/local/bin" "$ROOT/etc/systemd/system"
+	sudo install -m 755 "$BUNDLE/fleet-gateway" "$ROOT/usr/local/bin/fleet-gateway"
+	sudo install -m 755 "$BUNDLE/add-worker.sh" "$ROOT/usr/local/bin/fleet-add-worker"
+	sudo install -m 644 "$BUNDLE/fleet-gateway.service" "$ROOT/etc/systemd/system/fleet-gateway.service"
+	sudo install -d -m 700 "$ROOT/var/lib/fleet"
+	sudo chown fleet:fleet "$ROOT/var/lib/fleet"
+	sudo systemctl daemon-reload
+	sudo systemctl enable fleet-gateway >/dev/null 2>&1
+	sudo systemctl restart fleet-gateway
+
+	local ready="" _
+	for _ in $(seq 1 30); do
+		if curl -fsS --max-time 2 http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+			ready=yes
+			break
+		fi
+		sleep 1
+	done
+	[ -n "$ready" ] || die "the gateway didn't start; see: sudo journalctl -u fleet-gateway -n 50"
+
+	step "Publishing the worker installer"
+	local public="$ROOT/srv/fleet/install"
+	local url="https://$domain"
+	local staging="$WORKDIR/publish"
+	mkdir -p "$staging"
+	cp "$BUNDLE/fleet-worker-darwin-arm64" "$BUNDLE/fleet-worker-darwin-amd64" "$staging/"
+	sed "s|@@GATEWAY_URL@@|$url|g" "$BUNDLE/install-worker.sh" >"$staging/worker.sh"
+	(cd "$staging" && sha256sum fleet-worker-darwin-arm64 fleet-worker-darwin-amd64 >SHA256SUMS)
+	sudo install -d -m 755 "$public"
+	sudo install -m 644 "$staging"/fleet-worker-darwin-arm64 "$staging"/fleet-worker-darwin-amd64 "$staging"/SHA256SUMS "$staging"/worker.sh "$public/"
+	echo "$url" | sudo tee "$ROOT/srv/fleet/gateway-url" >/dev/null
+
+	step "Setting up HTTPS with Caddy"
+	if ! command -v caddy >/dev/null; then
+		sudo apt-get update -qq
+		sudo apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https gnupg
+		curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' |
+			sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+		curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' |
+			sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+		sudo apt-get update -qq
+		sudo apt-get install -y -qq caddy
+	fi
+	sudo install -d -m 755 "$ROOT/etc/caddy"
+	# This goes in its own file, so a Caddyfile you already have keeps working.
+	sudo tee "$ROOT/etc/caddy/fleet.caddy" >/dev/null <<CADDY
+$domain {
 	handle_path /install/* {
 		root * /srv/fleet/install
 		file_server
@@ -115,58 +187,61 @@ $DOMAIN {
 		reverse_proxy 127.0.0.1:8080
 	}
 }
-EOF
-sudo touch "$ROOT/etc/caddy/Caddyfile"
-if ! sudo grep -qxF 'import fleet.caddy' "$ROOT/etc/caddy/Caddyfile"; then
-	echo 'import fleet.caddy' | sudo tee -a "$ROOT/etc/caddy/Caddyfile" >/dev/null
-fi
-sudo caddy validate --adapter caddyfile --config "$ROOT/etc/caddy/Caddyfile" >/dev/null 2>&1 ||
-	die "the Caddy config is invalid; see: sudo caddy validate --config /etc/caddy/Caddyfile"
-sudo systemctl enable caddy >/dev/null 2>&1
-sudo systemctl restart caddy
-
-step "Checking https://$DOMAIN (getting a certificate can take a minute)"
-reachable=""
-for _ in $(seq 1 30); do
-	if curl -fsS --max-time 5 "$URL/healthz" >/dev/null 2>&1; then
-		reachable=yes
-		break
+CADDY
+	sudo touch "$ROOT/etc/caddy/Caddyfile"
+	if ! sudo grep -qxF 'import fleet.caddy' "$ROOT/etc/caddy/Caddyfile"; then
+		echo 'import fleet.caddy' | sudo tee -a "$ROOT/etc/caddy/Caddyfile" >/dev/null
 	fi
-	sleep 2
-done
+	sudo caddy validate --adapter caddyfile --config "$ROOT/etc/caddy/Caddyfile" >/dev/null 2>&1 ||
+		die "the Caddy config is invalid; see: sudo caddy validate --config /etc/caddy/Caddyfile"
+	sudo systemctl enable caddy >/dev/null 2>&1
+	sudo systemctl restart caddy
 
-# Secrets are shown once only, so these print whether or not HTTPS is working yet.
-echo
-step "Creating an API key"
-if key="$(sudo -u fleet "$ROOT/usr/local/bin/fleet-gateway" key add agent --capabilities '*' --data "$ROOT/var/lib/fleet" 2>/dev/null)"; then
-	cat <<EOF
+	step "Checking $url (getting a certificate can take a minute)"
+	local reachable=""
+	for _ in $(seq 1 30); do
+		if curl -fsS --max-time 5 "$url/healthz" >/dev/null 2>&1; then
+			reachable=yes
+			break
+		fi
+		sleep 2
+	done
+
+	# Secrets are shown once only, so these print whether or not HTTPS is working yet.
+	echo
+	step "Creating an API key"
+	local key first_install=""
+	if key="$(sudo -u fleet "$ROOT/usr/local/bin/fleet-gateway" key add agent --capabilities '*' --data "$ROOT/var/lib/fleet" 2>/dev/null)"; then
+		cat <<KEY
 Give these to your agent. The key isn't shown again:
 
-  export FLEET_URL=$URL
+  export FLEET_URL=$url
   export FLEET_API_KEY=$key
 
-EOF
-	first_install=yes
-else
-	echo "An API key named 'agent' already exists, so it was kept."
-	echo
-	first_install=""
-fi
+KEY
+		first_install=yes
+	else
+		echo "An API key named 'agent' already exists, so it was kept."
+		echo
+	fi
 
-if [ -n "$first_install" ] || [ -n "$NODE_NAME_GIVEN" ]; then
-	"$REPO/deploy/add-worker.sh" "$NODE_NAME" || true
-fi
+	if [ -n "$first_install" ] || [ -n "$node_name_given" ]; then
+		"$ROOT/usr/local/bin/fleet-add-worker" "$node_name" || true
+	fi
 
-if [ -z "$reachable" ]; then
-	cat >&2 <<EOF
+	if [ -z "$reachable" ]; then
+		cat >&2 <<WARNING
 
-WARNING: the gateway is running, but $URL isn't reachable yet, so the Mac
+WARNING: the gateway is running, but $url isn't reachable yet, so the Mac
 install command won't work until it is. Check that:
-  - DNS for $DOMAIN points at this server's public IP
+  - DNS for $domain points at this server's public IP
   - ports 80 and 443 are open in the firewall or cloud security group
 Then see: sudo journalctl -u caddy -n 50
 Caddy keeps retrying the certificate, so you don't need to run this again.
-EOF
-	exit 1
-fi
-step "Done"
+WARNING
+		exit 1
+	fi
+	step "Done"
+}
+
+main "$@"

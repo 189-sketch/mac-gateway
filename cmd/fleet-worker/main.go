@@ -13,10 +13,19 @@ import (
 	"mactunnel/internal/worker"
 )
 
+// version is set when building a release.
+var version = "dev"
+
 func main() {
 	configPath := flag.String("config", "worker.yaml", "path to the worker manifest")
 	check := flag.Bool("check", false, "validate the manifest and exit")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("fleet-worker", version)
+		return
+	}
 
 	if err := run(*configPath, *check); err != nil {
 		fmt.Fprintln(os.Stderr, "fleet-worker:", err)

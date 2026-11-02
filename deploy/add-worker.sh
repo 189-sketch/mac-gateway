@@ -2,7 +2,7 @@
 # Registers a new machine on an installed gateway and prints the command to run
 # on that machine. Run it on the gateway server.
 #
-#   ./deploy/add-worker.sh mac-mini-2
+#   fleet-add-worker mac-mini-2
 set -euo pipefail
 
 # Only the install script's tests set this, to install into a scratch directory.

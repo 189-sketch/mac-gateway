@@ -15,7 +15,11 @@ import (
 	"mactunnel/internal/gateway"
 )
 
+// version is set when building a release.
+var version = "dev"
+
 const usage = `usage:
+  fleet-gateway version
   fleet-gateway serve [flags]
   fleet-gateway node add <name>      [--data DIR]   print a new node token
   fleet-gateway node revoke <name>   [--data DIR]
@@ -34,6 +38,9 @@ func run(args []string) error {
 		return errors.New(usage)
 	}
 	switch args[0] {
+	case "version":
+		fmt.Println("fleet-gateway", version)
+		return nil
 	case "serve":
 		return serve(args[1:])
 	case "node", "key":

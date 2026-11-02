@@ -30,9 +30,13 @@ make test    # All tests, including the end-to-end suite (a few minutes)
 
 ## Install
 
+Prebuilt binaries are on the [Releases page](https://github.com/189-sketch/mac-gateway/releases). Releases are marked as pre-releases until they've been run on a real Mac.
+
+Mac installs use a one-line command rather than a double-click download. A file downloaded through a browser is blocked by Gatekeeper unless it's signed with a paid Apple Developer ID, and these aren't. Files fetched with `curl` aren't blocked this way.
+
 ### What you need
 
-- **Server:** Debian or Ubuntu on x86-64, a normal user with `sudo`, and Go 1.27 or newer to build the binaries.
+- **Server:** Debian or Ubuntu on x86-64 or ARM64, with a normal user who has `sudo`. Installing from a release doesn't need Go.
 - **Domain:** a domain name with its DNS pointing at the server.
 - **Firewall:** ports 80 and 443 open on the server, including in any cloud security group. Caddy needs both to get its HTTPS certificate.
 - **Mac:** macOS on Apple silicon or Intel. Your home network doesn't need any open ports.
@@ -41,17 +45,31 @@ Run the commands below in your own terminal. They print secrets that are shown o
 
 ### 1. Install the gateway
 
-On the server:
+Run one of these on the server, replacing `fleet.example.com` with your domain and `mac-mini-1` with a name for your first machine.
+
+**One line, if the repo is public:**
 
 ```sh
-git clone https://github.com/189-sketch/mac-gateway.git
-cd mac-gateway
+curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.2.0/install-gateway.sh | bash -s -- fleet.example.com mac-mini-1
+```
+
+**From a downloaded bundle, which also works while the repo is private.** Download `fleet-server-linux-amd64.tar.gz` (or `-arm64`) from the [Releases page](https://github.com/189-sketch/mac-gateway/releases) while logged in, or use the GitHub CLI as below:
+
+```sh
+gh release download v0.2.0 -R 189-sketch/mac-gateway -p 'fleet-server-linux-amd64.tar.gz'
+tar -xzf fleet-server-linux-amd64.tar.gz
+./fleet-server-linux-amd64/install-gateway.sh fleet.example.com mac-mini-1
+```
+
+**From source, which needs Go 1.27 or newer:**
+
+```sh
 ./deploy/install-gateway.sh fleet.example.com mac-mini-1
 ```
 
-The repo is private, so cloning it needs a GitHub login with access. Replace `fleet.example.com` with your domain and `mac-mini-1` with a name for your first machine. The script does the following:
+Whichever you use, the script does the following:
 
-1. Builds the binaries.
+1. Gets the binaries, and verifies their checksums if it downloaded them.
 2. Installs the gateway as the `fleet-gateway` service, with its data in `/var/lib/fleet`.
 3. Installs Caddy if it's missing and sets up HTTPS. Your existing Caddy sites are kept.
 4. Publishes the worker installer and worker binaries at `https://your-domain/install/`. They contain no secrets, and anyone can download them.
@@ -89,7 +107,13 @@ Then turn on automatic login for the worker's account in System Settings. The wo
 
 ### 4. Test it
 
-On any machine with the `fleet` command (build it with `go build -o fleet ./cmd/fleet`):
+You need the `fleet` command on the machine you test from. If the repo is public, this installs it to `~/.local/bin`:
+
+```sh
+curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.2.0/install-cli.sh | sh
+```
+
+Otherwise, download `fleet-linux-amd64`, `fleet-darwin-arm64` or the one for your machine from the Releases page, or build it with `go build -o fleet ./cmd/fleet`. Then:
 
 ```sh
 export FLEET_URL=https://fleet.example.com
@@ -103,24 +127,19 @@ You should get `hello.aiff` on the machine that ran the command. To confirm jobs
 
 ### Add another machine
 
-On the server, from the repo:
+On the server:
 
 ```sh
-./deploy/add-worker.sh mac-mini-2
+fleet-add-worker mac-mini-2
 ```
 
 Then run the command it prints on the new machine. Only macOS workers are available so far.
 
 ### Upgrade
 
-Upgrade the server first, then each Mac. Neither command needs a node name or token this time:
+Upgrade the server first, by running the install command from a newer release without a node name. Then run this on each Mac, which needs no node name or token:
 
 ```sh
-# On the server, from the repo
-git pull
-./deploy/install-gateway.sh fleet.example.com
-
-# On each Mac
 curl -fsSL https://fleet.example.com/install/worker.sh | sh
 ```
 
@@ -162,7 +181,7 @@ On the server, this also deletes all jobs, results and credentials:
 
 ```sh
 sudo systemctl disable --now fleet-gateway
-sudo rm -rf /var/lib/fleet /srv/fleet /etc/systemd/system/fleet-gateway.service /usr/local/bin/fleet-gateway /etc/caddy/fleet.caddy
+sudo rm -rf /var/lib/fleet /srv/fleet /etc/systemd/system/fleet-gateway.service /usr/local/bin/fleet-gateway /usr/local/bin/fleet-add-worker /etc/caddy/fleet.caddy
 sudo sed -i '/^import fleet.caddy$/d' /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 sudo userdel fleet
@@ -308,6 +327,18 @@ Add a capability to the machine's `worker.yaml` and restart the worker. The gate
 - **Environment:** commands get only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR` and whatever the capability's `env` sets.
 
 Unknown fields, missing programs and invalid schemas stop the worker at startup. Check a config with `fleet-worker --config worker.yaml --check`.
+
+## Publish a release
+
+From a clean checkout, build the files and upload them. Nothing is published until the last command:
+
+```sh
+./deploy/test-install.sh
+./deploy/build-release.sh v0.3.0
+gh release create v0.3.0 --prerelease --target "$(git rev-parse HEAD)" --title v0.3.0 dist/release/*
+```
+
+The version is built into the binaries and into the download address in the install scripts, so each release's scripts fetch that release's files. Update the version in this README's install commands too.
 
 ## Layout
 

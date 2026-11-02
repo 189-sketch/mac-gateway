@@ -26,8 +26,12 @@ import (
 	"mactunnel/internal/transfer"
 )
 
+// version is set when building a release.
+var version = "dev"
+
 const usage = `usage: fleet <command> [arguments]
 
+  fleet version
   fleet capabilities
   fleet run CAPABILITY [flags]        submit a job, follow it, download its results
   fleet status JOB [--wait N] [--events]
@@ -91,6 +95,10 @@ func run(args []string) int {
 		if len(args) == 0 {
 			return exitUsage
 		}
+		return exitOK
+	}
+	if args[0] == "version" {
+		fmt.Println("fleet", version)
 		return exitOK
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

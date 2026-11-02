@@ -113,7 +113,7 @@ main() {
 
 	mkdir -p "$FLEET_HOME" "$HOME/Library/LaunchAgents"
 	if [ ! -f "$FLEET_HOME/token" ] && [ -z "$NODE_TOKEN" ]; then
-		die "FLEET_NODE_TOKEN isn't set; on the gateway, run: ./deploy/add-worker.sh NAME"
+		die "FLEET_NODE_TOKEN isn't set; on the gateway, run: fleet-add-worker NAME"
 	fi
 	if [ ! -f "$FLEET_HOME/worker.yaml" ]; then
 		[ -n "$NODE_NAME" ] || die "FLEET_NODE_NAME isn't set"
