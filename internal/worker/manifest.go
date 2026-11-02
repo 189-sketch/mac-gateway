@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -75,6 +76,12 @@ type Capability struct {
 	Requires    map[string]int    `yaml:"requires"`
 	Timeout     string            `yaml:"timeout"`
 	RetryIfLost bool              `yaml:"retry_if_lost"`
+
+	// The http and http_async adapters use these instead of Command.
+	Request     *RequestTemplate `yaml:"request"`
+	Response    *ResponseConfig  `yaml:"response"`
+	Async       *AsyncConfig     `yaml:"async"`
+	AllowRemote bool             `yaml:"allow_remote"`
 
 	timeout    time.Duration
 	schemaJSON []byte
@@ -181,21 +188,12 @@ func (c *Capability) validate(resources map[string]int) error {
 	if !capabilityNameRE.MatchString(c.Name) {
 		return errors.New("name must be lowercase letters, digits, '.', '_' or '-'")
 	}
-	if c.Adapter != "cli" {
-		return fmt.Errorf("adapter %q is not supported (only cli is available)", c.Adapter)
+	switch c.Adapter {
+	case adapterCLI, adapterHTTP, adapterHTTPAsync:
+	default:
+		return fmt.Errorf("adapter %q is not supported (use cli, http or http_async)", c.Adapter)
 	}
-	if len(c.Command) == 0 {
-		return errors.New("command is required")
-	}
-	if placeholderRE.MatchString(c.Command[0]) {
-		return errors.New("the program in command[0] cannot contain placeholders")
-	}
-	// Resolve now, so a missing tool stops the capability being advertised.
-	executable, err := exec.LookPath(c.Command[0])
-	if err != nil {
-		return fmt.Errorf("cannot find program: %w", err)
-	}
-	if c.executable, err = filepath.Abs(executable); err != nil {
+	if err := c.rejectFields(); err != nil {
 		return err
 	}
 	seenFiles := make(map[string]bool, len(c.InputFiles))
@@ -208,12 +206,13 @@ func (c *Capability) validate(resources map[string]int) error {
 		}
 		seenFiles[field] = true
 	}
-	for _, arg := range c.Command[1:] {
-		if err := checkPlaceholders(arg, seenFiles); err != nil {
-			return err
-		}
+	var err error
+	if c.isService() {
+		err = c.validateService(seenFiles)
+	} else {
+		err = c.validateCommand(seenFiles)
 	}
-	if err := checkPlaceholders(c.Stdin, seenFiles); err != nil {
+	if err != nil {
 		return err
 	}
 
@@ -237,6 +236,9 @@ func (c *Capability) validate(resources map[string]int) error {
 		if !outputNameRE.MatchString(strings.TrimPrefix(filepath.Ext(rel), ".")) && filepath.Ext(rel) != "" {
 			return fmt.Errorf("output %q has an invalid file extension", name)
 		}
+	}
+	if err := c.validateResponse(); err != nil {
+		return err
 	}
 
 	if c.Progress != nil {
@@ -263,6 +265,46 @@ func (c *Capability) validate(resources map[string]int) error {
 	return nil
 }
 
+func (c *Capability) validateCommand(files map[string]bool) error {
+	if len(c.Command) == 0 {
+		return errors.New("command is required")
+	}
+	if placeholderRE.MatchString(c.Command[0]) {
+		return errors.New("the program in command[0] cannot contain placeholders")
+	}
+	// Resolve now, so a missing tool stops the capability being advertised.
+	executable, err := exec.LookPath(c.Command[0])
+	if err != nil {
+		return fmt.Errorf("cannot find program: %w", err)
+	}
+	if c.executable, err = filepath.Abs(executable); err != nil {
+		return err
+	}
+	if err := checkExecutable(c.executable, runtime.GOOS); err != nil {
+		return err
+	}
+	for _, arg := range c.Command[1:] {
+		if err := checkPlaceholders(arg, files); err != nil {
+			return err
+		}
+	}
+	return checkPlaceholders(c.Stdin, files)
+}
+
+// checkExecutable refuses Windows batch files. Windows runs them through cmd.exe,
+// whatever the caller asks for, and cmd.exe reparses the arguments. That would
+// let job input run commands, which this worker promises can't happen.
+func checkExecutable(path, goos string) error {
+	if goos != "windows" {
+		return nil
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".bat", ".cmd":
+		return errors.New("batch files can't be used as a program, because cmd.exe would reparse job input as commands; run the tool directly")
+	}
+	return nil
+}
+
 func checkPlaceholders(tpl string, files map[string]bool) error {
 	for _, match := range placeholderRE.FindAllStringSubmatch(tpl, -1) {
 		if field, isFile := strings.CutPrefix(match[1], "files."); isFile {
@@ -283,6 +325,8 @@ type templateVars struct {
 	workdir string
 	input   map[string]any
 	files   map[string]string // Input file field to its local path.
+	// remoteID is a service's own ID for this job, once http_async has one.
+	remoteID string
 }
 
 // render fills a template in one pass, so placeholder syntax inside a value is
@@ -293,6 +337,9 @@ func render(tpl string, vars templateVars) (string, error) {
 		name := placeholderRE.FindStringSubmatch(match)[1]
 		if name == "workdir" {
 			return vars.workdir
+		}
+		if name == remoteIDVar {
+			return vars.remoteID
 		}
 		if field, isFile := strings.CutPrefix(name, "files."); isFile {
 			path, ok := vars.files[field]
@@ -376,7 +423,8 @@ func (m *Manifest) ReadToken() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if info.Mode().Perm()&0o077 != 0 {
+	// Windows has no mode bits to check. Its installer restricts the file instead.
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 		return "", fmt.Errorf("%s is accessible by other users; run: chmod 600 %s", m.TokenFile, m.TokenFile)
 	}
 	raw, err := os.ReadFile(m.TokenFile)

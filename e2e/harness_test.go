@@ -393,7 +393,8 @@ type job struct {
 		SHA256 string `json:"sha256"`
 		URL    string `json:"url"`
 	} `json:"artifacts"`
-	Events []jobEvent `json:"events"`
+	Result json.RawMessage `json:"result"`
+	Events []jobEvent      `json:"events"`
 }
 
 func (h *harness) request(method, path, token string, body any) (int, []byte) {

@@ -8,14 +8,19 @@ Agent ──HTTPS──▶ Gateway (cloud server) ◀──outbound WSS + HTTPS�
 
 Workers only make outbound connections, so your home network needs no open ports. Each worker can run only what its local manifest declares. The gateway sends a capability name and input, never a command.
 
-This covers steps 1 and 2 of the design: the gateway, the worker, the CLI adapter, progress streaming, cancellation, file transfer and the `fleet` command. The tests run on Linux with a stand-in tool. Nothing has run on a real Mac or through a real server install yet, so the install steps below, including `say`, launchd and Caddy, are untested.
+This covers steps 1 to 3 of the design: the gateway, the worker, adapters for command-line tools and HTTP services, progress streaming, cancellation, file transfer, the `fleet` command, a status dashboard and a Windows worker.
+
+**What has been tested:** the suite runs the real gateway and worker on Linux, with a stand-in tool and a stand-in HTTP service, and the dashboard has been checked in headless Chromium.
+
+**What hasn't:**
+- Nothing has run on a real Mac or through a real server install, so `say`, launchd, systemd and Caddy are untested.
+- The Windows worker and its installer have been compiled but have never run on Windows.
+- The HTTP adapters haven't been used with a real service such as Ollama or ComfyUI.
 
 **Not built yet:**
-- The HTTP adapter
 - LLM streaming
+- An OpenAI-compatible endpoint
 - MCP
-- A Windows worker
-- A dashboard
 
 ## Build
 
@@ -23,7 +28,7 @@ This needs Go 1.27 or newer. The `make` targets are shortcuts, so if `make` isn'
 
 ```sh
 make build   # Binaries for this machine, in bin/
-make dist    # Gateway for Linux, workers for both Mac types and the CLI, in dist/
+make dist    # Gateway for Linux, workers for Mac and Windows, and the CLI, in dist/
 make test    # All tests, including the end-to-end suite (a few minutes)
 ./deploy/test-install.sh   # Tests the install scripts without changing this machine
 ```
@@ -39,7 +44,7 @@ Mac installs use a one-line command rather than a double-click download. A file 
 - **Server:** Debian or Ubuntu on x86-64 or ARM64, with a normal user who has `sudo`. Installing from a release doesn't need Go.
 - **Domain:** a domain name with its DNS pointing at the server.
 - **Firewall:** ports 80 and 443 open on the server, including in any cloud security group. Caddy needs both to get its HTTPS certificate.
-- **Mac:** macOS on Apple silicon or Intel. Your home network doesn't need any open ports.
+- **Worker machine:** macOS on Apple silicon or Intel, or Windows 10 or 11 on x64 or ARM64. Your home network doesn't need any open ports.
 
 Run the commands below in your own terminal. They print secrets that are shown only once, so don't paste the output into chats or tickets.
 
@@ -133,11 +138,44 @@ On the server:
 fleet-add-worker mac-mini-2
 ```
 
-Then run the command it prints on the new machine. Only macOS workers are available so far.
+It prints one command for a Mac and one for Windows. Run the one that fits the new machine.
+
+### Install on Windows
+
+This hasn't been run on real Windows yet, so expect to find rough edges.
+
+Run `fleet-add-worker windows-pc-1` on the server. Then, on the PC, log in as the account the worker should use, open PowerShell with **Run as administrator**, and paste the Windows command it printed:
+
+```powershell
+[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; $env:FLEET_NODE_NAME = 'windows-pc-1'; $env:FLEET_NODE_TOKEN = 'fn_...'; irm https://fleet.example.com/install/worker.ps1 | iex
+```
+
+The script does the following:
+
+1. Downloads the worker for your processor and verifies its checksum.
+2. Installs into `%LOCALAPPDATA%\Fleet`, with a `worker.yaml` that offers one test service, `system.hostname`, and limits the token file to this user.
+3. Registers a scheduled task named **Fleet Worker**, which runs at boot as this user with limited rights, with nobody logged in, and comes back within 5 minutes after a crash.
+
+It needs administrator rights only to register the task. A scheduled task is used rather than a Windows service so the worker runs in your account, where your tools and models are installed. It can't reach network shares when started this way.
+
+The script doesn't change your power settings, so do this yourself to keep the PC from sleeping on mains power:
+
+```powershell
+powercfg /change standby-timeout-ac 0
+powercfg /change hibernate-timeout-ac 0
+```
+
+To upgrade, run the same command again without the node name and token. To uninstall, run `Unregister-ScheduledTask -TaskName 'Fleet Worker'`, then delete `%LOCALAPPDATA%\Fleet`.
+
+Some things work differently on Windows:
+
+- **Stopping a job is immediate.** Windows has no gentle stop signal for a program with no console, so a command gets no chance to clean up.
+- **Batch files are refused.** Windows runs `.bat` and `.cmd` files through `cmd.exe`, which would reparse job input as commands. Point `command` at the real program.
+- **Write paths in single quotes in YAML,** such as `command: ['C:\tools\ffmpeg.exe', ...]`, or the backslashes are read as escapes.
 
 ### Upgrade
 
-Upgrade the server first, by running the install command from a newer release without a node name. Then run this on each Mac, which needs no node name or token:
+Upgrade the server first, by running the install command from a newer release without a node name. Then run this on each Mac, which needs no node name or token. Windows is covered under [Install on Windows](#install-on-windows).
 
 ```sh
 curl -fsSL https://fleet.example.com/install/worker.sh | sh
@@ -155,7 +193,7 @@ sudo -u fleet fleet-gateway key revoke my-agent --data /var/lib/fleet
 sudo -u fleet fleet-gateway node revoke mac-mini-1 --data /var/lib/fleet
 ```
 
-`--capabilities` takes comma-separated patterns, and `'*'` allows everything. Revoking takes effect within a heartbeat. A revoked name can't be registered again, so a replacement machine needs a new name.
+`--capabilities` takes comma-separated patterns, and `'*'` allows everything. A key made with `--dashboard` instead can only view [the dashboard](#dashboard). Revoking takes effect within a heartbeat. A revoked name can't be registered again, so a replacement machine needs a new name.
 
 ### Troubleshooting
 
@@ -284,13 +322,15 @@ The stream sends these events:
 
 To resume after a disconnect, send the last `id` you saw as `Last-Event-ID`, or as `?after=ID`. You'll miss nothing and see nothing twice. Decide the outcome from `status` and `end`: a `failed` event can be followed by a rerun if the job has `retry_if_lost`.
 
+A job that used an HTTP service may also have a `result` holding the service's answer, as described under [Add a service](#add-a-service). `fleet run` and `fleet status` print it with the rest of the job.
+
 ### Job states
 
 | Status | Meaning | Final? |
 |---|---|---|
 | `queued` | Waiting for a node | No |
 | `assigned` | Sent to a node, not yet started | No |
-| `running` | The command is running or its results are uploading | No |
+| `running` | The command or service is working, or its results are uploading | No |
 | `lost` | The node went quiet; it may still return | No |
 | `succeeded` | Finished, with results available | Yes |
 | `failed` | Check `error.code` | Yes |
@@ -314,6 +354,16 @@ A job is finished when `terminal` is `true`. If a job is rerun, `attempts` goes 
 
 Only set `retry_if_lost` for work that is safe to repeat.
 
+HTTP services add these error codes:
+
+| Code | Meaning | `retryable` |
+|---|---|---|
+| `SERVICE_ERROR` | The service refused the job or said it failed. The message has its reply | No |
+| `SERVICE_UNAVAILABLE` | The service couldn't be reached, or answered 408, 429, 502, 503 or 504 | Yes |
+| `BAD_RESPONSE` | The reply wasn't usable: not JSON, a missing field, or too large for a `result` | No |
+
+`retryable` is advice for the agent. The gateway doesn't resubmit these by itself.
+
 ## Add a service
 
 Add a capability to the machine's `worker.yaml` and restart the worker. The gateway needs no changes.
@@ -327,6 +377,102 @@ Add a capability to the machine's `worker.yaml` and restart the worker. The gate
 - **Environment:** commands get only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR` and whatever the capability's `env` sets.
 
 Unknown fields, missing programs and invalid schemas stop the worker at startup. Check a config with `fleet-worker --config worker.yaml --check`.
+
+### Call an HTTP service
+
+For a service already running on the machine, use `adapter: http` instead of a command:
+
+```yaml
+- name: llm.generate
+  adapter: http
+  request:
+    url: http://127.0.0.1:11434/api/generate
+    json:
+      model: llama3
+      prompt: "{{input.prompt}}"
+      temperature: "{{input.temperature}}" # Left out if the job doesn't send it.
+      stream: false
+  response:
+    result: json
+    result_field: response
+  input_schema:
+    type: object
+    required: [prompt]
+    properties:
+      prompt: { type: string }
+      temperature: { type: number }
+  timeout: 10m
+```
+
+- **Where it can connect:** the scheme and host are fixed in the manifest, and must be this machine unless the capability sets `allow_remote: true`. Job input can only fill in the path, the query and the body. A redirect to a different host isn't followed.
+- **URLs:** `{{input.field}}` in a URL is escaped for its position. A value used in the path must stay one segment, so one containing `/` or equal to `..` is refused.
+- **Bodies:** set one of `json`, `body` or `body_file`.
+  - In `json`, a string that's only a placeholder keeps the value's type, so input can't alter the document's structure, and `{{input}}` is the whole input. A key whose field wasn't sent is left out.
+  - `body` is raw text, with no escaping.
+  - `body_file: "{{files.field}}"` sends an input file as the whole body. Multipart uploads aren't supported.
+  - `{{workdir}}` and `{{files.field}}` also work in `json` and `body`, for a local service that reads and writes files itself.
+- **Headers:** values can use `{{env.NAME}}`, read from the worker's environment at startup, so secrets can stay out of the manifest. Job input can't reach a header.
+- **The answer:** with no `response`, only success or failure is kept. There are two ways to keep the reply:
+  - `result: json` or `result: text` puts it in the job's `result`, up to 1 MB. `result_field` picks out one field, using a path such as `choices.0.text`.
+  - `file: out.wav` saves it. The same path must be listed in `outputs`, which is what delivers it.
+- **Progress and timeouts:** `timeout` covers the whole call. A plain `http` capability reports no progress. Cancelling a job drops the connection, and the service decides what that means for its work.
+
+A capability is advertised even while its service is down, so jobs sent to it fail with `SERVICE_UNAVAILABLE` rather than moving to another machine.
+
+### Call a service with its own job queue
+
+Use `adapter: http_async` for a service that answers with a job ID and works in the background:
+
+```yaml
+- name: image.generate
+  adapter: http_async
+  request:
+    url: http://127.0.0.1:8188/jobs
+    json: "{{input}}"
+  async:
+    job_id_field: id
+    poll:
+      url: http://127.0.0.1:8188/jobs/{{remote.id}}
+      every: 2s
+      status_field: state
+      succeeded: [done]
+      failed: [error]
+      percent_field: fraction
+      percent_scale: 100 # This service reports 0 to 1.
+      message_field: stage
+      error_field: detail
+    fetch:
+      url: http://127.0.0.1:8188/jobs/{{remote.id}}/image
+    cancel:
+      method: DELETE
+      url: http://127.0.0.1:8188/jobs/{{remote.id}}
+  response:
+    file: out.png
+  outputs:
+    image: out.png
+  input_schema: { type: object }
+  timeout: 1h
+```
+
+- **Finishing:** a status that isn't listed, or isn't there yet, means keep waiting until `timeout`.
+- **Collecting the result:** `response` applies to the `fetch` reply. With no `fetch`, it applies to the poll reply that reported success.
+- **Outages:** while checking on a job, the worker waits out network errors and "try later" statuses for `give_up_after` (2 minutes by default). Any other error status, such as a 404 from a service that has forgotten the job, fails it straight away.
+- **Stopping:** `cancel` is sent when the job is cancelled, times out or is abandoned, and when a restarted worker finds a job left over from a crash. It's a best effort, so without it, or if it fails, the service's job keeps running. It also won't be sent if the worker crashes in the moment between submitting a job and recording its ID.
+- **Placeholders:** `poll`, `fetch` and `cancel` can use only `{{remote.id}}`, because after a crash the job's input is gone.
+
+## Dashboard
+
+The gateway serves a status page at `https://fleet.example.com/dashboard/`, showing machines, their load, and jobs with their progress and failures. It refreshes every 3 seconds while its tab is visible.
+
+It needs its own kind of key. On the server:
+
+```sh
+sudo -u fleet fleet-gateway key add ops --dashboard --data /var/lib/fleet
+```
+
+A dashboard key can see the status of every job from every agent, but can't run or cancel anything, and can't read job input, `result` values or result files. Agent keys can't open the dashboard. The key is kept only in the browser tab and is forgotten when the tab closes.
+
+**Error messages are visible to anyone with a dashboard key.** They can include what a command printed or a service replied, and that may quote part of a job's input.
 
 ## Publish a release
 
@@ -347,9 +493,12 @@ The version is built into the binaries and into the download address in the inst
 | `cmd/` | The three programs: `fleet-gateway`, `fleet-worker` and `fleet` |
 | `internal/gateway/lifecycle.go` | Every job state transition: leases, fencing, revival and retries |
 | `internal/gateway/` | API, scheduler, worker connections and storage |
+| `internal/gateway/dashboard.go`, `internal/gateway/web/` | Dashboard API, and its page, which is built into the binary |
 | `internal/worker/` | Manifest, command execution, event spool and connection |
+| `internal/worker/service.go`, `service_config.go` | The HTTP adapters |
+| `internal/worker/proc_unix.go`, `proc_windows.go` | Stopping commands, per operating system |
 | `internal/transfer/` | Resumable, verified file downloads, shared by the worker and CLI |
 | `internal/client/` | Client for the agent API, including stream reconnects |
 | `internal/protocol/` | Messages between gateway and worker |
 | `e2e/` | Tests that run the real binaries, with a proxy that simulates network cuts |
-| `deploy/` | Install scripts, plus example worker manifest, launchd, systemd and Caddy files |
+| `deploy/` | Install scripts for Mac and Windows, plus example worker manifest, launchd, systemd and Caddy files |

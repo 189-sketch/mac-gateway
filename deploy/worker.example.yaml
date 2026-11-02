@@ -55,3 +55,24 @@ capabilities:
   #     cpu_heavy: 1
   #   timeout: 2h
   #   retry_if_lost: true
+
+  # A service already running on this machine. The README's "Add a service"
+  # section explains these settings, and http_async for services with a job queue.
+  #
+  # - name: llm.generate
+  #   adapter: http
+  #   request:
+  #     url: http://127.0.0.1:11434/api/generate
+  #     json:
+  #       model: llama3
+  #       prompt: "{{input.prompt}}"
+  #       stream: false
+  #   response:
+  #     result: json
+  #     result_field: response
+  #   input_schema:
+  #     type: object
+  #     required: [prompt]
+  #     properties:
+  #       prompt: { type: string }
+  #   timeout: 10m

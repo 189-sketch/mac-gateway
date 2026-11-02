@@ -24,6 +24,7 @@ const usage = `usage:
   fleet-gateway node add <name>      [--data DIR]   print a new node token
   fleet-gateway node revoke <name>   [--data DIR]
   fleet-gateway key add <name> --capabilities 'tts.*,video.*' [--data DIR]   print a new API key
+  fleet-gateway key add <name> --dashboard [--data DIR]   print a new key for viewing the dashboard
   fleet-gateway key revoke <name>    [--data DIR]`
 
 func main() {
@@ -92,6 +93,7 @@ func manageCredential(kind, action, name string, args []string) error {
 	fs := flag.NewFlagSet(kind, flag.ContinueOnError)
 	dataDir := fs.String("data", gateway.DefaultConfig().DataDir, "data directory")
 	capabilities := fs.String("capabilities", "", "comma-separated capability patterns, such as tts.*")
+	dashboard := fs.Bool("dashboard", false, "make a key that can only view the dashboard")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -115,10 +117,19 @@ func manageCredential(kind, action, name string, args []string) error {
 	case "node revoke":
 		return store.RevokeNode(ctx, name)
 	case "key add":
-		if *capabilities == "" {
-			return errors.New("--capabilities is required; use '*' to allow all")
+		if *dashboard && *capabilities != "" {
+			return errors.New("a dashboard key can't run jobs, so don't combine --dashboard with --capabilities")
 		}
-		secret, err := store.AddAPIKey(ctx, name, strings.Split(*capabilities, ","))
+		var secret string
+		var err error
+		switch {
+		case *dashboard:
+			secret, err = store.AddDashboardKey(ctx, name)
+		case *capabilities == "":
+			return errors.New("--capabilities is required; use '*' to allow all")
+		default:
+			secret, err = store.AddAPIKey(ctx, name, strings.Split(*capabilities, ","))
+		}
 		if err != nil {
 			return err
 		}

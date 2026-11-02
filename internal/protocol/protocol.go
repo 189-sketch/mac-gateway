@@ -45,6 +45,13 @@ const (
 	CodeUploadFailed      = "UPLOAD_FAILED"
 	CodeWorkerRestarted   = "WORKER_RESTARTED"
 	CodeUnknownCapability = "UNKNOWN_CAPABILITY"
+	// CodeServiceError means an HTTP service refused the job or reported failure.
+	CodeServiceError = "SERVICE_ERROR"
+	// CodeServiceUnavailable means an HTTP service couldn't be reached or asked
+	// to be tried later, so resubmitting may work.
+	CodeServiceUnavailable = "SERVICE_UNAVAILABLE"
+	// CodeBadResponse means an HTTP service answered with something unusable.
+	CodeBadResponse = "BAD_RESPONSE"
 )
 
 // Envelope frames every WebSocket message.
@@ -165,4 +172,6 @@ type ArtifactRef struct {
 // Completion is the payload of a completed event.
 type Completion struct {
 	Artifacts []ArtifactRef `json:"artifacts"`
+	// Result is a small inline answer from an HTTP service, if it was asked for.
+	Result json.RawMessage `json:"result,omitempty"`
 }

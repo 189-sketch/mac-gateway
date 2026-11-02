@@ -98,6 +98,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 	UNIQUE (api_key_id, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status, created_ms);
+CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created_ms, id);
+CREATE INDEX IF NOT EXISTS jobs_finished ON jobs(finished_ms);
 CREATE TABLE IF NOT EXISTS attempts (
 	id TEXT PRIMARY KEY,
 	job_id TEXT NOT NULL REFERENCES jobs(id),
@@ -177,6 +179,10 @@ func OpenStore(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("upgrade schema: %w", err)
 	}
+	if err := ensureColumn(db, "api_keys", "dashboard", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("upgrade schema: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -251,6 +257,16 @@ func (s *Store) AddAPIKey(ctx context.Context, name string, patterns []string) (
 	return secret, nil
 }
 
+// AddDashboardKey creates a key that can view the dashboard and do nothing else.
+func (s *Store) AddDashboardKey(ctx context.Context, name string) (string, error) {
+	secret, hash := newSecret("fd_")
+	_, err := s.db.ExecContext(ctx, `INSERT INTO api_keys (id, name, key_hash, capabilities, dashboard) VALUES (?, ?, ?, '[]', 1)`, newID("key_"), name, hash)
+	if err != nil {
+		return "", fmt.Errorf("add key %q: %w", name, err)
+	}
+	return secret, nil
+}
+
 // RevokeAPIKey invalidates an agent key.
 func (s *Store) RevokeAPIKey(ctx context.Context, name string) error {
 	return requireOneRow(s.db.ExecContext(ctx, `UPDATE api_keys SET revoked_ms = ? WHERE name = ? AND revoked_ms IS NULL`, nowMS(), name))
@@ -288,15 +304,16 @@ func (s *Store) NodeByToken(ctx context.Context, token string) (*Node, error) {
 
 // APIKey is an authenticated agent identity.
 type APIKey struct {
-	ID       string
-	Patterns []string
+	ID        string
+	Patterns  []string
+	Dashboard bool // Can view the dashboard, and can't use the agent API.
 }
 
 // APIKeyBySecret returns the active key matching a secret.
 func (s *Store) APIKeyBySecret(ctx context.Context, secret string) (*APIKey, error) {
 	var k APIKey
 	var patterns string
-	err := s.db.QueryRowContext(ctx, `SELECT id, capabilities FROM api_keys WHERE key_hash = ? AND revoked_ms IS NULL`, hashSecret(secret)).Scan(&k.ID, &patterns)
+	err := s.db.QueryRowContext(ctx, `SELECT id, capabilities, dashboard FROM api_keys WHERE key_hash = ? AND revoked_ms IS NULL`, hashSecret(secret)).Scan(&k.ID, &patterns, &k.Dashboard)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -487,6 +504,7 @@ type JobView struct {
 	Progress   json.RawMessage `json:"progress,omitempty"`
 	Error      *JobError       `json:"error,omitempty"`
 	Artifacts  []ArtifactView  `json:"artifacts"`
+	Result     json.RawMessage `json:"result,omitempty"`
 	Events     []EventView     `json:"events,omitempty"`
 	CreatedAt  string          `json:"created_at"`
 	StartedAt  string          `json:"started_at,omitempty"`
@@ -541,6 +559,9 @@ func (s *Store) GetJob(ctx context.Context, jobID, apiKeyID string, withEvents b
 		if v.Artifacts, err = s.jobArtifacts(ctx, jobID); err != nil {
 			return nil, err
 		}
+		if v.Result, err = s.jobResult(ctx, jobID); err != nil {
+			return nil, err
+		}
 	}
 	if withEvents {
 		if v.Events, err = s.JobEventsAfter(ctx, jobID, 0); err != nil {
@@ -548,6 +569,25 @@ func (s *Store) GetJob(ctx context.Context, jobID, apiKeyID string, withEvents b
 		}
 	}
 	return &v, nil
+}
+
+// jobResult reads the inline result from the event that completed the job.
+func (s *Store) jobResult(ctx context.Context, jobID string) (json.RawMessage, error) {
+	var payload sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		SELECT e.payload FROM job_events e JOIN jobs j ON j.current_attempt = e.attempt_id
+		WHERE e.job_id = ? AND e.type = ?`, jobID, protocol.EventCompleted).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && !payload.Valid) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var done protocol.Completion
+	if err := json.Unmarshal([]byte(payload.String), &done); err != nil {
+		return nil, nil
+	}
+	return done.Result, nil
 }
 
 func (s *Store) jobArtifacts(ctx context.Context, jobID string) ([]ArtifactView, error) {
@@ -576,7 +616,7 @@ func (s *Store) jobArtifacts(ctx context.Context, jobID string) ([]ArtifactView,
 // isRetryable says whether an agent can reasonably resubmit after this error.
 func isRetryable(code string) bool {
 	switch code {
-	case CodeNodeLost, CodeNoNodeOnline, CodeQueueTimeout, CodeDeadline, protocol.CodeWorkerRestarted, protocol.CodeUploadFailed, protocol.CodeDownloadFailed:
+	case CodeNodeLost, CodeNoNodeOnline, CodeQueueTimeout, CodeDeadline, protocol.CodeWorkerRestarted, protocol.CodeUploadFailed, protocol.CodeDownloadFailed, protocol.CodeServiceUnavailable:
 		return true
 	}
 	return false

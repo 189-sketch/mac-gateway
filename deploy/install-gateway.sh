@@ -71,8 +71,9 @@ build_from_source() {
 		CGO_ENABLED=0 go build -trimpath -o "$BUNDLE/fleet-gateway" ./cmd/fleet-gateway
 		for arch in arm64 amd64; do
 			CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" go build -trimpath -o "$BUNDLE/fleet-worker-darwin-$arch" ./cmd/fleet-worker
+			CGO_ENABLED=0 GOOS=windows GOARCH="$arch" go build -trimpath -o "$BUNDLE/fleet-worker-windows-$arch.exe" ./cmd/fleet-worker
 		done
-		cp deploy/add-worker.sh deploy/install-worker.sh deploy/fleet-gateway.service "$BUNDLE/"
+		cp deploy/add-worker.sh deploy/install-worker.sh deploy/install-worker.ps1 deploy/fleet-gateway.service "$BUNDLE/"
 	)
 }
 
@@ -157,11 +158,13 @@ main() {
 	local url="https://$domain"
 	local staging="$WORKDIR/publish"
 	mkdir -p "$staging"
-	cp "$BUNDLE/fleet-worker-darwin-arm64" "$BUNDLE/fleet-worker-darwin-amd64" "$staging/"
+	local binaries=(fleet-worker-darwin-arm64 fleet-worker-darwin-amd64 fleet-worker-windows-amd64.exe fleet-worker-windows-arm64.exe)
+	(cd "$BUNDLE" && cp "${binaries[@]}" "$staging/")
 	sed "s|@@GATEWAY_URL@@|$url|g" "$BUNDLE/install-worker.sh" >"$staging/worker.sh"
-	(cd "$staging" && sha256sum fleet-worker-darwin-arm64 fleet-worker-darwin-amd64 >SHA256SUMS)
+	sed "s|@@GATEWAY_URL@@|$url|g" "$BUNDLE/install-worker.ps1" >"$staging/worker.ps1"
+	(cd "$staging" && sha256sum "${binaries[@]}" >SHA256SUMS)
 	sudo install -d -m 755 "$public"
-	sudo install -m 644 "$staging"/fleet-worker-darwin-arm64 "$staging"/fleet-worker-darwin-amd64 "$staging"/SHA256SUMS "$staging"/worker.sh "$public/"
+	(cd "$staging" && sudo install -m 644 "${binaries[@]}" SHA256SUMS worker.sh worker.ps1 "$public/")
 	echo "$url" | sudo tee "$ROOT/srv/fleet/gateway-url" >/dev/null
 
 	step "Setting up HTTPS with Caddy"
@@ -232,7 +235,7 @@ KEY
 	if [ -z "$reachable" ]; then
 		cat >&2 <<WARNING
 
-WARNING: the gateway is running, but $url isn't reachable yet, so the Mac
+WARNING: the gateway is running, but $url isn't reachable yet, so the worker
 install command won't work until it is. Check that:
   - DNS for $domain points at this server's public IP
   - ports 80 and 443 are open in the firewall or cloud security group

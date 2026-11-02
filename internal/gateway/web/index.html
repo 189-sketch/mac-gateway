@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fleet</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='2' y='2' width='5' height='5' rx='1' fill='%232a78d6'/%3E%3Crect x='9' y='2' width='5' height='5' rx='1' fill='%232a78d6'/%3E%3Crect x='2' y='9' width='5' height='5' rx='1' fill='%232a78d6'/%3E%3Crect x='9' y='9' width='5' height='5' rx='1' fill='%232a78d6'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<section id="signin" class="signin" hidden>
+  <h1>Fleet</h1>
+  <p>Enter a dashboard key to see your machines and jobs.</p>
+  <form id="signin-form">
+    <label for="key">Dashboard key</label>
+    <input id="key" type="password" autocomplete="off" spellcheck="false" required>
+    <p id="signin-error" class="form-error" role="alert" hidden></p>
+    <button type="submit" class="primary">Sign in</button>
+  </form>
+  <p class="hint">Create one on the gateway server:<br><code>sudo -u fleet fleet-gateway key add ops --dashboard --data /var/lib/fleet</code></p>
+  <p class="hint">The key stays in this tab and is forgotten when you close it. It can only view status: it can't run jobs or read their input or results.</p>
+</section>
+
+<div id="app" hidden>
+  <header class="topbar">
+    <h1>Fleet</h1>
+    <p id="freshness" class="freshness" role="status"></p>
+    <button id="signout" type="button" class="quiet">Sign out</button>
+  </header>
+  <main>
+    <section aria-label="Summary"><dl id="tiles" class="tiles"></dl></section>
+
+    <section aria-labelledby="machines-title">
+      <h2 id="machines-title">Machines</h2>
+      <div id="machines" class="machines"></div>
+    </section>
+
+    <section aria-labelledby="jobs-title">
+      <div class="section-head">
+        <h2 id="jobs-title">Jobs</h2>
+        <div class="filters">
+          <label>Status
+            <select id="filter-status">
+              <option value="">All</option>
+              <option value="active">Not finished</option>
+              <option value="running">Running</option>
+              <option value="queued">Queued</option>
+              <option value="lost">Lost</option>
+              <option value="succeeded">Succeeded</option>
+              <option value="failed">Failed</option>
+              <option value="timed_out">Timed out</option>
+              <option value="cancelled">Cancelled</option>
+            </select>
+          </label>
+          <label>Capability
+            <select id="filter-capability"><option value="">All</option></select>
+          </label>
+          <label>Machine
+            <select id="filter-node"><option value="">All</option></select>
+          </label>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="jobs">
+          <thead>
+            <tr><th scope="col">Status</th><th scope="col">Capability</th><th scope="col">Machine</th><th scope="col">Progress</th><th scope="col">Submitted by</th><th scope="col">Created</th><th scope="col" class="num">Took</th></tr>
+          </thead>
+          <tbody id="job-rows"></tbody>
+        </table>
+      </div>
+      <p id="jobs-empty" class="empty" hidden></p>
+      <button id="load-more" type="button" class="quiet more" hidden>Show older jobs</button>
+    </section>
+  </main>
+</div>
+
+<dialog id="detail" aria-labelledby="detail-title">
+  <div class="detail-head">
+    <h2 id="detail-title"></h2>
+    <button id="detail-close" type="button" class="quiet">Close</button>
+  </div>
+  <div id="detail-body"></div>
+</dialog>
+<script src="app.js"></script>
+</body>
+</html>

@@ -10,6 +10,8 @@ dist:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/fleet-gateway-linux-amd64 ./cmd/fleet-gateway
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -o dist/fleet-worker-darwin-arm64 ./cmd/fleet-worker
 	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -o dist/fleet-worker-darwin-amd64 ./cmd/fleet-worker
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o dist/fleet-worker-windows-amd64.exe ./cmd/fleet-worker
+	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 go build -trimpath -o dist/fleet-worker-windows-arm64.exe ./cmd/fleet-worker
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o dist/fleet-linux-amd64 ./cmd/fleet
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -o dist/fleet-darwin-arm64 ./cmd/fleet
 	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -trimpath -o dist/fleet-darwin-amd64 ./cmd/fleet

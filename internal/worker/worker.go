@@ -50,7 +50,10 @@ type Worker struct {
 	token      string
 	log        *slog.Logger
 	httpClient *http.Client
-	notify     chan struct{}
+	// serviceClient talks to local services. It's separate because httpClient's
+	// header timeout would cut off a model that takes minutes to start answering.
+	serviceClient *http.Client
+	notify        chan struct{}
 
 	mu       sync.Mutex
 	attempts map[string]*attempt
@@ -70,9 +73,11 @@ func New(manifest *Manifest, token string, log *slog.Logger) (*Worker, error) {
 		token:      token,
 		log:        log,
 		httpClient: &http.Client{Transport: transport},
-		notify:     make(chan struct{}, 1),
-		attempts:   map[string]*attempt{},
-		pids:       map[string]int{},
+
+		serviceClient: newServiceClient(),
+		notify:        make(chan struct{}, 1),
+		attempts:      map[string]*attempt{},
+		pids:          map[string]int{},
 	}
 	if err := w.recover(); err != nil {
 		return nil, fmt.Errorf("recover state: %w", err)
@@ -118,6 +123,7 @@ func (w *Worker) recover() error {
 		w.attempts[meta.AttemptID] = a
 		if a.terminalSeq == 0 {
 			killOrphan(meta, w.log)
+			w.cancelOrphanRemote(meta)
 			w.fail(a, protocol.CodeWorkerRestarted, "the worker restarted while this job was running")
 		}
 		w.log.Info("recovered attempt", "attempt", meta.AttemptID, "events", len(a.events))
@@ -132,7 +138,19 @@ func killOrphan(meta attemptMeta, log *slog.Logger) {
 		return
 	}
 	log.Warn("stopping orphaned command", "attempt", meta.AttemptID, "pid", meta.PID)
-	killGroup(meta.PID)
+	killOrphanProcess(meta.PID)
+}
+
+// cancelOrphanRemote asks a service to stop a job this worker started before it
+// crashed. It doesn't hold up startup, and failing only leaves that job running.
+func (w *Worker) cancelOrphanRemote(meta attemptMeta) {
+	if meta.RemoteID == "" {
+		return
+	}
+	if c := w.manifest.byName[meta.Capability]; c != nil {
+		w.log.Warn("stopping orphaned service job", "attempt", meta.AttemptID, "capability", meta.Capability)
+		go w.cancelRemote(c, meta.RemoteID)
+	}
 }
 
 func isFinalEvent(eventType string) bool {
@@ -460,6 +478,17 @@ func (w *Worker) recordProcess(a *attempt, pid int) {
 	meta.PIDStart = processStart(pid)
 	if err := writeMeta(a.dir, meta); err != nil {
 		w.log.Warn("could not record process", "attempt", meta.AttemptID, "error", err)
+	}
+}
+
+// recordRemote saves a service's job ID so a later run can cancel it after a crash.
+func (w *Worker) recordRemote(a *attempt, remoteID string) {
+	w.mu.Lock()
+	a.meta.RemoteID = remoteID
+	meta := a.meta
+	w.mu.Unlock()
+	if err := writeMeta(a.dir, meta); err != nil {
+		w.log.Warn("could not record the service's job ID", "attempt", meta.AttemptID, "error", err)
 	}
 }
 

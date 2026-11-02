@@ -40,6 +40,13 @@ func (g *Gateway) routes() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", g.withKey(g.handleCancelJob))
 	mux.HandleFunc("POST /v1/files", g.withKey(g.handleCreateFile))
 	mux.HandleFunc("GET /v1/files/{id}", g.withKey(g.handleGetFile))
+	mux.HandleFunc("GET /v1/dashboard/overview", g.withDashboardKey(g.handleDashboardOverview))
+	mux.HandleFunc("GET /v1/dashboard/jobs", g.withDashboardKey(g.handleDashboardJobs))
+	mux.HandleFunc("GET /v1/dashboard/jobs/{id}", g.withDashboardKey(g.handleDashboardJob))
+	mux.Handle("GET /dashboard/", dashboardHandler())
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "dashboard/", http.StatusFound)
+	})
 	mux.HandleFunc("GET /v1/worker/connect", g.handleWorkerConnect)
 	mux.HandleFunc("PUT /v1/worker/attempts/{attempt}/artifacts/{name}", g.handleUploadArtifact)
 	mux.HandleFunc("HEAD /v1/worker/attempts/{attempt}/artifacts/{name}", g.handleUploadStatus)
@@ -89,6 +96,10 @@ func (g *Gateway) withKey(next keyHandler) http.HandlerFunc {
 		}
 		if key == nil {
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", "invalid API key", false)
+			return
+		}
+		if key.Dashboard {
+			writeError(w, http.StatusForbidden, "FORBIDDEN", "a dashboard key can only view the dashboard", false)
 			return
 		}
 		next(w, r, key)

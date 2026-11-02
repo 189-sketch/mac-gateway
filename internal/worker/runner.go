@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -69,25 +70,32 @@ func (w *Worker) run(ctx context.Context, a *attempt, assign protocol.Assign) {
 		return
 	}
 	vars := templateVars{workdir: work, input: input, files: files}
-	args, err := renderCommand(capability.Command[1:], vars)
-	if err != nil {
-		w.fail(a, protocol.CodeInvalidInput, err.Error())
-		return
+	var result json.RawMessage
+	var outcome *protocol.Failure
+	if capability.isService() {
+		result, outcome = w.callService(ctx, a, capability, vars, work)
+	} else {
+		outcome = w.runCommand(ctx, a, capability, vars, work)
 	}
-	stdin, err := render(capability.Stdin, vars)
-	if err != nil {
-		w.fail(a, protocol.CodeInvalidInput, err.Error())
-		return
-	}
-
-	outcome := w.execute(ctx, a, capability, args, stdin, work)
 	if outcome != nil {
 		if ctx.Err() == nil || outcome.Code == protocol.CodeTimedOut {
 			w.fail(a, outcome.Code, outcome.Message)
 		}
 		return
 	}
-	w.deliverOutputs(ctx, a, capability, work)
+	w.deliverOutputs(ctx, a, capability, work, result)
+}
+
+func (w *Worker) runCommand(ctx context.Context, a *attempt, c *Capability, vars templateVars, work string) *protocol.Failure {
+	args, err := renderCommand(c.Command[1:], vars)
+	if err != nil {
+		return &protocol.Failure{Code: protocol.CodeInvalidInput, Message: err.Error()}
+	}
+	stdin, err := render(c.Stdin, vars)
+	if err != nil {
+		return &protocol.Failure{Code: protocol.CodeInvalidInput, Message: err.Error()}
+	}
+	return w.execute(ctx, a, c, args, stdin, work)
 }
 
 func (w *Worker) execute(ctx context.Context, a *attempt, c *Capability, args []string, stdin, work string) *protocol.Failure {
@@ -117,6 +125,7 @@ func (w *Worker) execute(ctx context.Context, a *attempt, c *Capability, args []
 	}
 	writer.Close()
 	pid := cmd.Process.Pid
+	groupStarted(cmd)
 	w.recordProcess(a, pid)
 	w.emit(a, protocol.EventStarted, nil)
 
@@ -180,19 +189,31 @@ func stopGroup(pid int, waited <-chan error) error {
 // childEnv deliberately starts empty, so the worker's own environment, which may
 // hold the node token, isn't inherited by commands.
 func childEnv(c *Capability, work string) []string {
+	return buildChildEnv(runtime.GOOS, os.LookupEnv, c.Env, work)
+}
+
+// buildChildEnv picks what a command gets. Windows programs can fail in odd ways
+// without its system variables: for one, networking needs SystemRoot.
+func buildChildEnv(goos string, lookup func(string) (string, bool), extra map[string]string, work string) []string {
+	inherit := []string{"PATH", "HOME", "LANG", "LC_ALL"}
 	env := map[string]string{"TMPDIR": work}
-	for _, key := range []string{"PATH", "HOME", "LANG", "LC_ALL"} {
-		if value, ok := os.LookupEnv(key); ok {
+	if goos == "windows" {
+		inherit = []string{"PATH", "PATHEXT", "SystemRoot", "SystemDrive", "windir", "ComSpec", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "ProgramData", "ProgramFiles", "ProgramFiles(x86)", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE"}
+		env = map[string]string{"TEMP": work, "TMP": work}
+	}
+	for _, key := range inherit {
+		if value, ok := lookup(key); ok {
 			env[key] = value
 		}
 	}
-	for key, value := range c.Env {
+	for key, value := range extra {
 		env[key] = value
 	}
 	out := make([]string, 0, len(env))
 	for key, value := range env {
 		out = append(out, key+"="+value)
 	}
+	sort.Strings(out)
 	return out
 }
 
@@ -276,7 +297,7 @@ func parseProgress(c *Capability, line string) (protocol.Progress, bool) {
 
 // deliverOutputs uploads every declared output, then reports completion. The
 // completed event is sent only after the gateway has the files.
-func (w *Worker) deliverOutputs(ctx context.Context, a *attempt, c *Capability, work string) {
+func (w *Worker) deliverOutputs(ctx context.Context, a *attempt, c *Capability, work string, result json.RawMessage) {
 	root, err := os.OpenRoot(work)
 	if err != nil {
 		w.fail(a, protocol.CodeOutputMissing, err.Error())
@@ -310,7 +331,7 @@ func (w *Worker) deliverOutputs(ctx context.Context, a *attempt, c *Capability, 
 		}
 		refs = append(refs, ref)
 	}
-	w.emit(a, protocol.EventCompleted, protocol.Completion{Artifacts: refs})
+	w.emit(a, protocol.EventCompleted, protocol.Completion{Artifacts: refs, Result: result})
 }
 
 // inspectOutput hashes an output file. os.Root stops a symlink the command

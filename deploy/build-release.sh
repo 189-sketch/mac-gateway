@@ -38,9 +38,11 @@ for arch in amd64 arm64; do
 	build linux "$arch" fleet-gateway "$bundle/fleet-gateway"
 	build darwin arm64 fleet-worker "$bundle/fleet-worker-darwin-arm64"
 	build darwin amd64 fleet-worker "$bundle/fleet-worker-darwin-amd64"
+	build windows amd64 fleet-worker "$bundle/fleet-worker-windows-amd64.exe"
+	build windows arm64 fleet-worker "$bundle/fleet-worker-windows-arm64.exe"
 	sed "s|@@RELEASE_URL@@|$RELEASE_URL|g" deploy/install-gateway.sh >"$bundle/install-gateway.sh"
 	chmod 755 "$bundle/install-gateway.sh"
-	cp deploy/add-worker.sh deploy/install-worker.sh deploy/fleet-gateway.service "$bundle/"
+	cp deploy/add-worker.sh deploy/install-worker.sh deploy/install-worker.ps1 deploy/fleet-gateway.service "$bundle/"
 	tar -C "$OUT" -czf "$OUT/$name.tar.gz" "$name"
 	rm -rf "$bundle"
 done
@@ -51,6 +53,7 @@ for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64; do
 	arch="${target#*/}"
 	build "$os" "$arch" fleet "$OUT/fleet-$os-$arch"
 done
+build windows amd64 fleet "$OUT/fleet-windows-amd64.exe"
 
 for script in install-gateway.sh install-cli.sh; do
 	sed "s|@@RELEASE_URL@@|$RELEASE_URL|g" "deploy/$script" >"$OUT/$script"

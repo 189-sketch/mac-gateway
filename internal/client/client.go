@@ -68,10 +68,12 @@ type Job struct {
 	Progress   *Progress  `json:"progress,omitempty"`
 	Error      *Error     `json:"error,omitempty"`
 	Artifacts  []Artifact `json:"artifacts"`
-	Events     []Event    `json:"events,omitempty"`
-	CreatedAt  string     `json:"created_at"`
-	StartedAt  string     `json:"started_at,omitempty"`
-	FinishedAt string     `json:"finished_at,omitempty"`
+	// Result is a small inline answer from an HTTP service, if it gives one.
+	Result     json.RawMessage `json:"result,omitempty"`
+	Events     []Event         `json:"events,omitempty"`
+	CreatedAt  string          `json:"created_at"`
+	StartedAt  string          `json:"started_at,omitempty"`
+	FinishedAt string          `json:"finished_at,omitempty"`
 }
 
 // Event is a stored fact about a job.

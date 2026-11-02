@@ -31,6 +31,9 @@ type attemptMeta struct {
 	PID        int    `json:"pid,omitempty"`
 	// PIDStart distinguishes our process from a later one reusing its PID.
 	PIDStart string `json:"pid_start,omitempty"`
+	// RemoteID is an http_async service's ID for this job, so a later run can ask
+	// the service to stop it after a crash.
+	RemoteID string `json:"remote_id,omitempty"`
 }
 
 func writeMeta(dir string, meta attemptMeta) error {

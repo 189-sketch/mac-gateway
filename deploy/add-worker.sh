@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Registers a new machine on an installed gateway and prints the command to run
+# Registers a new machine on an installed gateway and prints the commands to run
 # on that machine. Run it on the gateway server.
 #
 #   fleet-add-worker mac-mini-2
@@ -34,9 +34,15 @@ EOF
 fi
 
 cat <<EOF
-Run this on the Mac, in Terminal, logged in as the user the worker should run as.
-It contains the machine's token, which isn't shown again:
+Run one of these on the new machine, as the user the worker should run as. Each
+contains the machine's token, which isn't shown again.
+
+On a Mac, in Terminal:
 
   curl -fsSL $URL/install/worker.sh | FLEET_NODE_NAME=$NAME FLEET_NODE_TOKEN=$token sh
+
+On Windows, in PowerShell opened with "Run as administrator":
+
+  [Net.ServicePointManager]::SecurityProtocol = 'Tls12'; \$env:FLEET_NODE_NAME = '$NAME'; \$env:FLEET_NODE_TOKEN = '$token'; irm $URL/install/worker.ps1 | iex
 
 EOF
