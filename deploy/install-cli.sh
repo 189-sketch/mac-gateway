@@ -24,7 +24,15 @@ main() {
 	esac
 	case "$(uname -s)" in
 	Linux) OS=linux ;;
-	Darwin) OS=darwin ;;
+	Darwin)
+		OS=darwin
+		# The program is built with a Go version that needs this, and would crash.
+		VERSION="$(sw_vers -productVersion)"
+		case "${VERSION%%.*}" in
+		'' | *[!0-9]*) die "couldn't read this Mac's macOS version, got '$VERSION'" ;;
+		esac
+		[ "${VERSION%%.*}" -ge 13 ] || die "fleet needs macOS 13 or newer, and this Mac has macOS $VERSION"
+		;;
 	*) die "unsupported system: $(uname -s)" ;;
 	esac
 	case "$(uname -m)" in

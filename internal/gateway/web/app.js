@@ -222,7 +222,15 @@ function renderMachines(overview) {
     card.append(usage("Jobs", node.jobs));
     for (const name of Object.keys(node.resources).sort()) card.append(usage(name, node.resources[name]));
     if (node.capabilities.length > 0) {
-      card.append(el("ul", "chips", ...node.capabilities.map((name) => el("li", null, name))));
+      const notReady = node.not_ready || {};
+      card.append(el("ul", "chips", ...node.capabilities.map((name) => {
+        if (!notReady[name]) return el("li", null, name);
+        return el("li", "not-ready", el("span", "status status-warning", icon("alert")), name);
+      })));
+      // Spelled out, because a phone has no hover and an icon alone doesn't say why.
+      for (const name of Object.keys(notReady).sort()) {
+        card.append(el("p", "not-ready-note", `${name} isn't ready: ${notReady[name]}`));
+      }
     }
     return card;
   }));

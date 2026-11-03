@@ -89,10 +89,25 @@ write_plist() {
 EOF
 }
 
+# The worker is built with a Go version that needs this. An older Mac would crash
+# when it starts, which would otherwise be reported as a bad manifest.
+MIN_MACOS=13
+
+check_macos_version() {
+	version="$(sw_vers -productVersion)"
+	major="${version%%.*}"
+	case "$major" in
+	'' | *[!0-9]*) die "couldn't read this Mac's macOS version, got '$version'" ;;
+	esac
+	[ "$major" -ge "$MIN_MACOS" ] ||
+		die "the worker needs macOS $MIN_MACOS or newer, and this Mac has macOS $version. Nothing has been changed"
+}
+
 main() {
 	set -eu
 
 	[ "$(uname -s)" = "Darwin" ] || die "this installer is for macOS"
+	check_macos_version
 	[ "$(id -u)" -ne 0 ] || die "run this as the user the worker should run as, not as root"
 	case "$GATEWAY_URL" in
 	https://*) ;;

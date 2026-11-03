@@ -435,19 +435,27 @@ func (s *Store) fenceAndFinish(ctx context.Context, where string, args []any, st
 // ExpireQueued fails queued jobs that waited too long. eligibleOnline says
 // whether a capable node is connected, which separates "all nodes are busy"
 // from "nothing can run this".
-func (s *Store) ExpireQueued(ctx context.Context, eligibleOnline func(capability string) bool) ([]AttemptRef, error) {
-	type expiredJob struct{ id, capability string }
+func (s *Store) ExpireQueued(ctx context.Context, eligibleOnline func(capability string, selector map[string]string) bool) ([]AttemptRef, error) {
+	type expiredJob struct {
+		id, capability string
+		selector       map[string]string
+	}
 	var aborts []AttemptRef
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		aborts = nil
-		rows, err := tx.Query(`SELECT id, capability FROM jobs WHERE status=? AND queue_deadline_ms < ?`, StatusQueued, nowMS())
+		rows, err := tx.Query(`SELECT id, capability, selector FROM jobs WHERE status=? AND queue_deadline_ms < ?`, StatusQueued, nowMS())
 		if err != nil {
 			return err
 		}
 		var expired []expiredJob
 		for rows.Next() {
 			var j expiredJob
-			if err := rows.Scan(&j.id, &j.capability); err != nil {
+			var selector string
+			if err := rows.Scan(&j.id, &j.capability, &selector); err != nil {
+				rows.Close()
+				return err
+			}
+			if err := json.Unmarshal([]byte(selector), &j.selector); err != nil {
 				rows.Close()
 				return err
 			}
@@ -458,8 +466,8 @@ func (s *Store) ExpireQueued(ctx context.Context, eligibleOnline func(capability
 			return err
 		}
 		for _, j := range expired {
-			code, message := CodeNoNodeOnline, "no node offering this capability came online in time"
-			if eligibleOnline(j.capability) {
+			code, message := CodeNoNodeOnline, "no node that can run this capability was online and ready in time"
+			if eligibleOnline(j.capability, j.selector) {
 				code, message = CodeQueueTimeout, "capable nodes stayed busy for the whole queue timeout"
 			}
 			if err := finishJob(tx, j.id, StatusFailed, code, message); err != nil {

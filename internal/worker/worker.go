@@ -59,6 +59,10 @@ type Worker struct {
 	attempts map[string]*attempt
 	pids     map[string]int
 	stopping bool
+	// notReady holds why each capability that failed its last check can't run jobs.
+	notReady map[string]string
+	// statusChanged means the gateway hasn't been told about the latest notReady.
+	statusChanged bool
 }
 
 // New creates a worker and recovers anything left by a previous run.
@@ -78,6 +82,7 @@ func New(manifest *Manifest, token string, log *slog.Logger) (*Worker, error) {
 		notify:        make(chan struct{}, 1),
 		attempts:      map[string]*attempt{},
 		pids:          map[string]int{},
+		notReady:      map[string]string{},
 	}
 	if err := w.recover(); err != nil {
 		return nil, fmt.Errorf("recover state: %w", err)
@@ -162,6 +167,7 @@ func isFinalEvent(eventType string) bool {
 // next start reports those attempts as interrupted.
 func (w *Worker) Run(ctx context.Context) error {
 	defer w.stopAllCommands()
+	w.startChecks(ctx)
 	delay := minReconnectDelay
 	for ctx.Err() == nil {
 		started := time.Now()
@@ -244,7 +250,7 @@ func (w *Worker) handshake(ctx context.Context, ws *websocket.Conn) (time.Durati
 		Labels:          w.manifest.Node.Labels,
 		Resources:       w.manifest.Node.Resources,
 		MaxJobs:         w.manifest.Node.MaxJobs,
-		Capabilities:    w.manifest.protocolCapabilities(),
+		Capabilities:    w.helloCapabilities(),
 		Attempts:        w.attemptStates(),
 	}
 	msg, err := protocol.Encode(protocol.TypeHello, hello)
@@ -320,6 +326,10 @@ func (w *Worker) writeLoop(ctx context.Context, ws *websocket.Conn, heartbeat ti
 	}
 	for {
 		if err := w.sendPending(ctx, ws); err != nil {
+			return err
+		}
+		send := func(ctx context.Context, msg []byte) error { return writeMessage(ctx, ws, msg) }
+		if err := w.sendStatus(ctx, send); err != nil {
 			return err
 		}
 		select {

@@ -128,12 +128,18 @@ type capabilityView struct {
 	InputFiles  []string        `json:"input_files"`
 	Nodes       []nodeOffer     `json:"nodes"`
 	OnlineNodes int             `json:"online_nodes"`
+	// ReadyNodes counts nodes that are online and whose own check says this works.
+	ReadyNodes int `json:"ready_nodes"`
 }
 
 type nodeOffer struct {
-	Name   string            `json:"name"`
-	Online bool              `json:"online"`
-	Labels map[string]string `json:"labels,omitempty"`
+	Name   string `json:"name"`
+	Online bool   `json:"online"`
+	Ready  bool   `json:"ready"`
+	// NotReady says why the node's own check failed, even while it's offline, when
+	// it's what the node last reported.
+	NotReady string            `json:"not_ready,omitempty"`
+	Labels   map[string]string `json:"labels,omitempty"`
 }
 
 func (g *Gateway) handleCapabilities(w http.ResponseWriter, r *http.Request, key *APIKey) {
@@ -153,9 +159,13 @@ func (g *Gateway) handleCapabilities(w http.ResponseWriter, r *http.Request, key
 		}
 		view := &views[len(views)-1]
 		isOnline := online.ids[row.NodeID]
-		view.Nodes = append(view.Nodes, nodeOffer{Name: row.NodeName, Online: isOnline, Labels: row.Labels})
+		ready := isOnline && row.NotReady == ""
+		view.Nodes = append(view.Nodes, nodeOffer{Name: row.NodeName, Online: isOnline, Ready: ready, NotReady: row.NotReady, Labels: row.Labels})
 		if isOnline {
 			view.OnlineNodes++
+		}
+		if ready {
+			view.ReadyNodes++
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"capabilities": views})

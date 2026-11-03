@@ -251,6 +251,15 @@ func TestLoadManifestRejectsServiceMistakes(t *testing.T) {
 		{"bad poll interval", sub(validAsync, "status_field: state", "every: 0s\n        status_field: state"), "async.poll.every"},
 		{"cli field on a command", validCapability + "    request: { url: \"http://127.0.0.1/x\" }\n", "only to the http"},
 		{"allow_remote on a command", validCapability + "    allow_remote: true\n", "allow_remote applies"},
+		{"check with command and url", validService + "    check: { command: [/bin/true], url: \"http://127.0.0.1/h\" }\n", "command or url, not both"},
+		{"check with a missing program", validService + "    check: { command: [/no/such/tool] }\n", "cannot find program"},
+		{"check with a placeholder in its command", validService + "    check: { command: [/bin/echo, \"{{input.x}}\"] }\n", "can't use placeholders"},
+		{"check with a placeholder in its url", validService + "    check: { url: \"http://127.0.0.1/{{input.x}}\" }\n", "isn't allowed here"},
+		{"check on another machine", validService + "    check: { url: \"http://10.0.0.5/h\" }\n", "isn't on this machine"},
+		{"check with a body", validService + "    check: { url: \"http://127.0.0.1/h\", body: x }\n", "can't send a body"},
+		{"check with headers but no url", validService + "    check: { headers: { X-A: b } }\n", "need check.url"},
+		{"bad check interval", validService + "    check: { every: soon }\n", "check.every"},
+		{"bad check timeout", validService + "    check: { timeout: 0s }\n", "check.timeout"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -455,5 +464,45 @@ func TestBuildChildEnv(t *testing.T) {
 				t.Errorf("leaked %s", entry)
 			}
 		}
+	}
+}
+
+func TestDialAddress(t *testing.T) {
+	for raw, want := range map[string]string{
+		"http://127.0.0.1:11434/api/{{input.m}}?x={{input.y}}": "127.0.0.1:11434",
+		"http://localhost/x":  "localhost:80",
+		"https://gpu.lan/x":   "gpu.lan:443",
+		"http://[::1]:8000/x": "[::1]:8000",
+	} {
+		got, err := dialAddress(raw)
+		if err != nil || got != want {
+			t.Errorf("%s = %q, %v, want %q", raw, got, err, want)
+		}
+	}
+}
+
+func TestProgramRunnable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tool")
+	if err := programRunnable(path, "linux"); err == nil {
+		t.Error("a missing file counted as runnable")
+	}
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := programRunnable(path, "linux"); err == nil {
+		t.Error("a file with no execute bit counted as runnable")
+	}
+	if err := programRunnable(path, "windows"); err != nil {
+		t.Errorf("Windows has no execute bit to require: %v", err)
+	}
+	if err := os.Chmod(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := programRunnable(path, "linux"); err != nil {
+		t.Error(err)
+	}
+	if err := programRunnable(dir, "linux"); err == nil {
+		t.Error("a directory counted as runnable")
 	}
 }

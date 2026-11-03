@@ -17,7 +17,7 @@
     <p id="signin-error" class="form-error" role="alert" hidden></p>
     <button type="submit" class="primary">Sign in</button>
   </form>
-  <p class="hint">Create one on the gateway server:<br><code>sudo -u fleet fleet-gateway key add ops --dashboard --data /var/lib/fleet</code></p>
+  <p class="hint">Create one on the gateway server:<br><code>sudo -u fleet /usr/local/bin/fleet-gateway key add ops --dashboard --data /var/lib/fleet</code></p>
   <p class="hint">The key stays in this tab and is forgotten when you close it. It can only view status: it can't run jobs or read their input or results.</p>
 </section>
 

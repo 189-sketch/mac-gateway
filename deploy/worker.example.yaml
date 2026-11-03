@@ -76,3 +76,10 @@ capabilities:
   #     properties:
   #       prompt: { type: string }
   #   timeout: 10m
+  #   # Optional. The worker checks each capability and tells the gateway when it
+  #   # changes, and jobs only go to machines where it's ready. With no check, it
+  #   # connects to the service's host and port every 30 seconds.
+  #   check:
+  #     url: http://127.0.0.1:11434/api/tags
+  #     every: 30s
+  #     timeout: 10s

@@ -223,6 +223,130 @@ check "installs" test "$RESULT" -eq 0
 [ "$RESULT" -eq 0 ] || sed 's/^/    /' "$OUT" >&2
 check "prints the Mac command" grep -q 'FLEET_NODE_NAME=mac-bundle' "$OUT"
 
+echo "On CentOS, with SELinux and firewalld"
+# A separate set of stubs with no Caddy and no apt, so only dnf can provide it. The
+# stubs show which commands run, in what order. Real dnf, SELinux and firewalld
+# behaviour can only be proved by a real install.
+RHEL="$WORK/rhel"
+cp -r "$STUBS" "$RHEL"
+rm "$RHEL/caddy"
+rhelstub() {
+	printf '#!/bin/sh\n%s\n' "$2" >"$RHEL/$1"
+	chmod +x "$RHEL/$1"
+}
+rhelstub dnf 'echo "dnf $*" >>"$STUB_LOG"
+[ -z "${STUB_DNF_FAIL:-}" ] || exit 1
+case "$*" in
+*"-q caddy") printf "#!/bin/sh\nexit 0\n" >"$(dirname "$0")/caddy"; chmod +x "$(dirname "$0")/caddy" ;;
+esac'
+rhelstub getenforce 'echo "${STUB_SELINUX:-Enforcing}"'
+rhelstub setsebool 'echo "setsebool $*" >>"$STUB_LOG"'
+rhelstub semanage 'echo "semanage $*" >>"$STUB_LOG"
+case "$*" in *" -a "*) [ -z "${STUB_LABEL_EXISTS:-}" ] ;; esac'
+rhelstub restorecon 'echo "restorecon $*" >>"$STUB_LOG"'
+rhelstub chcon 'echo "chcon $*" >>"$STUB_LOG"'
+rhelstub firewall-cmd 'case "$*" in
+--state) echo "${STUB_FIREWALLD:-running}" ;;
+*) echo "firewall-cmd $*" >>"$STUB_LOG" ;;
+esac'
+# The real systemctl cat is how the script checks that a caddy service exists.
+rhelstub systemctl 'if [ "$1" = cat ] && [ -n "${STUB_NO_CADDY_SERVICE:-}" ]; then exit 1; fi
+echo "systemctl $*" >>"$STUB_LOG"'
+run_centos_install() { # root; environment assignments come before this call.
+	FLEET_INSTALL_ROOT="$1" PATH="$RHEL:$NO_GO" "$NO_GO/bash" "$BUNDLE_DIR/install-gateway.sh" fleet.example.com centos-mac
+}
+position() { grep -n -- "$1" "$STUB_LOG" | head -1 | cut -d: -f1; }
+
+CENTOS8="$WORK/centos-root8"
+mkdir -p "$CENTOS8"
+OUT="$WORK/centos.out"
+: >"$STUB_LOG"
+run_centos_install "$CENTOS8" >"$OUT" 2>&1
+RESULT=$?
+check "installs" test "$RESULT" -eq 0
+[ "$RESULT" -eq 0 ] || sed 's/^/    /' "$OUT" >&2
+check "prints the API key" grep -q 'FLEET_API_KEY=fk_' "$OUT"
+check "prints the Mac command" grep -q 'FLEET_NODE_NAME=centos-mac' "$OUT"
+check "installs the copr plugin Caddy documents" grep -q 'dnf install -y -q dnf-plugins-core' "$STUB_LOG"
+check "enables Caddy's repository" grep -q 'dnf copr enable -y -q @caddy/caddy' "$STUB_LOG"
+check "installs Caddy" grep -q 'dnf install -y -q caddy' "$STUB_LOG"
+check "installs Caddy before touching the gateway" test "$(position 'dnf install -y -q caddy')" -lt "$(position 'restart fleet-gateway')"
+check "lets Caddy connect to the gateway" grep -q 'setsebool -P httpd_can_network_connect on' "$STUB_LOG"
+check "labels the published files as web content" grep -q "semanage fcontext -a -t httpd_sys_content_t /srv/fleet(/.\*)?" "$STUB_LOG"
+check "applies that label" grep -q "restorecon -R $CENTOS8/srv/fleet" "$STUB_LOG"
+check "applies SELinux settings before starting Caddy" test "$(position setsebool)" -lt "$(position 'restart caddy')"
+check "relabels the installed gateway before starting it" test "$(position "restorecon $CENTOS8/usr/local/bin/fleet-gateway")" -lt "$(position 'restart fleet-gateway')"
+check "opens firewalld now" grep -qx 'firewall-cmd --quiet --add-service=http --add-service=https' "$STUB_LOG"
+check "opens firewalld after a reboot" grep -qx 'firewall-cmd --quiet --permanent --add-service=http --add-service=https' "$STUB_LOG"
+refute "doesn't reload firewalld, which would drop other temporary rules" grep -q 'reload' <(grep firewall-cmd "$STUB_LOG")
+rm -f "$RHEL/caddy"
+
+: >"$STUB_LOG"
+CENTOS9="$WORK/centos-root9"
+mkdir -p "$CENTOS9"
+STUB_SELINUX=Disabled STUB_FIREWALLD="not running" run_centos_install "$CENTOS9" >/dev/null 2>&1
+check "installs with SELinux and firewalld off" test $? -eq 0
+refute "leaves SELinux alone when it's off" grep -qE 'setsebool|semanage|restorecon|chcon' "$STUB_LOG"
+refute "leaves firewalld alone when it's off" grep -q 'firewall-cmd' "$STUB_LOG"
+rm -f "$RHEL/caddy"
+
+: >"$STUB_LOG"
+CENTOS10="$WORK/centos-root10"
+mkdir -p "$CENTOS10"
+mv "$RHEL/semanage" "$WORK/semanage.saved"
+run_centos_install "$CENTOS10" >/dev/null 2>&1
+check "installs without semanage" test $? -eq 0
+check "labels the published files with chcon instead" grep -q "chcon -R -t httpd_sys_content_t $CENTOS10/srv/fleet" "$STUB_LOG"
+mv "$WORK/semanage.saved" "$RHEL/semanage"
+rm -f "$RHEL/caddy"
+
+: >"$STUB_LOG"
+CENTOS11="$WORK/centos-root11"
+mkdir -p "$CENTOS11"
+STUB_LABEL_EXISTS=1 run_centos_install "$CENTOS11" >/dev/null 2>&1
+check "updates a label that already exists" grep -q 'semanage fcontext -m -t httpd_sys_content_t' "$STUB_LOG"
+rm -f "$RHEL/caddy"
+
+CENTOS12="$WORK/centos-root12"
+mkdir -p "$CENTOS12"
+OUT="$WORK/centos-fail.out"
+STUB_DNF_FAIL=1 run_centos_install "$CENTOS12" >"$OUT" 2>&1
+check "stops if Caddy can't be installed" test $? -ne 0
+check "explains retired repositories" grep -q 'retired' "$OUT"
+refute "changes nothing if Caddy can't be installed" test -e "$CENTOS12/usr/local/bin/fleet-gateway"
+
+mv "$RHEL/dnf" "$WORK/dnf.saved"
+OUT="$WORK/centos7.out"
+run_centos_install "$CENTOS12" >"$OUT" 2>&1
+check "stops on a system with no dnf or apt" test $? -ne 0
+check "mentions CentOS 7" grep -q 'CentOS 7' "$OUT"
+refute "changes nothing with no dnf or apt" test -e "$CENTOS12/usr/local/bin/fleet-gateway"
+mv "$WORK/dnf.saved" "$RHEL/dnf"
+
+printf '#!/bin/sh\nexit 0\n' >"$RHEL/caddy"
+chmod +x "$RHEL/caddy"
+OUT="$WORK/no-service.out"
+STUB_NO_CADDY_SERVICE=1 run_centos_install "$CENTOS12" >"$OUT" 2>&1
+check "stops if Caddy has no service" test $? -ne 0
+check "explains the missing service" grep -q 'no caddy systemd service' "$OUT"
+refute "changes nothing if Caddy has no service" test -e "$CENTOS12/usr/local/bin/fleet-gateway"
+rm -f "$RHEL/caddy"
+
+# Some sudo setups can't find Caddy by name, so the script must use its full path.
+mkdir -p "$WORK/caddy-elsewhere"
+printf '#!/bin/sh\necho "caddy $*" >>"$STUB_LOG"\n' >"$WORK/caddy-elsewhere/caddy"
+chmod +x "$WORK/caddy-elsewhere/caddy"
+: >"$STUB_LOG"
+CENTOS13="$WORK/centos-root13"
+mkdir -p "$CENTOS13"
+rhelstub sudo 'if [ "${1:-}" = "-u" ]; then shift 2; fi
+if [ "$#" -eq 0 ] || [ "$1" = "true" ]; then exit 0; fi
+if [ "$1" = caddy ]; then echo "sudo: caddy: command not found" >&2; exit 1; fi
+exec "$@"'
+FLEET_INSTALL_ROOT="$CENTOS13" PATH="$RHEL:$WORK/caddy-elsewhere:$NO_GO" "$NO_GO/bash" "$BUNDLE_DIR/install-gateway.sh" fleet.example.com centos-mac >/dev/null 2>&1
+check "finds Caddy where sudo doesn't look" test $? -eq 0
+check "runs Caddy by its full path" grep -q 'caddy validate' "$STUB_LOG"
+
 echo "A bad download is refused"
 ROOT7="$WORK/root7"
 mkdir -p "$ROOT7"
@@ -299,6 +423,7 @@ macstub() {
 }
 macstub uname 'case "$1" in -s) echo Darwin ;; -m) echo "${STUB_ARCH:-arm64}" ;; esac'
 macstub shasum 'shift 2; exec sha256sum "$@"'
+macstub sw_vers 'echo "${STUB_MACOS:-14.5}"'
 macstub curl "out=''
 url=''
 while [ \$# -gt 0 ]; do
@@ -360,6 +485,13 @@ FLEET_NODE_NAME='bad;name' FLEET_NODE_TOKEN=fn_x run_worker_install >"$OUT" 2>&1
 check "refuses an invalid node name" test $? -ne 0
 FLEET_NODE_NAME=mac-worker FLEET_NODE_TOKEN=fn_x STUB_ARCH=sparc run_worker_install >"$OUT" 2>&1
 check "refuses an unknown chip" test $? -ne 0
+rm -rf "$MAC_HOME/fleet"
+FLEET_NODE_NAME=mac-worker FLEET_NODE_TOKEN=fn_x STUB_MACOS=12.7.6 run_worker_install >"$OUT" 2>&1
+check "refuses a macOS too old for the worker" test $? -ne 0
+check "names the macOS it needs" grep -q 'needs macOS 13 or newer, and this Mac has macOS 12.7.6' "$OUT"
+refute "changes nothing on an old macOS" test -e "$MAC_HOME/fleet"
+FLEET_NODE_NAME=mac-worker FLEET_NODE_TOKEN=fn_x STUB_MACOS=unknown run_worker_install >"$OUT" 2>&1
+check "refuses an unreadable macOS version" test $? -ne 0
 
 # The name must match the token, so use the name this token was issued for.
 NODE="$(sed -n 's/.*FLEET_NODE_NAME=\([^ ]*\).*/\1/p' "$WORK/add.out" | head -1)"

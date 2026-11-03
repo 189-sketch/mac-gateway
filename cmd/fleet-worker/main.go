@@ -44,6 +44,15 @@ func run(configPath, logFile string, check bool) error {
 	}
 	if check {
 		fmt.Printf("%s is valid (node %s, %d capabilities)\n", configPath, manifest.Node.Name, len(manifest.Capabilities))
+		// A capability that isn't ready is a fact about this moment, not a bad config:
+		// the worker reports it and starts offering it once it passes.
+		for _, result := range worker.VerifyCapabilities(context.Background(), manifest) {
+			if result.Reason == "" {
+				fmt.Printf("  ready: %s\n", result.Name)
+			} else {
+				fmt.Printf("  not ready: %s: %s (%s)\n", result.Name, result.Reason, result.Detail)
+			}
+		}
 		return nil
 	}
 	token, err := manifest.ReadToken()

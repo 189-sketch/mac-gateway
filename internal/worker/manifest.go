@@ -82,6 +82,7 @@ type Capability struct {
 	Response    *ResponseConfig  `yaml:"response"`
 	Async       *AsyncConfig     `yaml:"async"`
 	AllowRemote bool             `yaml:"allow_remote"`
+	Check       *CheckConfig     `yaml:"check"`
 
 	timeout    time.Duration
 	schemaJSON []byte
@@ -238,6 +239,9 @@ func (c *Capability) validate(resources map[string]int) error {
 		}
 	}
 	if err := c.validateResponse(); err != nil {
+		return err
+	}
+	if err := c.validateCheck(); err != nil {
 		return err
 	}
 

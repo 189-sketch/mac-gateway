@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -212,21 +213,33 @@ func (g *Gateway) logError(ctx context.Context, what string, err error) {
 }
 
 type onlineSet struct {
-	ids       map[string]bool
-	offerings map[string]bool
+	ids   map[string]bool
+	nodes []onlineNode
 }
 
-func (o onlineSet) offers(capability string) bool { return o.offerings[capability] }
+// onlineNode is what the scheduler needs to know about a connected worker.
+type onlineNode struct {
+	labels       map[string]string
+	capabilities []string // Only those that are ready.
+}
+
+// offers says whether a connected node could run this job if it had room.
+func (o onlineSet) offers(capability string, selector map[string]string) bool {
+	for _, node := range o.nodes {
+		if labelsMatch(selector, node.labels) && slices.Contains(node.capabilities, capability) {
+			return true
+		}
+	}
+	return false
+}
 
 func (g *Gateway) onlineNodes() onlineSet {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	set := onlineSet{ids: map[string]bool{}, offerings: map[string]bool{}}
+	set := onlineSet{ids: map[string]bool{}}
 	for id, conn := range g.conns {
 		set.ids[id] = true
-		for _, name := range conn.capabilities {
-			set.offerings[name] = true
-		}
+		set.nodes = append(set.nodes, onlineNode{labels: conn.labels, capabilities: conn.capabilities})
 	}
 	return set
 }
@@ -301,7 +314,7 @@ func pickNode(job QueuedJob, offers []CapabilityRow, online onlineSet, loads map
 	var eligible []*CapabilityRow
 	for i := range offers {
 		offer := &offers[i]
-		if offer.Name == job.Capability && online.ids[offer.NodeID] &&
+		if offer.Name == job.Capability && offer.NotReady == "" && online.ids[offer.NodeID] &&
 			labelsMatch(job.Selector, offer.Labels) && hasCapacity(offer, loads[offer.NodeID]) {
 			eligible = append(eligible, offer)
 		}
@@ -351,10 +364,14 @@ func hasCapacity(offer *CapabilityRow, load *NodeLoad) bool {
 // --- Worker connections ---
 
 type nodeConn struct {
-	node         *Node
-	send         chan []byte
-	cancel       context.CancelFunc
+	node   *Node
+	send   chan []byte
+	cancel context.CancelFunc
+	// capabilities lists those that passed the worker's latest checks. It's guarded
+	// by Gateway.mu, because a worker can change it while the scheduler reads it.
 	capabilities []string
+	declared     []string
+	labels       map[string]string
 }
 
 // enqueue drops a slow connection rather than block the scheduler. The worker
@@ -444,9 +461,12 @@ func (g *Gateway) handleWorkerConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn := &nodeConn{node: node, send: make(chan []byte, 256), cancel: cancel}
+	conn := &nodeConn{node: node, send: make(chan []byte, 256), cancel: cancel, labels: hello.Labels}
 	for _, c := range hello.Capabilities {
-		conn.capabilities = append(conn.capabilities, c.Name)
+		conn.declared = append(conn.declared, c.Name)
+		if c.NotReady == "" {
+			conn.capabilities = append(conn.capabilities, c.Name)
+		}
 	}
 	if err := g.attach(ctx, conn, hello); err != nil {
 		g.logError(ctx, "attach worker", err)
@@ -563,6 +583,20 @@ func (g *Gateway) readLoop(ctx context.Context, ws *websocket.Conn, conn *nodeCo
 				return
 			}
 			g.reply(conn, protocol.TypeHeartAck, struct{}{})
+		case protocol.TypeCapabilityStatus:
+			var status protocol.CapabilityStatus
+			if err := json.Unmarshal(env.Data, &status); err != nil {
+				g.log.Warn("bad status from worker", "node", conn.node.Name, "error", err)
+				return
+			}
+			// On failure, ending the session makes the worker report it all again.
+			if err := g.store.SetCapabilityStatus(ctx, conn.node.ID, status.NotReady); err != nil {
+				g.logError(ctx, "store capability status", err)
+				return
+			}
+			g.setReadyCapabilities(conn, status.NotReady)
+			g.log.Info("worker capabilities changed", "node", conn.node.Name, "not_ready", len(status.NotReady))
+			g.wakeScheduler()
 		case protocol.TypeEvent:
 			var ev protocol.Event
 			if err := json.Unmarshal(env.Data, &ev); err != nil {
@@ -585,6 +619,17 @@ func (g *Gateway) readLoop(ctx context.Context, ws *websocket.Conn, conn *nodeCo
 			}
 		default:
 			g.log.Warn("unknown message from worker", "node", conn.node.Name, "type", env.Type)
+		}
+	}
+}
+
+func (g *Gateway) setReadyCapabilities(conn *nodeConn, notReady map[string]string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	conn.capabilities = conn.capabilities[:0:0]
+	for _, name := range conn.declared {
+		if _, down := notReady[name]; !down {
+			conn.capabilities = append(conn.capabilities, name)
 		}
 	}
 }

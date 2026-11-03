@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Installs the gateway on a Debian or Ubuntu server. Any of these works:
+# Installs the gateway on Debian, Ubuntu, or a current CentOS Stream or RHEL-family
+# server. Any of these works:
 #
 #   From a release, with nothing else installed (needs a public repo):
 #     curl -fsSL RELEASE_URL/install-gateway.sh | bash -s -- fleet.example.com [node-name]
@@ -19,7 +20,9 @@
 # only registers another machine if you pass a node name.
 #
 # Before running it, point DOMAIN's DNS at this server and open ports 80 and 443
-# in its firewall or cloud security group. This script can't do either for you.
+# in any cloud security group. This script can't do either for you. If firewalld is
+# running, it opens those two ports there. If SELinux is on, it lets Caddy reach
+# the gateway and read the published installer, which SELinux would otherwise block.
 #
 # Everything is inside main, so a download cut off partway can't run half a script.
 
@@ -96,6 +99,60 @@ download_bundle() {
 	BUNDLE="$WORKDIR/$name"
 }
 
+# Installs Caddy from its official package repository. These run before anything
+# else changes, so a system that can't get Caddy is left as it was.
+install_caddy() {
+	step "Installing Caddy"
+	if command -v apt-get >/dev/null; then
+		sudo apt-get update -qq
+		sudo apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https gnupg
+		curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' |
+			sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+		curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' |
+			sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
+		sudo apt-get update -qq
+		sudo apt-get install -y -qq caddy
+	else
+		sudo dnf install -y -q dnf-plugins-core &&
+			sudo dnf copr enable -y -q @caddy/caddy &&
+			sudo dnf install -y -q caddy ||
+			die "couldn't install Caddy with dnf, and nothing has been changed. If this system's package repositories have been retired, as CentOS 8 and CentOS Stream 8's have, install Caddy and a caddy systemd service by hand, then run this again"
+	fi
+}
+
+selinux_active() {
+	command -v getenforce >/dev/null && [ "$(getenforce 2>/dev/null)" != "Disabled" ]
+}
+
+# Caddy's package may run it as a confined web server. Then SELinux would refuse
+# its connection to the gateway and answer 403 for the published files, even with
+# every file permission correct. Both changes do nothing if Caddy isn't confined.
+allow_caddy_under_selinux() {
+	selinux_active || return 0
+	step "Allowing Caddy through SELinux"
+	sudo setsebool -P httpd_can_network_connect on ||
+		die "couldn't set an SELinux option; see: sudo setsebool -P httpd_can_network_connect on"
+	if command -v semanage >/dev/null; then
+		sudo semanage fcontext -a -t httpd_sys_content_t '/srv/fleet(/.*)?' 2>/dev/null ||
+			sudo semanage fcontext -m -t httpd_sys_content_t '/srv/fleet(/.*)?'
+		sudo restorecon -R "$ROOT/srv/fleet"
+	else
+		# This label is lost if the whole system is relabelled. Running this script
+		# again restores it.
+		sudo chcon -R -t httpd_sys_content_t "$ROOT/srv/fleet"
+	fi
+}
+
+# Applies now and after a reboot. A reload would do the second part in one step,
+# but it would also drop any temporary rules someone else has added.
+open_firewalld() {
+	command -v firewall-cmd >/dev/null || return 0
+	[ "$(sudo firewall-cmd --state 2>/dev/null)" = "running" ] || return 0
+	step "Opening ports 80 and 443 in firewalld"
+	sudo firewall-cmd --quiet --add-service=http --add-service=https
+	sudo firewall-cmd --quiet --permanent --add-service=http --add-service=https
+}
+
 main() {
 	set -euo pipefail
 
@@ -108,8 +165,8 @@ main() {
 	[ "$(id -u)" -ne 0 ] || die "run this as a normal user with sudo rights, not as root"
 
 	command -v curl >/dev/null || die "curl isn't installed"
-	command -v apt-get >/dev/null || command -v caddy >/dev/null ||
-		die "this script installs Caddy with apt; on other systems, install Caddy first"
+	command -v caddy >/dev/null || command -v apt-get >/dev/null || command -v dnf >/dev/null ||
+		die "this script can install Caddy only with apt or dnf. On this system, which may be CentOS 7, install Caddy and a caddy systemd service by hand, then run this again"
 
 	step "Asking for sudo rights"
 	sudo true
@@ -117,7 +174,8 @@ main() {
 	# Stop before changing anything if another web server holds the ports Caddy needs.
 	local port holder
 	for port in 80 443; do
-		holder="$(sudo ss -Hltnp "sport = :$port" 2>/dev/null || true)"
+		# Not ss -H: older versions reject it, which would look like a free port.
+		holder="$(sudo ss -ltnp "sport = :$port" 2>/dev/null | grep LISTEN || true)"
 		if [ -n "$holder" ] && ! grep -q '"caddy"' <<<"$holder"; then
 			die "port $port is already in use by something other than Caddy: $holder"
 		fi
@@ -127,11 +185,18 @@ main() {
 	trap 'rm -rf "$WORKDIR"' EXIT
 	find_bundle
 	"$BUNDLE/fleet-gateway" version >/dev/null 2>&1 ||
-		die "this bundle's gateway can't run on this machine, which is $(uname -m)"
+		die "this bundle's gateway can't run here. This machine is $(uname -m), and the bundle is in $BUNDLE, which must not be mounted noexec"
+
+	command -v caddy >/dev/null || install_caddy
+	# sudo may not search where Caddy is, such as /usr/local/bin on CentOS.
+	local caddy
+	caddy="$(command -v caddy)" || die "Caddy still isn't on PATH after installing it"
+	sudo systemctl cat caddy >/dev/null 2>&1 ||
+		die "Caddy is installed, but there's no caddy systemd service to run it. Create one, then run this again"
 
 	step "Installing the gateway service"
 	if ! id fleet >/dev/null 2>&1; then
-		sudo useradd --system --no-create-home --shell /usr/sbin/nologin fleet
+		sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin fleet
 	fi
 	sudo install -d -m 755 "$ROOT/usr/local/bin" "$ROOT/etc/systemd/system"
 	sudo install -m 755 "$BUNDLE/fleet-gateway" "$ROOT/usr/local/bin/fleet-gateway"
@@ -139,6 +204,10 @@ main() {
 	sudo install -m 644 "$BUNDLE/fleet-gateway.service" "$ROOT/etc/systemd/system/fleet-gateway.service"
 	sudo install -d -m 700 "$ROOT/var/lib/fleet"
 	sudo chown fleet:fleet "$ROOT/var/lib/fleet"
+	if selinux_active; then
+		# Files keep a label from where they were made, and a wrong one stops a service.
+		sudo restorecon "$ROOT/usr/local/bin/fleet-gateway" "$ROOT/usr/local/bin/fleet-add-worker" "$ROOT/etc/systemd/system/fleet-gateway.service"
+	fi
 	sudo systemctl daemon-reload
 	sudo systemctl enable fleet-gateway >/dev/null 2>&1
 	sudo systemctl restart fleet-gateway
@@ -168,16 +237,8 @@ main() {
 	echo "$url" | sudo tee "$ROOT/srv/fleet/gateway-url" >/dev/null
 
 	step "Setting up HTTPS with Caddy"
-	if ! command -v caddy >/dev/null; then
-		sudo apt-get update -qq
-		sudo apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https gnupg
-		curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' |
-			sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-		curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' |
-			sudo tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-		sudo apt-get update -qq
-		sudo apt-get install -y -qq caddy
-	fi
+	allow_caddy_under_selinux
+	open_firewalld
 	sudo install -d -m 755 "$ROOT/etc/caddy"
 	# This goes in its own file, so a Caddyfile you already have keeps working.
 	sudo tee "$ROOT/etc/caddy/fleet.caddy" >/dev/null <<CADDY
@@ -195,8 +256,8 @@ CADDY
 	if ! sudo grep -qxF 'import fleet.caddy' "$ROOT/etc/caddy/Caddyfile"; then
 		echo 'import fleet.caddy' | sudo tee -a "$ROOT/etc/caddy/Caddyfile" >/dev/null
 	fi
-	sudo caddy validate --adapter caddyfile --config "$ROOT/etc/caddy/Caddyfile" >/dev/null 2>&1 ||
-		die "the Caddy config is invalid; see: sudo caddy validate --config /etc/caddy/Caddyfile"
+	sudo "$caddy" validate --adapter caddyfile --config "$ROOT/etc/caddy/Caddyfile" >/dev/null 2>&1 ||
+		die "the Caddy config is invalid; see: sudo $caddy validate --config /etc/caddy/Caddyfile"
 	sudo systemctl enable caddy >/dev/null 2>&1
 	sudo systemctl restart caddy
 
@@ -238,7 +299,7 @@ KEY
 WARNING: the gateway is running, but $url isn't reachable yet, so the worker
 install command won't work until it is. Check that:
   - DNS for $domain points at this server's public IP
-  - ports 80 and 443 are open in the firewall or cloud security group
+  - ports 80 and 443 are open in any firewall or cloud security group
 Then see: sudo journalctl -u caddy -n 50
 Caddy keeps retrying the certificate, so you don't need to run this again.
 WARNING

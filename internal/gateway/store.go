@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // SQLite driver
@@ -176,6 +177,10 @@ func OpenStore(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
 	if err := ensureColumn(db, "capabilities", "input_files", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("upgrade schema: %w", err)
+	}
+	if err := ensureColumn(db, "capabilities", "not_ready", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("upgrade schema: %w", err)
 	}
@@ -355,13 +360,34 @@ func (s *Store) RegisterNode(ctx context.Context, nodeID string, h protocol.Hell
 			if err != nil {
 				return err
 			}
-			if _, err := tx.Exec(`INSERT INTO capabilities (node_id, name, input_schema, requires, timeout_seconds, retry_if_lost, input_files) VALUES (?,?,?,?,?,?,?)`,
-				nodeID, c.Name, string(c.InputSchema), string(requires), c.TimeoutSeconds, boolInt(c.RetryIfLost), string(inputFiles)); err != nil {
+			if _, err := tx.Exec(`INSERT INTO capabilities (node_id, name, input_schema, requires, timeout_seconds, retry_if_lost, input_files, not_ready) VALUES (?,?,?,?,?,?,?,?)`,
+				nodeID, c.Name, string(c.InputSchema), string(requires), c.TimeoutSeconds, boolInt(c.RetryIfLost), string(inputFiles), cleanReason(c.NotReady)); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+}
+
+// SetCapabilityStatus records which of a node's capabilities passed their latest
+// checks. Names the node never declared are ignored.
+func (s *Store) SetCapabilityStatus(ctx context.Context, nodeID string, notReady map[string]string) error {
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`UPDATE capabilities SET not_ready='' WHERE node_id=?`, nodeID); err != nil {
+			return err
+		}
+		for name, reason := range notReady {
+			if _, err := tx.Exec(`UPDATE capabilities SET not_ready=? WHERE node_id=? AND name=?`, cleanReason(reason), nodeID, name); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// cleanReason bounds what a worker can make the gateway store and show.
+func cleanReason(reason string) string {
+	return strings.ToValidUTF8(truncate(reason, 300), "")
 }
 
 // CapabilityRow is one node's offer of a capability.
@@ -377,12 +403,13 @@ type CapabilityRow struct {
 	Resources      map[string]int
 	MaxJobs        int
 	InputFiles     []string
+	NotReady       string // Why the node's own check says this can't run. Empty means ready.
 }
 
 // CapabilityRows lists capabilities for active nodes. An empty name lists all.
 func (s *Store) CapabilityRows(ctx context.Context, name string) ([]CapabilityRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT c.node_id, n.name, c.name, c.input_schema, c.requires, c.timeout_seconds, c.retry_if_lost, n.labels, n.resources, n.max_jobs, c.input_files
+		SELECT c.node_id, n.name, c.name, c.input_schema, c.requires, c.timeout_seconds, c.retry_if_lost, n.labels, n.resources, n.max_jobs, c.input_files, c.not_ready
 		FROM capabilities c JOIN nodes n ON n.id = c.node_id
 		WHERE n.revoked_ms IS NULL AND (? = '' OR c.name = ?)
 		ORDER BY c.name, n.name`, name, name)
@@ -395,7 +422,7 @@ func (s *Store) CapabilityRows(ctx context.Context, name string) ([]CapabilityRo
 		var c CapabilityRow
 		var requires, labels, resources, inputFiles string
 		var retry int
-		if err := rows.Scan(&c.NodeID, &c.NodeName, &c.Name, &c.InputSchema, &requires, &c.TimeoutSeconds, &retry, &labels, &resources, &c.MaxJobs, &inputFiles); err != nil {
+		if err := rows.Scan(&c.NodeID, &c.NodeName, &c.Name, &c.InputSchema, &requires, &c.TimeoutSeconds, &retry, &labels, &resources, &c.MaxJobs, &inputFiles, &c.NotReady); err != nil {
 			return nil, err
 		}
 		c.RetryIfLost = retry != 0

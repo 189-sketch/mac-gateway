@@ -27,7 +27,7 @@ if ! token="$(sudo -u fleet "$ROOT/usr/local/bin/fleet-gateway" node add "$NAME"
 	cat >&2 <<EOF
 add-worker: couldn't create a token for '$NAME'. If that name is already registered,
 choose another one, or revoke it first:
-  sudo -u fleet fleet-gateway node revoke $NAME --data /var/lib/fleet
+  sudo -u fleet /usr/local/bin/fleet-gateway node revoke $NAME --data /var/lib/fleet
 A revoked name can't be registered again, so a replacement needs a new name.
 EOF
 	exit 1

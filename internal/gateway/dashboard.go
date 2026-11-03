@@ -85,7 +85,9 @@ type DashboardNode struct {
 	Jobs         ResourceUse            `json:"jobs"`
 	Resources    map[string]ResourceUse `json:"resources"`
 	Capabilities []string               `json:"capabilities"`
-	LastSeenAt   string                 `json:"last_seen_at,omitempty"`
+	// NotReady lists capabilities that failed the worker's own check, with why.
+	NotReady   map[string]string `json:"not_ready,omitempty"`
+	LastSeenAt string            `json:"last_seen_at,omitempty"`
 }
 
 // ResourceUse is how much of something is taken.
@@ -227,9 +229,16 @@ func (s *Store) dashboardOverview(ctx context.Context, online onlineSet) (*Dashb
 		return nil, err
 	}
 	offered := map[string][]string{}
+	notReady := map[string]map[string]string{}
 	var capabilities []string
 	for _, offer := range offers {
 		offered[offer.NodeID] = append(offered[offer.NodeID], offer.Name)
+		if offer.NotReady != "" {
+			if notReady[offer.NodeID] == nil {
+				notReady[offer.NodeID] = map[string]string{}
+			}
+			notReady[offer.NodeID][offer.Name] = offer.NotReady
+		}
 		if len(capabilities) == 0 || capabilities[len(capabilities)-1] != offer.Name {
 			capabilities = append(capabilities, offer.Name) // Rows are sorted by name.
 		}
@@ -274,6 +283,7 @@ func (s *Store) dashboardOverview(ctx context.Context, online onlineSet) (*Dashb
 		}
 		node.Online = online.ids[id]
 		node.Capabilities = orEmptySlice(offered[id])
+		node.NotReady = notReady[id]
 		if lastSeen.Valid {
 			node.LastSeenAt = formatMS(lastSeen.Int64)
 		}

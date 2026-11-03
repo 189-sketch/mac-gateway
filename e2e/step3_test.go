@@ -232,7 +232,8 @@ func TestHTTPFailuresAreClassified(t *testing.T) {
 		capability("svc.nofield", service.URL+"/no-field", "{ result: json, result_field: answer }"),
 		capability("svc.huge", service.URL+"/huge", "{ result: json }"),
 		capability("svc.escapes", service.URL+"/escapes", "{ result: text }"),
-		capability("svc.down", goneURL+"/x", "{ result: json }"),
+		// Its check passes regardless, as if the service died just after being checked.
+		capability("svc.down", goneURL+"/x", "{ result: json }")+"    check: { command: [/bin/sh, -c, \"exit 0\"] }\n",
 		capability("svc.fine", service.URL+"/fine", "{ result: json }"),
 		anyObject("svc.path", "http", fmt.Sprintf("    request: { url: \"%s/items/{{input.id}}\" }\n", service.URL)),
 	)

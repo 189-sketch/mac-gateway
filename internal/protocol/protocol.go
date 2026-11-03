@@ -24,6 +24,8 @@ const (
 	TypeEvent     = "event"
 	TypeAck       = "ack"
 	TypeAbort     = "abort"
+	// TypeCapabilityStatus is sent by a worker when what it can run has changed.
+	TypeCapabilityStatus = "capability_status"
 )
 
 // Job event types, as carried by Event.Type.
@@ -77,6 +79,15 @@ type Capability struct {
 	TimeoutSeconds int64           `json:"timeout_seconds"`
 	RetryIfLost    bool            `json:"retry_if_lost"`
 	InputFiles     []string        `json:"input_files,omitempty"`
+	// NotReady says why the worker's own check found this can't run jobs right now.
+	// Empty means ready, which is also how a worker with no checks appears.
+	NotReady string `json:"not_ready,omitempty"`
+}
+
+// CapabilityStatus is the complete list of a worker's capabilities that aren't
+// ready, by name. Any capability it doesn't mention is ready.
+type CapabilityStatus struct {
+	NotReady map[string]string `json:"not_ready"`
 }
 
 // InputFile is a file a worker must download before running a job.

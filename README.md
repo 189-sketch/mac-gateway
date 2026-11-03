@@ -41,10 +41,10 @@ Mac installs use a one-line command rather than a double-click download. A file 
 
 ### What you need
 
-- **Server:** Debian or Ubuntu on x86-64 or ARM64, with a normal user who has `sudo`. Installing from a release doesn't need Go.
+- **Server:** Debian, Ubuntu, CentOS Stream 9 or newer, or a current RHEL-family system, on x86-64 or ARM64, with a normal (non-root) user who has `sudo`. On CentOS 7, CentOS 8 or CentOS Stream 8, whose package repositories have been retired, install Caddy and a `caddy` systemd service by hand first. Installing from a release doesn't need Go.
 - **Domain:** a domain name with its DNS pointing at the server.
-- **Firewall:** ports 80 and 443 open on the server, including in any cloud security group. Caddy needs both to get its HTTPS certificate.
-- **Worker machine:** macOS on Apple silicon or Intel, or Windows 10 or 11 on x64 or ARM64. Your home network doesn't need any open ports.
+- **Firewall:** ports 80 and 443 open on the server, including in any cloud security group. The script opens them in firewalld if it's running, but it can't change other firewalls. Caddy needs both to get its HTTPS certificate.
+- **Worker machine:** macOS 13 or newer on Apple silicon or Intel, or Windows 10 or 11 on x64 or ARM64. Your home network doesn't need any open ports.
 
 Run the commands below in your own terminal. They print secrets that are shown only once, so don't paste the output into chats or tickets.
 
@@ -81,6 +81,11 @@ Whichever you use, the script does the following:
 5. Prints an API key for your agent and the command to run on your Mac.
 
 It stops before changing anything if another program is using port 80 or 443. It exits with a warning if the server isn't reachable over HTTPS yet, but still prints your credentials. In that case, fix DNS or the firewall; Caddy keeps retrying, so you don't need to run the script again.
+
+On CentOS and similar systems, the script also changes system settings that would otherwise block the gateway:
+
+- **firewalld**, if it's running: allows the `http` and `https` services.
+- **SELinux**, if it's on: labels `/srv/fleet` as web content, and turns on `httpd_can_network_connect`. That setting applies to every web server on the machine, and lets each of them make outgoing connections.
 
 ### 2. Install the worker
 
@@ -188,9 +193,9 @@ Data, API keys, tokens and each Mac's `worker.yaml` are kept. Running jobs on a 
 On the server:
 
 ```sh
-sudo -u fleet fleet-gateway key add my-agent --capabilities 'tts.*,video.*' --data /var/lib/fleet
-sudo -u fleet fleet-gateway key revoke my-agent --data /var/lib/fleet
-sudo -u fleet fleet-gateway node revoke mac-mini-1 --data /var/lib/fleet
+sudo -u fleet /usr/local/bin/fleet-gateway key add my-agent --capabilities 'tts.*,video.*' --data /var/lib/fleet
+sudo -u fleet /usr/local/bin/fleet-gateway key revoke my-agent --data /var/lib/fleet
+sudo -u fleet /usr/local/bin/fleet-gateway node revoke mac-mini-1 --data /var/lib/fleet
 ```
 
 `--capabilities` takes comma-separated patterns, and `'*'` allows everything. A key made with `--dashboard` instead can only view [the dashboard](#dashboard). Revoking takes effect within a heartbeat. A revoked name can't be registered again, so a replacement machine needs a new name.
@@ -223,6 +228,15 @@ sudo rm -rf /var/lib/fleet /srv/fleet /etc/systemd/system/fleet-gateway.service 
 sudo sed -i '/^import fleet.caddy$/d' /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 sudo userdel fleet
+```
+
+If the script changed firewalld or SELinux settings, it leaves them in place, because something else may rely on them. To undo them:
+
+```sh
+sudo firewall-cmd --remove-service=http --remove-service=https
+sudo firewall-cmd --permanent --remove-service=http --remove-service=https
+sudo setsebool -P httpd_can_network_connect off
+sudo semanage fcontext -d '/srv/fleet(/.*)?'
 ```
 
 Caddy itself stays installed, in case other sites use it.
@@ -375,8 +389,34 @@ Add a capability to the machine's `worker.yaml` and restart the worker. The gate
 - **Progress:** `progress.regex` reads command output using the named groups `percent`, `current`, `total` and `message`.
 - **Capacity:** `requires` reserves units from `node.resources`, so heavy jobs don't overlap. `node.max_jobs` caps the total.
 - **Environment:** commands get only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR` and whatever the capability's `env` sets.
+- **Readiness:** see [How the gateway finds out what a machine can do](#how-the-gateway-finds-out-what-a-machine-can-do).
 
-Unknown fields, missing programs and invalid schemas stop the worker at startup. Check a config with `fleet-worker --config worker.yaml --check`.
+Unknown fields, missing programs and invalid schemas stop the worker at startup. To validate a config and see whether each capability is ready right now, with the details, run `fleet-worker --config worker.yaml --check`.
+
+### How the gateway finds out what a machine can do
+
+Each worker alone decides what it offers and whether it works. The gateway has no list of services to maintain:
+
+1. You define a capability in the machine's `worker.yaml`.
+2. The worker checks every capability before it connects, and keeps checking.
+3. It tells the gateway the result when it connects, and again whenever one changes.
+4. The gateway sends jobs only to machines where the capability is ready.
+
+A job for a capability that isn't ready anywhere stays `queued`, and runs as soon as a machine reports it ready. If that doesn't happen within its queue timeout, it fails with `NO_NODE_ONLINE`.
+
+`GET /v1/capabilities` and `fleet capabilities` show `ready_nodes` for each capability, and `ready` and `not_ready` (the reason) for each machine. Use `ready_nodes` rather than `online_nodes` to tell whether a job can run now. The dashboard shows the same reasons.
+
+With no `check` setting, a command-line tool is ready if its program can still run, and a service is ready if something accepts a connection on its host and port. That second check can't tell whether the service actually works, so set your own when you can:
+
+```yaml
+check:
+  url: http://127.0.0.1:11434/api/tags # Ready if this answers with a 2xx status.
+  # Or instead: command: [/usr/local/bin/mytool, --version] # Ready if it exits with 0.
+  every: 30s # The default.
+  timeout: 10s # The default. A check that takes longer counts as failed.
+```
+
+A check runs with no job, so it can't use placeholders. It runs with the capability's `env`, and `url` can use `headers` and follows the same host rules as `request`. A check that fails only affects new jobs: anything already running carries on.
 
 ### Call an HTTP service
 
@@ -416,8 +456,6 @@ For a service already running on the machine, use `adapter: http` instead of a c
   - `result: json` or `result: text` puts it in the job's `result`, up to 1 MB. `result_field` picks out one field, using a path such as `choices.0.text`.
   - `file: out.wav` saves it. The same path must be listed in `outputs`, which is what delivers it.
 - **Progress and timeouts:** `timeout` covers the whole call. A plain `http` capability reports no progress. Cancelling a job drops the connection, and the service decides what that means for its work.
-
-A capability is advertised even while its service is down, so jobs sent to it fail with `SERVICE_UNAVAILABLE` rather than moving to another machine.
 
 ### Call a service with its own job queue
 
@@ -467,7 +505,7 @@ The gateway serves a status page at `https://fleet.example.com/dashboard/`, show
 It needs its own kind of key. On the server:
 
 ```sh
-sudo -u fleet fleet-gateway key add ops --dashboard --data /var/lib/fleet
+sudo -u fleet /usr/local/bin/fleet-gateway key add ops --dashboard --data /var/lib/fleet
 ```
 
 A dashboard key can see the status of every job from every agent, but can't run or cancel anything, and can't read job input, `result` values or result files. Agent keys can't open the dashboard. The key is kept only in the browser tab and is forgotten when the tab closes.
