@@ -39,6 +39,7 @@ type attempt struct {
 	sent   int64            // Highest sequence written to the current connection.
 
 	terminalSeq int64
+	started     time.Time // Zero for an attempt recovered after a restart.
 	cancel      context.CancelFunc
 	done        chan struct{}
 	aborted     bool
@@ -367,6 +368,7 @@ func (w *Worker) sendPending(ctx context.Context, ws *websocket.Conn) error {
 			return nil
 		}
 		for _, ev := range pending {
+			w.log.Debug("sending event", "attempt", ev.AttemptID, "seq", ev.Seq, "type", ev.Type)
 			msg, err := protocol.Encode(protocol.TypeEvent, ev)
 			if err != nil {
 				return err
@@ -389,6 +391,9 @@ func (w *Worker) readLoop(ctx context.Context, ws *websocket.Conn, timeout time.
 		var env protocol.Envelope
 		if err := json.Unmarshal(data, &env); err != nil {
 			return fmt.Errorf("bad message from gateway: %w", err)
+		}
+		if env.Type != protocol.TypeHeartAck {
+			w.log.Debug("message from gateway", "type", env.Type)
 		}
 		switch env.Type {
 		case protocol.TypeHeartAck:
@@ -444,10 +449,11 @@ func (w *Worker) startAttempt(assign protocol.Assign) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &attempt{
-		meta:   attemptMeta{JobID: assign.JobID, AttemptID: assign.AttemptID, Capability: assign.Capability},
-		dir:    filepath.Join(attemptsDir(w.manifest), assign.AttemptID),
-		cancel: cancel,
-		done:   make(chan struct{}),
+		meta:    attemptMeta{JobID: assign.JobID, AttemptID: assign.AttemptID, Capability: assign.Capability},
+		dir:     filepath.Join(attemptsDir(w.manifest), assign.AttemptID),
+		cancel:  cancel,
+		started: time.Now(),
+		done:    make(chan struct{}),
 	}
 	w.attempts[assign.AttemptID] = a
 	w.mu.Unlock()
@@ -459,7 +465,7 @@ func (w *Worker) startAttempt(assign protocol.Assign) {
 		close(a.done)
 		return
 	}
-	w.log.Info("attempt started", "job", assign.JobID, "attempt", assign.AttemptID, "capability", assign.Capability)
+	w.log.Info("attempt started", "job", assign.JobID, "attempt", assign.AttemptID, "capability", assign.Capability, "test", assign.Test)
 	go w.run(ctx, a, assign)
 }
 
@@ -546,8 +552,17 @@ func (w *Worker) emit(a *attempt, eventType string, payload any) {
 	w.wakeWriter()
 }
 
+// elapsed rounds, because a log reader needs seconds rather than nanoseconds.
+func (a *attempt) elapsed() string {
+	if a.started.IsZero() {
+		return "unknown"
+	}
+	return time.Since(a.started).Round(time.Millisecond).String()
+}
+
 func (w *Worker) fail(a *attempt, code, message string) {
-	w.log.Warn("attempt failed", "attempt", a.meta.AttemptID, "code", code)
+	w.log.Warn("attempt failed", "job", a.meta.JobID, "attempt", a.meta.AttemptID, "capability", a.meta.Capability,
+		"code", code, "message", message, "duration", a.elapsed())
 	w.emit(a, protocol.EventFailed, protocol.Failure{Code: code, Message: message})
 }
 
@@ -565,7 +580,7 @@ func (w *Worker) abortAttempt(attemptID, reason string) {
 	delete(w.pids, attemptID)
 	w.mu.Unlock()
 
-	w.log.Info("attempt aborted", "attempt", attemptID, "reason", reason)
+	w.log.Info("attempt aborted", "job", a.meta.JobID, "attempt", attemptID, "capability", a.meta.Capability, "reason", reason, "duration", a.elapsed())
 	a.cancel()
 	go func() {
 		<-a.done

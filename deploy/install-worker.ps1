@@ -93,6 +93,9 @@ function Install-FleetWorker {
 # This file alone decides what this machine will run. See the README for how to
 # add services. Restart after changing it:
 #   Stop-ScheduledTask -TaskName 'Fleet Worker'; Start-ScheduledTask -TaskName 'Fleet Worker'
+#
+# Logs are in worker.log. For more detail, add this line and restart:
+#   log_level: debug
 gateway_url: $gatewayUrl
 token_file: token
 state_dir: state
@@ -113,6 +116,7 @@ capabilities:
       additionalProperties: false
     timeout: 1m
     retry_if_lost: true
+    test: { input: {} }
 "@
 			[IO.File]::WriteAllText($manifest, ($yaml -replace "`r`n", "`n"), (New-Object Text.ASCIIEncoding))
 		}
@@ -162,7 +166,9 @@ capabilities:
 
 	Write-Host ''
 	Write-Host "==> Connected to $gatewayUrl"
-	Write-Host "Installed in $fleetHome. The log is $logFile."
+	Write-Host "Installed in $fleetHome. To watch what it's doing:"
+	Write-Host ''
+	Write-Host "  Get-Content -Wait -Tail 20 '$logFile'"
 	Write-Host ''
 	Write-Host 'To keep this PC available, run these yourself. They stop it sleeping or hibernating while on mains power:'
 	Write-Host ''

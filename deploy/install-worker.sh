@@ -21,6 +21,9 @@ write_manifest() {
 # This file alone decides what this machine will run. See the README for how to
 # add services. Restart after changing it:
 #   launchctl kickstart -k gui/$(id -u)/com.fleet.worker
+#
+# Logs are in worker.log. For more detail, add this line and restart:
+#   log_level: debug
 gateway_url: $GATEWAY_URL
 token_file: token
 state_dir: state
@@ -50,6 +53,8 @@ capabilities:
       cpu_heavy: 1
     timeout: 10m
     retry_if_lost: true
+    test:
+      input: { text: "Fleet test" }
 EOF
 }
 
@@ -66,6 +71,8 @@ write_plist() {
     <string>$FLEET_HOME/fleet-worker</string>
     <string>--config</string>
     <string>$FLEET_HOME/worker.yaml</string>
+    <string>--log-file</string>
+    <string>$FLEET_HOME/worker.log</string>
   </array>
   <key>WorkingDirectory</key>
   <string>$FLEET_HOME</string>
@@ -81,9 +88,9 @@ write_plist() {
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>$FLEET_HOME/worker.log</string>
+  <string>$FLEET_HOME/worker.log.crash</string>
   <key>StandardErrorPath</key>
-  <string>$FLEET_HOME/worker.log</string>
+  <string>$FLEET_HOME/worker.log.crash</string>
 </dict>
 </plist>
 EOF
@@ -194,7 +201,9 @@ main() {
 	cat <<EOF
 
 ==> Connected to $GATEWAY_URL
-Installed in $FLEET_HOME. The log is $FLEET_HOME/worker.log.
+Installed in $FLEET_HOME. To watch what it's doing:
+
+  tail -F $FLEET_HOME/worker.log
 
 To keep this Mac available, run these yourself. The first stops it sleeping and
 restarts it after a power cut. The second part is in System Settings: turn on

@@ -86,8 +86,10 @@ type DashboardNode struct {
 	Resources    map[string]ResourceUse `json:"resources"`
 	Capabilities []string               `json:"capabilities"`
 	// NotReady lists capabilities that failed the worker's own check, with why.
-	NotReady   map[string]string `json:"not_ready,omitempty"`
-	LastSeenAt string            `json:"last_seen_at,omitempty"`
+	NotReady map[string]string `json:"not_ready,omitempty"`
+	// LastTests has the latest test of each capability that has been tested here.
+	LastTests  map[string]*LastTest `json:"last_tests,omitempty"`
+	LastSeenAt string               `json:"last_seen_at,omitempty"`
 }
 
 // ResourceUse is how much of something is taken.
@@ -120,6 +122,7 @@ type DashboardJob struct {
 	Capability  string          `json:"capability"`
 	Status      string          `json:"status"`
 	Terminal    bool            `json:"terminal"`
+	Test        bool            `json:"test,omitempty"`
 	Attempts    int             `json:"attempts"`
 	Node        string          `json:"node,omitempty"`
 	Progress    json.RawMessage `json:"progress,omitempty"`
@@ -228,6 +231,17 @@ func (s *Store) dashboardOverview(ctx context.Context, online onlineSet) (*Dashb
 	if err != nil {
 		return nil, err
 	}
+	lastTests, err := s.LastTests(ctx)
+	if err != nil {
+		return nil, err
+	}
+	nodeTests := map[string]map[string]*LastTest{}
+	for key, test := range lastTests {
+		if nodeTests[key.nodeID] == nil {
+			nodeTests[key.nodeID] = map[string]*LastTest{}
+		}
+		nodeTests[key.nodeID][key.capability] = test
+	}
 	offered := map[string][]string{}
 	notReady := map[string]map[string]string{}
 	var capabilities []string
@@ -284,6 +298,7 @@ func (s *Store) dashboardOverview(ctx context.Context, online onlineSet) (*Dashb
 		node.Online = online.ids[id]
 		node.Capabilities = orEmptySlice(offered[id])
 		node.NotReady = notReady[id]
+		node.LastTests = nodeTests[id]
 		if lastSeen.Valid {
 			node.LastSeenAt = formatMS(lastSeen.Int64)
 		}
@@ -334,7 +349,7 @@ type dashboardFilter struct {
 }
 
 const dashboardJobColumns = `
-	SELECT j.id, j.capability, j.status, j.attempts, n.name, j.progress, j.error_code, j.error_message, k.name, j.created_ms, j.started_ms, j.finished_ms
+	SELECT j.id, j.capability, j.status, j.attempts, n.name, j.progress, j.error_code, j.error_message, k.name, j.created_ms, j.started_ms, j.finished_ms, j.test_node IS NOT NULL
 	FROM jobs j
 	JOIN api_keys k ON k.id = j.api_key_id
 	LEFT JOIN attempts a ON a.id = j.current_attempt
@@ -344,7 +359,7 @@ func scanDashboardJob(scan func(...any) error) (DashboardJob, error) {
 	var j DashboardJob
 	var node, progress, errCode, errMessage sql.NullString
 	var started, finished sql.NullInt64
-	if err := scan(&j.ID, &j.Capability, &j.Status, &j.Attempts, &node, &progress, &errCode, &errMessage, &j.SubmittedBy, &j.createdMS, &started, &finished); err != nil {
+	if err := scan(&j.ID, &j.Capability, &j.Status, &j.Attempts, &node, &progress, &errCode, &errMessage, &j.SubmittedBy, &j.createdMS, &started, &finished, &j.Test); err != nil {
 		return j, err
 	}
 	j.Terminal = isTerminal(j.Status)

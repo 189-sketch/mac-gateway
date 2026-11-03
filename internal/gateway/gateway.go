@@ -219,14 +219,15 @@ type onlineSet struct {
 
 // onlineNode is what the scheduler needs to know about a connected worker.
 type onlineNode struct {
+	id           string
 	labels       map[string]string
 	capabilities []string // Only those that are ready.
 }
 
 // offers says whether a connected node could run this job if it had room.
-func (o onlineSet) offers(capability string, selector map[string]string) bool {
+func (o onlineSet) offers(capability string, selector map[string]string, testNode string) bool {
 	for _, node := range o.nodes {
-		if labelsMatch(selector, node.labels) && slices.Contains(node.capabilities, capability) {
+		if (testNode == "" || node.id == testNode) && labelsMatch(selector, node.labels) && slices.Contains(node.capabilities, capability) {
 			return true
 		}
 	}
@@ -239,7 +240,7 @@ func (g *Gateway) onlineNodes() onlineSet {
 	set := onlineSet{ids: map[string]bool{}}
 	for id, conn := range g.conns {
 		set.ids[id] = true
-		set.nodes = append(set.nodes, onlineNode{labels: conn.labels, capabilities: conn.capabilities})
+		set.nodes = append(set.nodes, onlineNode{id: id, labels: conn.labels, capabilities: conn.capabilities})
 	}
 	return set
 }
@@ -304,6 +305,7 @@ func (g *Gateway) schedule(ctx context.Context) {
 			Capability: job.Capability,
 			Input:      json.RawMessage(job.Input),
 			Files:      files,
+			Test:       job.TestNode != "",
 		})
 		g.log.Info("job assigned", "job", job.ID, "attempt", attemptID, "node", offer.NodeName)
 	}
@@ -315,6 +317,7 @@ func pickNode(job QueuedJob, offers []CapabilityRow, online onlineSet, loads map
 	for i := range offers {
 		offer := &offers[i]
 		if offer.Name == job.Capability && offer.NotReady == "" && online.ids[offer.NodeID] &&
+			(job.TestNode == "" || job.TestNode == offer.NodeID) &&
 			labelsMatch(job.Selector, offer.Labels) && hasCapacity(offer, loads[offer.NodeID]) {
 			eligible = append(eligible, offer)
 		}

@@ -199,6 +199,10 @@ func programRunnable(path, goos string) error {
 // startChecks verifies every capability once, so the first connection already
 // reports the truth, then keeps checking in the background until ctx ends.
 func (w *Worker) startChecks(ctx context.Context) {
+	for i := range w.manifest.Capabilities {
+		c := &w.manifest.Capabilities[i]
+		w.log.Info("capability offered", "capability", c.Name, "adapter", c.Adapter, "check_every", c.Check.every.String())
+	}
 	var first sync.WaitGroup
 	for i := range w.manifest.Capabilities {
 		c := &w.manifest.Capabilities[i]
@@ -226,6 +230,7 @@ func (w *Worker) recordCheck(ctx context.Context, c *Capability) {
 	if ctx.Err() != nil {
 		return // A check cut short by shutdown says nothing about the capability.
 	}
+	w.log.Debug("capability checked", "capability", c.Name, "ready", reason == "", "detail", detail)
 	w.mu.Lock()
 	previous := w.notReady[c.Name]
 	if reason == previous {

@@ -204,6 +204,13 @@ function renderTiles(overview) {
   $("tiles").replaceChildren(...tiles);
 }
 
+function testNote(name, test) {
+  if (test.status === "succeeded") return el("p", "test-note", `${name} test passed ${ago(test.at)}`);
+  if (!test.finished) return el("p", "test-note", `${name} test is running`);
+  const why = test.error_code ? ` (${test.error_code})` : "";
+  return el("p", "not-ready-note", `${name} test failed ${ago(test.at)}${why}`);
+}
+
 function renderMachines(overview) {
   if (overview.nodes.length === 0) {
     $("machines").replaceChildren(el("p", "empty", "No machines yet. Add one on the gateway server with fleet-add-worker."));
@@ -231,6 +238,8 @@ function renderMachines(overview) {
       for (const name of Object.keys(notReady).sort()) {
         card.append(el("p", "not-ready-note", `${name} isn't ready: ${notReady[name]}`));
       }
+      const tests = node.last_tests || {};
+      for (const name of Object.keys(tests).sort()) card.append(testNote(name, tests[name]));
     }
     return card;
   }));
@@ -294,7 +303,7 @@ function tookCell(job) {
 function renderJobs() {
   const focused = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.job : "";
   $("job-rows").replaceChildren(...state.jobs.map((job) => {
-    const open = el("button", "capability", job.capability);
+    const open = el("button", "capability", job.test ? `${job.capability} (test)` : job.capability);
     open.type = "button";
     open.dataset.job = job.id;
     const row = el("tr", null,
@@ -351,7 +360,7 @@ function eventText(event) {
 }
 
 function renderDetail(job) {
-  $("detail-title").textContent = job.capability;
+  $("detail-title").textContent = job.test ? `${job.capability} (test)` : job.capability;
   const facts = el("dl", "facts");
   const fact = (name, value) => {
     if (value === null || value === undefined || value === "") return;

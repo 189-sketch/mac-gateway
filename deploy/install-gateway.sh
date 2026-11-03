@@ -101,6 +101,15 @@ download_bundle() {
 
 # Installs Caddy from its official package repository. These run before anything
 # else changes, so a system that can't get Caddy is left as it was.
+# Caddy's repository is built for EPEL and has no CentOS Stream build by that name,
+# so if dnf can't work out which to use, name the EPEL one for this version.
+enable_caddy_copr() {
+	sudo dnf copr enable -y -q @caddy/caddy && return 0
+	version=$(. "$ROOT/etc/os-release" 2>/dev/null && printf '%s' "${VERSION_ID%%.*}") || return 1
+	[ -n "$version" ] || return 1
+	sudo dnf copr enable -y -q @caddy/caddy "epel-$version-$(uname -m)"
+}
+
 install_caddy() {
 	step "Installing Caddy"
 	if command -v apt-get >/dev/null; then
@@ -114,7 +123,7 @@ install_caddy() {
 		sudo apt-get install -y -qq caddy
 	else
 		sudo dnf install -y -q dnf-plugins-core &&
-			sudo dnf copr enable -y -q @caddy/caddy &&
+			enable_caddy_copr &&
 			sudo dnf install -y -q caddy ||
 			die "couldn't install Caddy with dnf, and nothing has been changed. If this system's package repositories have been retired, as CentOS 8 and CentOS Stream 8's have, install Caddy and a caddy systemd service by hand, then run this again"
 	fi

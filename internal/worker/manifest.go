@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/url"
 	"os"
@@ -41,6 +42,7 @@ type Manifest struct {
 	StateDir          string       `yaml:"state_dir"`
 	AllowInsecureHTTP bool         `yaml:"allow_insecure_http"`
 	UploadRetryWindow string       `yaml:"upload_retry_window"`
+	LogLevel          string       `yaml:"log_level"`
 	Node              NodeConfig   `yaml:"node"`
 	Capabilities      []Capability `yaml:"capabilities"`
 
@@ -83,7 +85,9 @@ type Capability struct {
 	Async       *AsyncConfig     `yaml:"async"`
 	AllowRemote bool             `yaml:"allow_remote"`
 	Check       *CheckConfig     `yaml:"check"`
+	Test        *TestConfig      `yaml:"test"`
 
+	testInput  []byte
 	timeout    time.Duration
 	schemaJSON []byte
 	compiled   *jsonschema.Schema
@@ -146,6 +150,10 @@ func (m *Manifest) validate(baseDir string) error {
 		m.TokenFile = resolvePath(baseDir, m.TokenFile)
 	}
 
+	if _, err := ParseLogLevel(m.LogLevel); err != nil {
+		return fmt.Errorf("log_level: %w", err)
+	}
+
 	m.uploadWindow = defaultUploadWindow
 	if m.UploadRetryWindow != "" {
 		if m.uploadWindow, err = time.ParseDuration(m.UploadRetryWindow); err != nil {
@@ -168,6 +176,55 @@ func (m *Manifest) validate(baseDir string) error {
 		m.byName[c.Name] = c
 	}
 	return nil
+}
+
+// TestConfig says how to show a capability working from start to finish, when
+// someone asks the gateway to test it. Unlike a check, it runs as a real job.
+type TestConfig struct {
+	Input any `yaml:"input"`
+}
+
+// maxTestInputBytes keeps a test's input small enough to send on every connection.
+const maxTestInputBytes = 64 << 10
+
+func (c *Capability) validateTest() error {
+	if c.Test == nil {
+		return nil
+	}
+	if len(c.InputFiles) > 0 {
+		return errors.New("test can't be used with input_files, because a test has no files to send")
+	}
+	input := c.Test.Input
+	if input == nil {
+		input = map[string]any{}
+	}
+	raw, err := json.Marshal(input)
+	if err != nil {
+		return fmt.Errorf("test input: %w", err)
+	}
+	if len(raw) > maxTestInputBytes {
+		return fmt.Errorf("test input is larger than %d bytes", maxTestInputBytes)
+	}
+	if err := schema.Validate(c.compiled, raw); err != nil {
+		return fmt.Errorf("test input doesn't match input_schema: %w", err)
+	}
+	c.testInput = raw
+	return nil
+}
+
+// ParseLogLevel reads a level name. Empty means info.
+func ParseLogLevel(text string) (slog.Level, error) {
+	switch text {
+	case "", "info":
+		return slog.LevelInfo, nil
+	case "debug":
+		return slog.LevelDebug, nil
+	case "warn":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	}
+	return 0, fmt.Errorf("%q must be debug, info, warn or error", text)
 }
 
 func isLoopback(host string) bool {
@@ -242,6 +299,9 @@ func (c *Capability) validate(resources map[string]int) error {
 		return err
 	}
 	if err := c.validateCheck(); err != nil {
+		return err
+	}
+	if err := c.validateTest(); err != nil {
 		return err
 	}
 
@@ -409,6 +469,7 @@ func (m *Manifest) protocolCapabilities() []protocol.Capability {
 			TimeoutSeconds: int64(c.timeout.Seconds()),
 			RetryIfLost:    c.RetryIfLost,
 			InputFiles:     c.InputFiles,
+			TestInput:      c.testInput,
 		})
 	}
 	return out

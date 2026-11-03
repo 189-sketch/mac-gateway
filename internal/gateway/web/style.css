@@ -116,6 +116,7 @@ section > h2, .section-head { margin-bottom: 10px; }
 .chips li { border: 1px solid var(--hairline); border-radius: 4px; padding: 0 6px; font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
 
 .chips li.not-ready { display: inline-flex; align-items: center; gap: 4px; color: var(--ink); border-color: var(--edge); }
+.test-note { margin: 8px 0 0; font-size: 12px; color: var(--ink); overflow-wrap: anywhere; }
 .not-ready-note { margin: 8px 0 0; padding-left: 8px; border-left: 3px solid var(--warning); font-size: 12px; color: var(--ink); overflow-wrap: anywhere; }
 
 .meter { height: 6px; border-radius: 3px; background: var(--accent-track); overflow: hidden; }

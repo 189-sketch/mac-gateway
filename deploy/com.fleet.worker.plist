@@ -13,6 +13,8 @@
     <string>/Users/YOUR_USER/fleet/fleet-worker</string>
     <string>--config</string>
     <string>/Users/YOUR_USER/fleet/worker.yaml</string>
+    <string>--log-file</string>
+    <string>/Users/YOUR_USER/fleet/worker.log</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/YOUR_USER/fleet</string>
@@ -28,8 +30,8 @@
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
-  <string>/Users/YOUR_USER/fleet/worker.log</string>
+  <string>/Users/YOUR_USER/fleet/worker.log.crash</string>
   <key>StandardErrorPath</key>
-  <string>/Users/YOUR_USER/fleet/worker.log</string>
+  <string>/Users/YOUR_USER/fleet/worker.log.crash</string>
 </dict>
 </plist>

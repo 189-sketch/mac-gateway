@@ -34,6 +34,7 @@ func (g *Gateway) routes() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("GET /v1/capabilities", g.withKey(g.handleCapabilities))
+	mux.HandleFunc("POST /v1/capabilities/{name}/test", g.withKey(g.handleTestCapability))
 	mux.HandleFunc("POST /v1/jobs", g.withKey(g.handleCreateJob))
 	mux.HandleFunc("GET /v1/jobs/{id}", g.withKey(g.handleGetJob))
 	mux.HandleFunc("GET /v1/jobs/{id}/events", g.withKey(g.handleJobEvents))
@@ -140,12 +141,20 @@ type nodeOffer struct {
 	// it's what the node last reported.
 	NotReady string            `json:"not_ready,omitempty"`
 	Labels   map[string]string `json:"labels,omitempty"`
+	// Testable says the node declares a test for this capability.
+	Testable bool      `json:"testable"`
+	LastTest *LastTest `json:"last_test,omitempty"`
 }
 
 func (g *Gateway) handleCapabilities(w http.ResponseWriter, r *http.Request, key *APIKey) {
 	rows, err := g.store.CapabilityRows(r.Context(), "")
 	if err != nil {
 		g.internalError(w, r, "list capabilities", err)
+		return
+	}
+	lastTests, err := g.store.LastTests(r.Context())
+	if err != nil {
+		g.internalError(w, r, "list test results", err)
 		return
 	}
 	online := g.onlineNodes()
@@ -160,7 +169,8 @@ func (g *Gateway) handleCapabilities(w http.ResponseWriter, r *http.Request, key
 		view := &views[len(views)-1]
 		isOnline := online.ids[row.NodeID]
 		ready := isOnline && row.NotReady == ""
-		view.Nodes = append(view.Nodes, nodeOffer{Name: row.NodeName, Online: isOnline, Ready: ready, NotReady: row.NotReady, Labels: row.Labels})
+		view.Nodes = append(view.Nodes, nodeOffer{Name: row.NodeName, Online: isOnline, Ready: ready, NotReady: row.NotReady, Labels: row.Labels,
+			Testable: row.TestInput != "", LastTest: lastTests[testKey{row.NodeID, row.Name}]})
 		if isOnline {
 			view.OnlineNodes++
 		}
@@ -196,14 +206,10 @@ func (g *Gateway) handleCreateJob(w http.ResponseWriter, r *http.Request, key *A
 		writeError(w, http.StatusBadRequest, "BAD_REQUEST", "idempotency_key is longer than 200 characters", false)
 		return
 	}
-	queueTimeout := defaultQueueTimeout
-	if req.QueueTimeout != "" {
-		parsed, err := time.ParseDuration(req.QueueTimeout)
-		if err != nil || parsed <= 0 || parsed > maxQueueTimeout {
-			writeError(w, http.StatusBadRequest, "BAD_REQUEST", "queue_timeout must be a duration between 0 and 24h", false)
-			return
-		}
-		queueTimeout = parsed
+	queueTimeout, err := parseQueueTimeout(req.QueueTimeout)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "BAD_REQUEST", err.Error(), false)
+		return
 	}
 
 	input := []byte(req.Input)
@@ -277,6 +283,17 @@ func (g *Gateway) handleCreateJob(w http.ResponseWriter, r *http.Request, key *A
 		g.wakeScheduler()
 	}
 	writeJSON(w, status, view)
+}
+
+func parseQueueTimeout(text string) (time.Duration, error) {
+	if text == "" {
+		return defaultQueueTimeout, nil
+	}
+	parsed, err := time.ParseDuration(text)
+	if err != nil || parsed <= 0 || parsed > maxQueueTimeout {
+		return 0, errors.New("queue_timeout must be a duration between 0 and 24h")
+	}
+	return parsed, nil
 }
 
 // checkOffers confirms at least one node could run this request.

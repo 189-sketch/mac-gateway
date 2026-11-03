@@ -99,6 +99,7 @@ func (w *Worker) runAsync(ctx context.Context, a *attempt, c *Capability, vars t
 		return nil, &protocol.Failure{Code: protocol.CodeBadResponse, Message: fmt.Sprintf("the service's reply has no usable %q", c.Async.JobIDField)}
 	}
 	vars.remoteID = remoteID
+	w.log.Info("service accepted the job", "attempt", a.meta.AttemptID, "capability", c.Name, "remote_id", remoteID)
 	if _, err := renderURL(c.Async.Poll.URL, vars); err != nil {
 		return nil, &protocol.Failure{Code: protocol.CodeBadResponse, Message: "the service's job ID can't be used in its status URL"}
 	}
@@ -251,8 +252,11 @@ func (w *Worker) sendRequest(ctx context.Context, t *RequestTemplate, vars templ
 	if err != nil {
 		return nil, &protocol.Failure{Code: protocol.CodeInvalidInput, Message: err.Error()}
 	}
+	// t.URL is the manifest's template, so job input never reaches the log this way.
+	sent := time.Now()
 	resp, err := w.serviceClient.Do(req)
 	if err != nil {
+		w.log.Debug("service request failed", "method", t.Method, "url", t.URL, "duration", time.Since(sent).Round(time.Millisecond).String())
 		// The details name this machine's address and ports, which are no business
 		// of whoever submitted the job, so they stay in the local log. A url.Error
 		// also repeats the full URL, which can contain a secret.
@@ -265,6 +269,7 @@ func (w *Worker) sendRequest(ctx context.Context, t *RequestTemplate, vars templ
 		}
 		return nil, &protocol.Failure{Code: protocol.CodeServiceUnavailable, Message: "couldn't reach the service; the worker's log has the details"}
 	}
+	w.log.Debug("service request", "method", t.Method, "url", t.URL, "status", resp.StatusCode, "duration", time.Since(sent).Round(time.Millisecond).String())
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		return resp, nil
 	}

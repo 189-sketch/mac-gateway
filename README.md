@@ -200,6 +200,32 @@ sudo -u fleet /usr/local/bin/fleet-gateway node revoke mac-mini-1 --data /var/li
 
 `--capabilities` takes comma-separated patterns, and `'*'` allows everything. A key made with `--dashboard` instead can only view [the dashboard](#dashboard). Revoking takes effect within a heartbeat. A revoked name can't be registered again, so a replacement machine needs a new name.
 
+### See what a worker is doing
+
+The worker logs each job as it starts, finishes or fails, with how long it took and why it failed. It also logs its connection to the gateway and any capability that stops or starts working.
+
+| Where | Watch the log | Files |
+|---|---|---|
+| Mac | `tail -F ~/fleet/worker.log` | `~/fleet/` |
+| Windows | `Get-Content -Wait -Tail 20 "$env:LOCALAPPDATA\Fleet\worker.log"` | `%LOCALAPPDATA%\Fleet\` |
+
+`worker.log` moves aside at 10 MB, and the newest three old logs are kept as `worker.log.1`, `.2` and `.3`, so logs can't fill the disk. If the worker itself crashes, the details are in `worker.log.crash`.
+
+To watch it live in a console, stop the background worker first, so that two aren't running with one token:
+
+```sh
+launchctl bootout "gui/$(id -u)/com.fleet.worker"
+cd ~/fleet && ./fleet-worker --config worker.yaml --log-level debug
+# Press Ctrl-C when you're done, then start it in the background again:
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.fleet.worker.plist
+```
+
+By default a console shows logs and writes no file. Add `--log-file worker.log` to get both.
+
+For more detail in the background worker, add `log_level: debug` to `worker.yaml` and restart it. Debug also shows each command's output line, each request to a service, each check and each message exchanged with the gateway.
+
+Logs never contain the node token or header secrets. Job input isn't logged either, with one exception: **at debug level, the log includes what commands print, and a command can print what it was given.** A failed job's error message also includes the end of its command's output, or the service's reply, at every level.
+
 ### Troubleshooting
 
 | Problem | What to check |
@@ -417,6 +443,41 @@ check:
 ```
 
 A check runs with no job, so it can't use placeholders. It runs with the capability's `env`, and `url` can use `headers` and follows the same host rules as `request`. A check that fails only affects new jobs: anything already running carries on.
+
+### Test a capability
+
+A check says a service is answering. A test runs the whole capability as a real job, so it shows that a machine can actually do the work. The worker defines the test in `worker.yaml`, using input that's safe to run again and again:
+
+```yaml
+- name: tts.say
+  # ...
+  test:
+    input: { text: "Fleet test" } # Must match input_schema.
+```
+
+Restart the worker, and the gateway finds out when it reconnects. Then, from anywhere with an API key:
+
+```sh
+fleet test tts.say                  # Every connected, ready machine
+fleet test tts.say --node mac-mini  # Just this one
+```
+
+```text
+mac-mini: testing tts.say (job job_...)
+mac-mini: passed in 1.2s
+```
+
+The command prints the jobs as JSON and exits with `0` if every test it started passed, `1` if one failed, or `75` if trying again could work, such as when no machine is ready yet. Machines it couldn't test are listed as `skipped`, with the reason.
+
+With the API, `POST /v1/capabilities/{name}/test` takes an optional `node`, `queue_timeout` and `idempotency_key`, and answers with `tests` (the node and job for each) and `skipped`. If it can't start any, it answers `409 NOT_READY` when a machine is offline or not ready, or `422 NO_TEST` when none declares a usable test.
+
+- **It's an ordinary job.** Follow it, cancel it or download its results with the job's ID. It counts against the machine's limits, so it waits its turn on a busy machine. It runs on the machine it was started for, and no other.
+- **Callers can't change what it runs.** They choose only when it runs. The API key must be allowed to call the capability, and a dashboard key can't start tests.
+- **Passing means the job finished.** The command exited with `0` and produced its outputs, or the service replied successfully. It doesn't judge the content, so download the result if you need to hear or see it.
+- **Tests only run when asked.** A test can use a lot of a machine's power, so connecting doesn't start one. To test regularly, run `fleet test` from cron.
+- **A capability with `input_files` can't declare a test**, because a test has no files to send.
+
+`fleet capabilities` shows `testable` and `last_test` for each machine, and the dashboard shows each machine's latest result.
 
 ### Call an HTTP service
 

@@ -435,15 +435,15 @@ func (s *Store) fenceAndFinish(ctx context.Context, where string, args []any, st
 // ExpireQueued fails queued jobs that waited too long. eligibleOnline says
 // whether a capable node is connected, which separates "all nodes are busy"
 // from "nothing can run this".
-func (s *Store) ExpireQueued(ctx context.Context, eligibleOnline func(capability string, selector map[string]string) bool) ([]AttemptRef, error) {
+func (s *Store) ExpireQueued(ctx context.Context, eligibleOnline func(capability string, selector map[string]string, testNode string) bool) ([]AttemptRef, error) {
 	type expiredJob struct {
-		id, capability string
-		selector       map[string]string
+		id, capability, testNode string
+		selector                 map[string]string
 	}
 	var aborts []AttemptRef
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		aborts = nil
-		rows, err := tx.Query(`SELECT id, capability, selector FROM jobs WHERE status=? AND queue_deadline_ms < ?`, StatusQueued, nowMS())
+		rows, err := tx.Query(`SELECT id, capability, selector, COALESCE(test_node, '') FROM jobs WHERE status=? AND queue_deadline_ms < ?`, StatusQueued, nowMS())
 		if err != nil {
 			return err
 		}
@@ -451,7 +451,7 @@ func (s *Store) ExpireQueued(ctx context.Context, eligibleOnline func(capability
 		for rows.Next() {
 			var j expiredJob
 			var selector string
-			if err := rows.Scan(&j.id, &j.capability, &selector); err != nil {
+			if err := rows.Scan(&j.id, &j.capability, &selector, &j.testNode); err != nil {
 				rows.Close()
 				return err
 			}
@@ -467,7 +467,7 @@ func (s *Store) ExpireQueued(ctx context.Context, eligibleOnline func(capability
 		}
 		for _, j := range expired {
 			code, message := CodeNoNodeOnline, "no node that can run this capability was online and ready in time"
-			if eligibleOnline(j.capability, j.selector) {
+			if eligibleOnline(j.capability, j.selector, j.testNode) {
 				code, message = CodeQueueTimeout, "capable nodes stayed busy for the whole queue timeout"
 			}
 			if err := finishJob(tx, j.id, StatusFailed, code, message); err != nil {
@@ -495,11 +495,12 @@ func (s *Store) ExpireQueued(ctx context.Context, eligibleOnline func(capability
 type QueuedJob struct {
 	ID, Capability, Input string
 	Selector              map[string]string
+	TestNode              string // For a test, the only node that may run it.
 }
 
 // QueuedJobs returns the oldest waiting jobs.
 func (s *Store) QueuedJobs(ctx context.Context, limit int) ([]QueuedJob, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, capability, input, selector FROM jobs WHERE status=? ORDER BY created_ms LIMIT ?`, StatusQueued, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, capability, input, selector, COALESCE(test_node, '') FROM jobs WHERE status=? ORDER BY created_ms LIMIT ?`, StatusQueued, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -508,7 +509,7 @@ func (s *Store) QueuedJobs(ctx context.Context, limit int) ([]QueuedJob, error) 
 	for rows.Next() {
 		var j QueuedJob
 		var selector string
-		if err := rows.Scan(&j.ID, &j.Capability, &j.Input, &selector); err != nil {
+		if err := rows.Scan(&j.ID, &j.Capability, &j.Input, &selector, &j.TestNode); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(selector), &j.Selector); err != nil {

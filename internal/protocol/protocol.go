@@ -82,6 +82,9 @@ type Capability struct {
 	// NotReady says why the worker's own check found this can't run jobs right now.
 	// Empty means ready, which is also how a worker with no checks appears.
 	NotReady string `json:"not_ready,omitempty"`
+	// TestInput is the input the worker says will show this capability working. With
+	// none, the capability can't be tested.
+	TestInput json.RawMessage `json:"test_input,omitempty"`
 }
 
 // CapabilityStatus is the complete list of a worker's capabilities that aren't
@@ -135,6 +138,7 @@ type Assign struct {
 	Capability string          `json:"capability"`
 	Input      json.RawMessage `json:"input"`
 	Files      []InputFile     `json:"files,omitempty"`
+	Test       bool            `json:"test,omitempty"`
 }
 
 // Event is one numbered, durable fact about an attempt. Seq starts at 1 for

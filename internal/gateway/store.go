@@ -188,6 +188,18 @@ func OpenStore(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("upgrade schema: %w", err)
 	}
+	if err := ensureColumn(db, "capabilities", "test_input", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("upgrade schema: %w", err)
+	}
+	if err := ensureColumn(db, "jobs", "test_node", "TEXT"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("upgrade schema: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS jobs_test ON jobs(test_node, capability, created_ms) WHERE test_node IS NOT NULL`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("upgrade schema: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -360,8 +372,8 @@ func (s *Store) RegisterNode(ctx context.Context, nodeID string, h protocol.Hell
 			if err != nil {
 				return err
 			}
-			if _, err := tx.Exec(`INSERT INTO capabilities (node_id, name, input_schema, requires, timeout_seconds, retry_if_lost, input_files, not_ready) VALUES (?,?,?,?,?,?,?,?)`,
-				nodeID, c.Name, string(c.InputSchema), string(requires), c.TimeoutSeconds, boolInt(c.RetryIfLost), string(inputFiles), cleanReason(c.NotReady)); err != nil {
+			if _, err := tx.Exec(`INSERT INTO capabilities (node_id, name, input_schema, requires, timeout_seconds, retry_if_lost, input_files, not_ready, test_input) VALUES (?,?,?,?,?,?,?,?,?)`,
+				nodeID, c.Name, string(c.InputSchema), string(requires), c.TimeoutSeconds, boolInt(c.RetryIfLost), string(inputFiles), cleanReason(c.NotReady), string(c.TestInput)); err != nil {
 				return err
 			}
 		}
@@ -404,12 +416,13 @@ type CapabilityRow struct {
 	MaxJobs        int
 	InputFiles     []string
 	NotReady       string // Why the node's own check says this can't run. Empty means ready.
+	TestInput      string // What the node says to run to test this. Empty means it can't be tested.
 }
 
 // CapabilityRows lists capabilities for active nodes. An empty name lists all.
 func (s *Store) CapabilityRows(ctx context.Context, name string) ([]CapabilityRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT c.node_id, n.name, c.name, c.input_schema, c.requires, c.timeout_seconds, c.retry_if_lost, n.labels, n.resources, n.max_jobs, c.input_files, c.not_ready
+		SELECT c.node_id, n.name, c.name, c.input_schema, c.requires, c.timeout_seconds, c.retry_if_lost, n.labels, n.resources, n.max_jobs, c.input_files, c.not_ready, c.test_input
 		FROM capabilities c JOIN nodes n ON n.id = c.node_id
 		WHERE n.revoked_ms IS NULL AND (? = '' OR c.name = ?)
 		ORDER BY c.name, n.name`, name, name)
@@ -422,7 +435,7 @@ func (s *Store) CapabilityRows(ctx context.Context, name string) ([]CapabilityRo
 		var c CapabilityRow
 		var requires, labels, resources, inputFiles string
 		var retry int
-		if err := rows.Scan(&c.NodeID, &c.NodeName, &c.Name, &c.InputSchema, &requires, &c.TimeoutSeconds, &retry, &labels, &resources, &c.MaxJobs, &inputFiles, &c.NotReady); err != nil {
+		if err := rows.Scan(&c.NodeID, &c.NodeName, &c.Name, &c.InputSchema, &requires, &c.TimeoutSeconds, &retry, &labels, &resources, &c.MaxJobs, &inputFiles, &c.NotReady, &c.TestInput); err != nil {
 			return nil, err
 		}
 		c.RetryIfLost = retry != 0
@@ -451,6 +464,7 @@ type NewJob struct {
 	RequestHash    string
 	QueueTimeout   time.Duration
 	Files          map[string]string // Input field name to file ID.
+	TestNode       string            // For a test, the only node that may run it.
 }
 
 // ErrIdempotencyConflict means a key was reused for a different request.
@@ -481,10 +495,14 @@ func (s *Store) CreateJob(ctx context.Context, j NewJob) (id string, created boo
 		if j.IdempotencyKey != "" {
 			key = j.IdempotencyKey
 		}
-		_, err := tx.Exec(`INSERT INTO jobs (id, api_key_id, capability, input, selector, idempotency_key, request_hash, status, queue_timeout_ms, queue_deadline_ms, created_ms)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		var testNode any
+		if j.TestNode != "" {
+			testNode = j.TestNode
+		}
+		_, err := tx.Exec(`INSERT INTO jobs (id, api_key_id, capability, input, selector, idempotency_key, request_hash, status, queue_timeout_ms, queue_deadline_ms, created_ms, test_node)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 			id, j.APIKeyID, j.Capability, j.Input, j.Selector, key, j.RequestHash, StatusQueued,
-			j.QueueTimeout.Milliseconds(), now+j.QueueTimeout.Milliseconds(), now)
+			j.QueueTimeout.Milliseconds(), now+j.QueueTimeout.Milliseconds(), now, testNode)
 		if err != nil {
 			return err
 		}
@@ -526,6 +544,7 @@ type JobView struct {
 	Capability string          `json:"capability"`
 	Status     string          `json:"status"`
 	Terminal   bool            `json:"terminal"`
+	Test       bool            `json:"test,omitempty"`
 	Attempts   int             `json:"attempts"`
 	Node       string          `json:"node,omitempty"`
 	Progress   json.RawMessage `json:"progress,omitempty"`
@@ -553,12 +572,12 @@ func (s *Store) GetJob(ctx context.Context, jobID, apiKeyID string, withEvents b
 	var created int64
 	var started, finished sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `
-		SELECT j.id, j.capability, j.status, j.attempts, n.name, j.progress, j.error_code, j.error_message, j.created_ms, j.started_ms, j.finished_ms
+		SELECT j.id, j.capability, j.status, j.attempts, n.name, j.progress, j.error_code, j.error_message, j.created_ms, j.started_ms, j.finished_ms, j.test_node IS NOT NULL
 		FROM jobs j
 		LEFT JOIN attempts a ON a.id = j.current_attempt
 		LEFT JOIN nodes n ON n.id = a.node_id
 		WHERE j.id = ? AND j.api_key_id = ?`, jobID, apiKeyID).
-		Scan(&v.ID, &v.Capability, &v.Status, &v.Attempts, &node, &progress, &errCode, &errMsg, &created, &started, &finished)
+		Scan(&v.ID, &v.Capability, &v.Status, &v.Attempts, &node, &progress, &errCode, &errMsg, &created, &started, &finished, &v.Test)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

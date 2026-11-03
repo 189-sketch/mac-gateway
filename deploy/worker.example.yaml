@@ -6,6 +6,9 @@
 gateway_url: https://fleet.example.com
 token_file: token # Must be chmod 600.
 state_dir: state
+# How much to log: debug, info (the default), warn or error. At debug, the log
+# also has each command's output, which can include what a job was given.
+# log_level: info
 
 node:
   name: mac-mini-1 # Must match the name given to `fleet-gateway node add`.
@@ -37,6 +40,10 @@ capabilities:
     # Rerunning is safe here because it only produces a file. Leave this false for
     # anything with side effects that must not happen twice.
     retry_if_lost: true
+    # What `fleet test` runs, to show this works from start to finish. Without this,
+    # the capability can't be tested. Use input that's safe to run again and again.
+    test:
+      input: { text: "Fleet test" }
 
   # A capability that takes a file. Uncomment it after installing ffmpeg, and use
   # the path `which ffmpeg` prints. The agent sends the file with:

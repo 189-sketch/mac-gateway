@@ -243,6 +243,8 @@ func (w *Worker) readOutput(a *attempt, c *Capability, r io.Reader, tail *logTai
 	for scanner.Scan() {
 		line := scanner.Text()
 		tail.add(line)
+		// Only at debug level, because a command can print what it was given.
+		w.log.Debug("command output", "attempt", a.meta.AttemptID, "line", line)
 		if c.progressRE == nil || time.Since(lastEmit) < progressInterval {
 			continue
 		}
@@ -319,6 +321,7 @@ func (w *Worker) deliverOutputs(ctx context.Context, a *attempt, c *Capability, 
 			w.fail(a, protocol.CodeOutputMissing, fmt.Sprintf("output %q: %v", name, err))
 			return
 		}
+		w.log.Info("uploading result", "attempt", a.meta.AttemptID, "file", ref.Name, "bytes", ref.Size)
 		w.emit(a, protocol.EventProgress, protocol.Progress{Stage: "uploading", Message: ref.Name})
 		err = w.retryTransfer(ctx, a, ref.Name, func() error {
 			return w.uploadOnce(ctx, a, root, rel, ref)
@@ -331,6 +334,7 @@ func (w *Worker) deliverOutputs(ctx context.Context, a *attempt, c *Capability, 
 		}
 		refs = append(refs, ref)
 	}
+	w.log.Info("attempt completed", "job", a.meta.JobID, "attempt", a.meta.AttemptID, "capability", a.meta.Capability, "files", len(refs), "duration", a.elapsed())
 	w.emit(a, protocol.EventCompleted, protocol.Completion{Artifacts: refs, Result: result})
 }
 

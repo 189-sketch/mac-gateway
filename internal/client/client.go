@@ -63,6 +63,7 @@ type Job struct {
 	Capability string     `json:"capability"`
 	Status     string     `json:"status"`
 	Terminal   bool       `json:"terminal"`
+	Test       bool       `json:"test,omitempty"`
 	Attempts   int        `json:"attempts"`
 	Node       string     `json:"node,omitempty"`
 	Progress   *Progress  `json:"progress,omitempty"`
@@ -103,6 +104,32 @@ type NewJob struct {
 	Selector       map[string]string `json:"selector,omitempty"`
 	QueueTimeout   string            `json:"queue_timeout,omitempty"`
 	IdempotencyKey string            `json:"idempotency_key,omitempty"`
+}
+
+// NewTest asks the gateway to test a capability. With no node, it tests every
+// connected machine that's ready and declares a test.
+type NewTest struct {
+	Node           string `json:"node,omitempty"`
+	QueueTimeout   string `json:"queue_timeout,omitempty"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+}
+
+// TestRun is a test the gateway started, as a job on one machine.
+type TestRun struct {
+	Node string `json:"node"`
+	Job  *Job   `json:"job"`
+}
+
+// TestSkip is a machine the gateway couldn't test, and why.
+type TestSkip struct {
+	Node   string `json:"node"`
+	Reason string `json:"reason"`
+}
+
+// TestResult is what the gateway started.
+type TestResult struct {
+	Tests   []TestRun  `json:"tests"`
+	Skipped []TestSkip `json:"skipped"`
 }
 
 // Client is an authenticated connection to one gateway.
@@ -250,6 +277,20 @@ func (c *Client) CreateJob(ctx context.Context, job NewJob) (*Job, error) {
 	}
 	var out Job
 	if err := c.requestJSON(ctx, http.MethodPost, "/v1/jobs", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// TestCapability starts a capability's test using the input its worker declares.
+func (c *Client) TestCapability(ctx context.Context, capability string, test NewTest) (*TestResult, error) {
+	body, err := json.Marshal(test)
+	if err != nil {
+		return nil, err
+	}
+	var out TestResult
+	path := "/v1/capabilities/" + url.PathEscape(capability) + "/test"
+	if err := c.requestJSON(ctx, http.MethodPost, path, body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

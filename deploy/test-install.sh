@@ -237,6 +237,7 @@ rhelstub() {
 rhelstub dnf 'echo "dnf $*" >>"$STUB_LOG"
 [ -z "${STUB_DNF_FAIL:-}" ] || exit 1
 case "$*" in
+*"copr enable -y -q @caddy/caddy") [ -z "${STUB_COPR_NEEDS_EPEL:-}" ] || exit 1 ;;
 *"-q caddy") printf "#!/bin/sh\nexit 0\n" >"$(dirname "$0")/caddy"; chmod +x "$(dirname "$0")/caddy" ;;
 esac'
 rhelstub getenforce 'echo "${STUB_SELINUX:-Enforcing}"'
@@ -314,6 +315,17 @@ STUB_DNF_FAIL=1 run_centos_install "$CENTOS12" >"$OUT" 2>&1
 check "stops if Caddy can't be installed" test $? -ne 0
 check "explains retired repositories" grep -q 'retired' "$OUT"
 refute "changes nothing if Caddy can't be installed" test -e "$CENTOS12/usr/local/bin/fleet-gateway"
+
+CENTOS9="$WORK/centos9-root"
+mkdir -p "$CENTOS9/etc"
+printf 'ID="centos"\nVERSION_ID="9"\n' >"$CENTOS9/etc/os-release"
+rm -f "$RHEL/caddy"
+: >"$STUB_LOG"
+OUT="$WORK/centos9.out"
+STUB_COPR_NEEDS_EPEL=1 run_centos_install "$CENTOS9" >"$OUT" 2>&1
+check "installs on CentOS 9 when dnf can't choose Caddy's repository" test $? -eq 0
+check "falls back to the EPEL 9 build of Caddy" grep -q "dnf copr enable -y -q @caddy/caddy epel-9-$(uname -m)" "$STUB_LOG"
+rm -f "$RHEL/caddy"
 
 mv "$RHEL/dnf" "$WORK/dnf.saved"
 OUT="$WORK/centos7.out"
@@ -503,6 +515,8 @@ check "installs and connects" test "$RESULT" -eq 0
 [ "$RESULT" -eq 0 ] || sed 's/^/    /' "$OUT" >&2
 check "reports the connection" grep -q 'Connected to https://fleet.example.com' "$OUT"
 check "prints the power settings to apply" grep -q 'sudo pmset' "$OUT"
+check "explains how to watch the log" grep -q 'tail -F .*worker.log' "$OUT"
+check "gives the Mac a capability test" grep -q 'test:' "$MAC_HOME/fleet/worker.yaml"
 check "saves the token privately" test "$(stat -c %a "$MAC_HOME/fleet/token")" = 600
 check "writes a valid plist" python3 -c "
 import plistlib, sys
@@ -510,6 +524,8 @@ p = plistlib.load(open('$MAC_HOME/Library/LaunchAgents/com.fleet.worker.plist', 
 assert p['Label'] == 'com.fleet.worker'
 assert p['ProgramArguments'][0] == '$MAC_HOME/fleet/fleet-worker'
 assert p['KeepAlive'] is True
+assert p['ProgramArguments'][3:] == ['--log-file', '$MAC_HOME/fleet/worker.log']
+assert p['StandardErrorPath'] == '$MAC_HOME/fleet/worker.log.crash'
 "
 export FLEET_URL="http://127.0.0.1:$GATEWAY_PORT"
 export FLEET_API_KEY="$(sed -n 's/.*FLEET_API_KEY=\(fk_[0-9a-f]*\).*/\1/p' "$WORK/first.out")"

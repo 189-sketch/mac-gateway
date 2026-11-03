@@ -2,6 +2,7 @@ package worker
 
 import (
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -504,5 +505,69 @@ func TestProgramRunnable(t *testing.T) {
 	}
 	if err := programRunnable(dir, "linux"); err == nil {
 		t.Error("a directory counted as runnable")
+	}
+}
+
+func testManifest(t *testing.T, capabilityExtra string) (*Manifest, error) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "worker.yaml")
+	body := `gateway_url: https://fleet.example.com
+token_file: token
+state_dir: state
+node: { name: mac }
+capabilities:
+  - name: tts.say
+    adapter: cli
+    command: [/bin/echo]
+    input_schema:
+      type: object
+      required: [text]
+      properties: { text: { type: string } }
+` + capabilityExtra
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return LoadManifest(path)
+}
+
+func TestCapabilityTestIsCheckedWhenTheWorkerStarts(t *testing.T) {
+	m, err := testManifest(t, "    test: { input: { text: hello } }\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(m.protocolCapabilities()[0].TestInput); got != `{"text":"hello"}` {
+		t.Errorf("sends %s", got)
+	}
+
+	m, err = testManifest(t, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.protocolCapabilities()[0].TestInput; got != nil {
+		t.Errorf("a capability with no test sends %s", got)
+	}
+
+	for name, tc := range map[string]struct{ extra, want string }{
+		"input doesn't match the schema": {"    test: { input: { text: 5 } }\n", "doesn't match input_schema"},
+		"empty input doesn't match":      {"    test: {}\n", "doesn't match input_schema"},
+		"needs a file":                   {"    input_files: [clip]\n    test: { input: { text: a } }\n", "input_files"},
+		"too large":                      {"    test: { input: { text: " + strings.Repeat("x", maxTestInputBytes) + " } }\n", "larger than"},
+	} {
+		_, err := testManifest(t, tc.extra)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error = %v, want %q", name, err, tc.want)
+		}
+	}
+}
+
+func TestLogLevels(t *testing.T) {
+	for text, want := range map[string]slog.Level{"": slog.LevelInfo, "info": slog.LevelInfo, "debug": slog.LevelDebug, "warn": slog.LevelWarn, "error": slog.LevelError} {
+		if got, err := ParseLogLevel(text); err != nil || got != want {
+			t.Errorf("%q = %v, %v", text, got, err)
+		}
+	}
+	if _, err := ParseLogLevel("verbose"); err == nil {
+		t.Error("accepted an unknown level")
 	}
 }

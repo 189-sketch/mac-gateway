@@ -20,7 +20,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"mactunnel/internal/client"
 	"mactunnel/internal/transfer"
@@ -33,6 +35,7 @@ const usage = `usage: fleet <command> [arguments]
 
   fleet version
   fleet capabilities
+  fleet test CAPABILITY [flags]       run the test its workers declare, and report the result
   fleet run CAPABILITY [flags]        submit a job, follow it, download its results
   fleet status JOB [--wait N] [--events]
   fleet watch JOB                     print events as JSON lines until the job ends
@@ -49,6 +52,11 @@ flags for run:
   --queue-timeout D      how long to wait for a node, such as 10m
   --idempotency-key KEY  repeat this key to get the same job back
   --detach               print the job and exit without waiting
+  --quiet                don't print progress
+
+flags for test:
+  --node NAME            only test this machine (default: every ready machine)
+  --queue-timeout D      how long to wait if the machine is busy, such as 10m
   --quiet                don't print progress
 
 environment:
@@ -107,6 +115,7 @@ func run(args []string) int {
 	commands := map[string]func(context.Context, []string) (int, error){
 		"capabilities": cmdCapabilities,
 		"run":          cmdRun,
+		"test":         cmdTest,
 		"status":       cmdStatus,
 		"watch":        cmdWatch,
 		"cancel":       cmdCancel,
@@ -483,6 +492,104 @@ func cmdCapabilities(ctx context.Context, args []string) (int, error) {
 		return 0, err
 	}
 	return exitOK, printJSON(raw)
+}
+
+// testOutput is what `fleet test` prints.
+type testOutput struct {
+	Tests   []client.TestRun  `json:"tests"`
+	Skipped []client.TestSkip `json:"skipped"`
+}
+
+func cmdTest(ctx context.Context, args []string) (int, error) {
+	fs := newFlagSet("test")
+	node := fs.String("node", "", "")
+	queueTimeout := fs.String("queue-timeout", "", "")
+	quiet := fs.Bool("quiet", false, "")
+	capability, err := parseWithPositional(fs, args, "CAPABILITY")
+	if err != nil {
+		return 0, err
+	}
+	c, err := newClient()
+	if err != nil {
+		return 0, err
+	}
+	// The key stops a retried request from running an expensive test twice.
+	started, err := c.TestCapability(ctx, capability, client.NewTest{Node: *node, QueueTimeout: *queueTimeout, IdempotencyKey: randomKey()})
+	if err != nil {
+		return 0, err
+	}
+	for _, skip := range started.Skipped {
+		progressf(*quiet, "%s: skipped: %s", skip.Node, skip.Reason)
+	}
+	for _, test := range started.Tests {
+		progressf(*quiet, "%s: testing %s (job %s)", test.Node, capability, test.Job.ID)
+	}
+
+	var wait sync.WaitGroup
+	failures := make([]error, len(started.Tests))
+	for i := range started.Tests {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			test := &started.Tests[i]
+			job, err := waitForJob(ctx, c, test.Job)
+			if err != nil {
+				failures[i] = fmt.Errorf("%s: job %s: %w", test.Node, test.Job.ID, err)
+				return
+			}
+			test.Job = job
+			progressf(*quiet, "%s: %s", test.Node, testSummary(job))
+		}()
+	}
+	wait.Wait()
+	if ctx.Err() != nil {
+		fmt.Fprintln(os.Stderr, "fleet: stopped following; the tests keep running. Use `fleet status JOB` or `fleet cancel JOB`.")
+		return exitInterrupt, nil
+	}
+	if err := errors.Join(failures...); err != nil {
+		return 0, err
+	}
+	if err := printJSON(testOutput{Tests: started.Tests, Skipped: started.Skipped}); err != nil {
+		return 0, err
+	}
+	code := exitOK
+	for _, test := range started.Tests {
+		// A test that certainly failed outranks one that might pass if run again.
+		if result := jobExitCode(test.Job); result == exitFailed || code == exitOK {
+			code = result
+		}
+		if code == exitFailed {
+			break
+		}
+	}
+	return code, nil
+}
+
+// waitForJob waits in long polls, so that many machines don't need many streams.
+func waitForJob(ctx context.Context, c *client.Client, job *client.Job) (*client.Job, error) {
+	for !job.Terminal {
+		next, err := c.GetJob(ctx, job.ID, 30, false)
+		if err != nil {
+			return nil, err
+		}
+		job = next
+	}
+	return job, nil
+}
+
+func testSummary(job *client.Job) string {
+	if job.Status == "succeeded" {
+		started, err1 := time.Parse(time.RFC3339Nano, job.StartedAt)
+		finished, err2 := time.Parse(time.RFC3339Nano, job.FinishedAt)
+		if err1 != nil || err2 != nil {
+			return "passed"
+		}
+		return "passed in " + finished.Sub(started).Round(10*time.Millisecond).String()
+	}
+	if job.Error != nil {
+		return fmt.Sprintf("failed: %s: %s", job.Error.Code, job.Error.Message)
+	}
+	return "failed: " + job.Status
 }
 
 func cmdStatus(ctx context.Context, args []string) (int, error) {
