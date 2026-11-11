@@ -37,6 +37,15 @@ type Config struct {
 	ArtifactTTL       time.Duration
 	MaxArtifactBytes  int64
 	MaxWebSocketBytes int64
+	// PublicURL is where agents reach the gateway, such as
+	// https://fleet.example.com. Links in MCP results use it. Without it, the
+	// gateway goes by the proxy's headers.
+	PublicURL string
+	// MCPWait is how long an MCP tool call waits for its job before answering
+	// with the job's ID instead.
+	MCPWait time.Duration
+	// Version is the gateway's release, which MCP clients are told.
+	Version string
 }
 
 // DefaultConfig returns production defaults.
@@ -53,6 +62,7 @@ func DefaultConfig() Config {
 		ArtifactTTL:       24 * time.Hour,
 		MaxArtifactBytes:  20 << 30,
 		MaxWebSocketBytes: 2 << 20,
+		MCPWait:           50 * time.Second,
 	}
 }
 
@@ -69,6 +79,11 @@ type Gateway struct {
 
 	uploadsMu sync.Mutex
 	uploads   map[string]*uploadSlot
+
+	linkKey []byte
+	// runCtx ends when the gateway shuts down, which tells a request that ended
+	// because of the shutdown from one its client gave up on.
+	runCtx context.Context
 }
 
 // New creates a gateway and prepares its data directories.
@@ -84,7 +99,16 @@ func New(cfg Config, store *Store, log *slog.Logger) (*Gateway, error) {
 			os.Remove(filepath.Join(cfg.tmpDir(), e.Name()))
 		}
 	}
+	linkKey, err := loadLinkKey(cfg.DataDir)
+	if err != nil {
+		return nil, fmt.Errorf("load link key: %w", err)
+	}
+	if cfg.MCPWait <= 0 {
+		cfg.MCPWait = DefaultConfig().MCPWait
+	}
 	return &Gateway{
+		linkKey: linkKey,
+		runCtx:  context.Background(),
 		cfg:     cfg,
 		store:   store,
 		log:     log,
@@ -109,6 +133,7 @@ func (c Config) partialDir() string { return filepath.Join(c.DataDir, "partial")
 
 // Run serves until ctx is cancelled.
 func (g *Gateway) Run(ctx context.Context) error {
+	g.runCtx = ctx
 	if err := g.store.ExtendActiveLeases(ctx, g.policy); err != nil {
 		return fmt.Errorf("extend leases: %w", err)
 	}

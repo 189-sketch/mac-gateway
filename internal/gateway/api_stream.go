@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -136,11 +137,24 @@ func writeSSE(w io.Writer, id, name string, payload any) error {
 	return err
 }
 
+// cancelJob stops a job the key owns, and tells its worker to stop.
+func (g *Gateway) cancelJob(ctx context.Context, jobID, keyID string) (found bool, err error) {
+	found, abort, err := g.store.CancelJob(ctx, jobID, keyID)
+	if err != nil || !found {
+		return found, err
+	}
+	if abort != nil {
+		g.sendAbort(*abort)
+		g.wakeScheduler() // The cancelled job's capacity is free now.
+	}
+	return true, nil
+}
+
 // handleCancelJob stops a job. If its worker is offline, the worker is told to
 // stop when it reconnects.
 func (g *Gateway) handleCancelJob(w http.ResponseWriter, r *http.Request, key *APIKey) {
 	id := r.PathValue("id")
-	found, abort, err := g.store.CancelJob(r.Context(), id, key.ID)
+	found, err := g.cancelJob(r.Context(), id, key.ID)
 	if err != nil {
 		g.internalError(w, r, "cancel job", err)
 		return
@@ -148,10 +162,6 @@ func (g *Gateway) handleCancelJob(w http.ResponseWriter, r *http.Request, key *A
 	if !found {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "job not found", false)
 		return
-	}
-	if abort != nil {
-		g.sendAbort(*abort)
-		g.wakeScheduler() // The cancelled job's capacity is free now.
 	}
 	view, err := g.store.GetJob(r.Context(), id, key.ID, false)
 	if err != nil {

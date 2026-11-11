@@ -8,9 +8,9 @@ Agent ──HTTPS──▶ Gateway (cloud server) ◀──outbound WSS + HTTPS�
 
 Workers only make outbound connections, so your home network needs no open ports. Each worker can run only the tools it declares itself. The gateway sends a tool name and input, never a command.
 
-This covers steps 1 to 3 of the design and the first part of the general tool model: the gateway, the worker, tools that wrap any command-line program or HTTP service with built-in templates, live reloading of tools, progress streaming, cancellation, file transfer, the `fleet` command, a status dashboard and a Windows worker.
+This covers steps 1 to 3 of the design and most of the general tool model: the gateway, the worker, tools that wrap any command-line program or HTTP service with built-in templates, a configuration page on each worker, live reloading of tools, an MCP server so any agent can use every tool, progress streaming, cancellation, file transfer, the `fleet` command, a status dashboard and a Windows worker.
 
-**What has been tested:** the suite runs the real gateway and worker on Linux, with a stand-in tool and a stand-in HTTP service, and the dashboard has been checked in headless Chromium.
+**What has been tested:** the suite runs the real gateway and worker on Linux, with a stand-in tool and a stand-in HTTP service, and the dashboard has been checked in headless Chromium. Claude Code 2.1.322 connects to the MCP server, but no model has called a tool through it yet.
 
 **What hasn't:**
 - Nothing has run on a real Mac or through a real server install, so `say`, launchd, systemd and Caddy are untested.
@@ -20,7 +20,7 @@ This covers steps 1 to 3 of the design and the first part of the general tool mo
 **Not built yet:**
 - LLM streaming
 - An OpenAI-compatible endpoint
-- MCP
+- OAuth sign-in for MCP, which some clients need
 
 ## Build
 
@@ -270,6 +270,42 @@ sudo semanage fcontext -d '/srv/fleet(/.*)?'
 Caddy itself stays installed, in case other sites use it.
 
 ## Call it
+
+### With MCP, from Claude Code and other agents
+
+The gateway is an MCP server at `https://fleet.example.com/mcp`. Every tool your machines offer becomes an MCP tool, so an agent can use them with nothing installed where it runs. In Claude Code:
+
+```sh
+claude mcp add --transport http fleet https://fleet.example.com/mcp \
+  --header "Authorization: Bearer $FLEET_API_KEY"
+```
+
+Other clients take the same three things: the URL, the HTTP (Streamable HTTP) transport, and the header. A client that can't send a header, and can only sign in with OAuth, can't connect yet.
+
+What the agent sees:
+
+- **One tool per capability**, named with `_` for `.`, so `tts.say` is `tts_say`. Its description and input schema come from the worker. A key made with `--capabilities` sees only the tools it may call, so give each agent its own key.
+- **`fleet_job_wait` and `fleet_job_cancel`** for long jobs, **`fleet_status`** for which machines are online and why a tool isn't ready, and **`fleet_file_upload`** when a tool takes files.
+
+What a call returns:
+
+- **The result**, then the exit code and the end of what the program printed: the last 8 KB on success, or the last 64 KB, all the worker keeps, on failure. `fleet_job_wait` with `full_output` gives all of it after a success too.
+- **Files**, each with a download link that needs no key. Links last as long as the file, 24 hours by default (`--artifact-ttl`). Pictures up to 5 MB are shown inline, and so are text files up to 100 KB, such as subtitles.
+- **Failures** as tool errors, with the reason, exit code and output, so the agent can fix its input and try again.
+
+Long jobs and files:
+
+- A call waits up to 50 seconds (`--mcp-wait`). A longer job answers with its `job_id`, and the agent calls `fleet_job_wait` to get the result, waiting up to 10 minutes per call. If the client asks for progress, it gets each update as it happens.
+- If no machine can run a tool right now, the call says why at once and nothing is queued.
+- With the 2026-07-28 protocol, a client that hangs up during a call has cancelled it, so the job stops too. Older clients' jobs carry on.
+- A tool that takes files gets an `input_files` argument, mapping each file to a file id. Use the id of any file from an earlier result, so one tool's output can feed the next, or upload one with `fleet_file_upload`: inline as base64 up to 20 MB, or with a link for `curl -T` for any size.
+
+Some things to know:
+
+- **Anyone with a download link can use it until it expires.** Treat links like the files themselves. Revoking the key that made them ends them all, and so does deleting `link.key` in the data folder and restarting the gateway.
+- The gateway works out its public address from the headers Caddy adds. Behind a different proxy, set `--public-url https://fleet.example.com`.
+- The tool list doesn't update by itself. After adding a tool to a worker, reconnect the client; in Claude Code, run `/mcp`.
+- It speaks MCP 2026-07-28, and 2025-11-25, 2025-06-18 and 2025-03-26 for older clients, all without sessions. It offers tools only, not resources or prompts.
 
 ### With the `fleet` command
 

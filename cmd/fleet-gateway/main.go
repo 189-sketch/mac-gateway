@@ -66,6 +66,9 @@ func serve(args []string) error {
 	fs.IntVar(&cfg.MaxAttempts, "max-attempts", cfg.MaxAttempts, "maximum attempts per job")
 	fs.DurationVar(&cfg.Tick, "tick", cfg.Tick, "how often to run maintenance")
 	fs.DurationVar(&cfg.ArtifactTTL, "artifact-ttl", cfg.ArtifactTTL, "how long result files are kept")
+	cfg.Version = version
+	fs.StringVar(&cfg.PublicURL, "public-url", cfg.PublicURL, "where agents reach the gateway, such as https://fleet.example.com, for links in MCP results; by default it's taken from the proxy's headers")
+	fs.DurationVar(&cfg.MCPWait, "mcp-wait", cfg.MCPWait, "how long an MCP tool call waits for its job before answering with the job's ID")
 	fs.Int64Var(&cfg.MaxArtifactBytes, "max-artifact-bytes", cfg.MaxArtifactBytes, "total storage limit for result files")
 	if err := fs.Parse(args); err != nil {
 		return err

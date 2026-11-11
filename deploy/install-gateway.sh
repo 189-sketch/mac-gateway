@@ -291,6 +291,10 @@ Give these to your agent. The key isn't shown again:
   export FLEET_URL=$url
   export FLEET_API_KEY=$key
 
+To use every tool from Claude Code, through MCP:
+
+  claude mcp add --transport http fleet $url/mcp --header "Authorization: Bearer $key"
+
 KEY
 		first_install=yes
 	else

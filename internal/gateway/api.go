@@ -41,6 +41,11 @@ func (g *Gateway) routes() http.Handler {
 	mux.HandleFunc("POST /v1/jobs/{id}/cancel", g.withKey(g.handleCancelJob))
 	mux.HandleFunc("POST /v1/files", g.withKey(g.handleCreateFile))
 	mux.HandleFunc("GET /v1/files/{id}", g.withKey(g.handleGetFile))
+	mux.HandleFunc("GET /v1/links/{token}", g.handleLinkDownload)
+	mux.HandleFunc("PUT /v1/links/{token}", g.handleLinkUpload)
+	mux.HandleFunc("POST /mcp", g.handleMCP)
+	mux.HandleFunc("GET /mcp", g.handleMCPOtherMethod)
+	mux.HandleFunc("DELETE /mcp", g.handleMCPOtherMethod)
 	mux.HandleFunc("GET /v1/dashboard/overview", g.withDashboardKey(g.handleDashboardOverview))
 	mux.HandleFunc("GET /v1/dashboard/jobs", g.withDashboardKey(g.handleDashboardJobs))
 	mux.HandleFunc("GET /v1/dashboard/jobs/{id}", g.withDashboardKey(g.handleDashboardJob))
@@ -203,18 +208,47 @@ func (g *Gateway) handleCreateJob(w http.ResponseWriter, r *http.Request, key *A
 		writeError(w, http.StatusBadRequest, "BAD_REQUEST", "invalid request body: "+err.Error(), false)
 		return
 	}
-	if !keyAllows(key, req.Capability) {
-		writeError(w, http.StatusForbidden, "FORBIDDEN", "this API key may not call "+req.Capability, false)
+	view, created, failure := g.submitJob(r.Context(), key, req)
+	if failure != nil {
+		if failure.status == http.StatusInternalServerError {
+			g.internalError(w, r, failure.message, failure.err)
+			return
+		}
+		writeError(w, failure.status, failure.code, failure.message, false)
 		return
 	}
+	status := http.StatusOK
+	if created {
+		status = http.StatusAccepted
+	}
+	writeJSON(w, status, view)
+}
+
+// apiFailure is a request the gateway refused, or couldn't carry out.
+type apiFailure struct {
+	status        int
+	code, message string
+	err           error // Set for internal errors, which are logged rather than shown.
+}
+
+func internalFailure(what string, err error) *apiFailure {
+	return &apiFailure{status: http.StatusInternalServerError, code: "INTERNAL", message: what, err: err}
+}
+
+// submitJob checks and queues a job. It's shared by the HTTP API and MCP.
+func (g *Gateway) submitJob(ctx context.Context, key *APIKey, req createJobRequest) (*JobView, bool, *apiFailure) {
+	refuse := func(status int, code, message string) (*JobView, bool, *apiFailure) {
+		return nil, false, &apiFailure{status: status, code: code, message: message}
+	}
+	if !keyAllows(key, req.Capability) {
+		return refuse(http.StatusForbidden, "FORBIDDEN", "this API key may not call "+req.Capability)
+	}
 	if len(req.IdempotencyKey) > 200 {
-		writeError(w, http.StatusBadRequest, "BAD_REQUEST", "idempotency_key is longer than 200 characters", false)
-		return
+		return refuse(http.StatusBadRequest, "BAD_REQUEST", "idempotency_key is longer than 200 characters")
 	}
 	queueTimeout, err := parseQueueTimeout(req.QueueTimeout)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "BAD_REQUEST", err.Error(), false)
-		return
+		return refuse(http.StatusBadRequest, "BAD_REQUEST", err.Error())
 	}
 
 	input := []byte(req.Input)
@@ -223,39 +257,33 @@ func (g *Gateway) handleCreateJob(w http.ResponseWriter, r *http.Request, key *A
 	}
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, input); err != nil {
-		writeError(w, http.StatusBadRequest, "BAD_REQUEST", "input is not valid JSON", false)
-		return
+		return refuse(http.StatusBadRequest, "BAD_REQUEST", "input is not valid JSON")
 	}
 	input = compact.Bytes()
 
-	offers, err := g.store.CapabilityRows(r.Context(), req.Capability)
+	offers, err := g.store.CapabilityRows(ctx, req.Capability)
 	if err != nil {
-		g.internalError(w, r, "look up capability", err)
-		return
+		return nil, false, internalFailure("look up capability", err)
 	}
 	if len(offers) == 0 {
-		writeError(w, http.StatusNotFound, "UNKNOWN_CAPABILITY", "no node has registered "+req.Capability, false)
-		return
+		return refuse(http.StatusNotFound, "UNKNOWN_CAPABILITY", "no node has registered "+req.Capability)
 	}
 	if status, code, message := checkOffers(offers, req.Selector, input, req.Files); code != "" {
-		writeError(w, status, code, message, false)
-		return
+		return refuse(status, code, message)
 	}
 
 	selector, err := json.Marshal(orEmpty(req.Selector))
 	if err != nil {
-		g.internalError(w, r, "encode selector", err)
-		return
+		return nil, false, internalFailure("encode selector", err)
 	}
 	files, err := json.Marshal(orEmpty(req.Files)) // Sorted by key, so it's stable.
 	if err != nil {
-		g.internalError(w, r, "encode files", err)
-		return
+		return nil, false, internalFailure("encode files", err)
 	}
 	hash := sha256.New()
 	fmt.Fprintf(hash, "%s\x00%s\x00%s\x00%s", req.Capability, input, selector, files)
 
-	id, created, err := g.store.CreateJob(r.Context(), NewJob{
+	id, created, err := g.store.CreateJob(ctx, NewJob{
 		APIKeyID:       key.ID,
 		Capability:     req.Capability,
 		Input:          string(input),
@@ -266,28 +294,22 @@ func (g *Gateway) handleCreateJob(w http.ResponseWriter, r *http.Request, key *A
 		Files:          req.Files,
 	})
 	if errors.Is(err, ErrFileUnavailable) {
-		writeError(w, http.StatusUnprocessableEntity, "FILE_UNAVAILABLE", err.Error(), false)
-		return
+		return refuse(http.StatusUnprocessableEntity, "FILE_UNAVAILABLE", err.Error())
 	}
 	if errors.Is(err, ErrIdempotencyConflict) {
-		writeError(w, http.StatusConflict, "IDEMPOTENCY_CONFLICT", err.Error(), false)
-		return
+		return refuse(http.StatusConflict, "IDEMPOTENCY_CONFLICT", err.Error())
 	}
 	if err != nil {
-		g.internalError(w, r, "create job", err)
-		return
+		return nil, false, internalFailure("create job", err)
 	}
-	view, err := g.store.GetJob(r.Context(), id, key.ID, false)
+	view, err := g.store.GetJob(ctx, id, key.ID, false)
 	if err != nil {
-		g.internalError(w, r, "read job", err)
-		return
+		return nil, false, internalFailure("read job", err)
 	}
-	status := http.StatusOK
 	if created {
-		status = http.StatusAccepted
 		g.wakeScheduler()
 	}
-	writeJSON(w, status, view)
+	return view, created, nil
 }
 
 func parseQueueTimeout(text string) (time.Duration, error) {

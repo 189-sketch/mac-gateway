@@ -309,7 +309,11 @@ func (g *Gateway) handleUploadArtifact(w http.ResponseWriter, r *http.Request) {
 // handleCreateFile stores an input file an agent wants a job to use. The body is
 // the raw file, and ?name= gives its name.
 func (g *Gateway) handleCreateFile(w http.ResponseWriter, r *http.Request, key *APIKey) {
-	name := r.URL.Query().Get("name")
+	g.receiveInputFile(w, r, key.ID, r.URL.Query().Get("name"))
+}
+
+// receiveInputFile stores a request's body as an input file the key owns.
+func (g *Gateway) receiveInputFile(w http.ResponseWriter, r *http.Request, keyID, name string) {
 	if !storedFileName.MatchString(name) {
 		writeError(w, http.StatusBadRequest, "BAD_REQUEST", "name must use letters, digits, '.', '_' or '-' and start with a letter or digit", false)
 		return
@@ -350,7 +354,7 @@ func (g *Gateway) handleCreateFile(w http.ResponseWriter, r *http.Request, key *
 		g.internalError(w, r, "store file", err)
 		return
 	}
-	view, err := g.store.AddInputFile(r.Context(), fileID, key.ID, name, gotSum, size, g.cfg.ArtifactTTL)
+	view, err := g.store.AddInputFile(r.Context(), fileID, keyID, name, gotSum, size, g.cfg.ArtifactTTL)
 	if err != nil {
 		os.Remove(target)
 		g.internalError(w, r, "record file", err)
