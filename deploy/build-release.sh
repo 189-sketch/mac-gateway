@@ -38,6 +38,8 @@ for arch in amd64 arm64; do
 	build linux "$arch" fleet-gateway "$bundle/fleet-gateway"
 	build darwin arm64 fleet-worker "$bundle/fleet-worker-darwin-arm64"
 	build darwin amd64 fleet-worker "$bundle/fleet-worker-darwin-amd64"
+	build linux amd64 fleet-worker "$bundle/fleet-worker-linux-amd64"
+	build linux arm64 fleet-worker "$bundle/fleet-worker-linux-arm64"
 	build windows amd64 fleet-worker "$bundle/fleet-worker-windows-amd64.exe"
 	build windows arm64 fleet-worker "$bundle/fleet-worker-windows-arm64.exe"
 	sed "s|@@RELEASE_URL@@|$RELEASE_URL|g" deploy/install-gateway.sh >"$bundle/install-gateway.sh"

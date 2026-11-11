@@ -553,6 +553,7 @@ func looksRunnable(name string, mode fs.FileMode) bool {
 var detectPrograms = []string{
 	"python3", "python", "uv", "node", "npx", "claude", "curl", "ffmpeg", "git", "docker",
 	"xcodebuild", "xcrun", "swift", "pwsh", "powershell", "bash", "zsh",
+	"conda", "nvidia-smi", "ollama",
 }
 
 type detectedProgram struct {
@@ -578,7 +579,12 @@ func (s *uiServer) detect(w http.ResponseWriter, r *http.Request) {
 		extra = []string{"/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"}
 		if home != "" {
 			extra = append(extra, filepath.Join(home, ".local", "bin"), filepath.Join(home, ".claude", "local"), filepath.Join(home, "bin"), filepath.Join(home, ".npm-global", "bin"))
+			// Where conda is usually installed, which a service's PATH won't include.
+			for _, dir := range []string{"miniconda3", "miniforge3", "anaconda3"} {
+				extra = append(extra, filepath.Join(home, dir, "bin"))
+			}
 		}
+		extra = append(extra, "/opt/conda/bin")
 	}
 	for _, name := range detectPrograms {
 		if path, err := exec.LookPath(name); err == nil {

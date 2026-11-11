@@ -3,17 +3,17 @@
 Run jobs on idle home computers through one cloud API. An agent calls the gateway on your cloud server, the gateway hands the job to a machine that can run it, and the agent gets progress and result files back.
 
 ```text
-Agent ──HTTPS──▶ Gateway (cloud server) ◀──outbound WSS + HTTPS── Worker (Mac mini) ──▶ local tools
+Agent ──HTTPS──▶ Gateway (cloud server) ◀──outbound WSS + HTTPS── Worker (Mac, Linux or Windows) ──▶ local tools
 ```
 
 Workers only make outbound connections, so your home network needs no open ports. Each worker can run only the tools it declares itself. The gateway sends a tool name and input, never a command.
 
-This covers steps 1 to 3 of the design and most of the general tool model: the gateway, the worker, tools that wrap any command-line program or HTTP service with built-in templates, a configuration page on each worker, live reloading of tools, an MCP server so any agent can use every tool, progress streaming, cancellation, file transfer, the `fleet` command, a status dashboard and a Windows worker.
+This covers steps 1 to 3 of the design and most of the general tool model: the gateway, the worker, tools that wrap any command-line program or HTTP service with built-in templates, a configuration page on each worker, live reloading of tools, an MCP server so any agent can use every tool, progress streaming, cancellation, file transfer, the `fleet` command, a status dashboard, and workers for Mac, Linux and Windows.
 
-**What has been tested:** the suite runs the real gateway and worker on Linux, with a stand-in tool and a stand-in HTTP service, and the dashboard has been checked in headless Chromium. Claude Code 2.1.322 connects to the MCP server, but no model has called a tool through it yet.
+**What has been tested:** the suite runs the real gateway and worker on Linux, with a stand-in tool and a stand-in HTTP service, and the dashboard has been checked in headless Chromium. The Linux installer's tests run it against a real gateway and worker, with only systemd, sudo and SELinux stubbed. Claude Code 2.1.322 connects to the MCP server, but no model has called a tool through it yet.
 
 **What hasn't:**
-- Nothing has run on a real Mac or through a real server install, so `say`, launchd, systemd and Caddy are untested.
+- Nothing has run on a real Mac or through a real server install, so `say`, launchd, systemd and Caddy are untested. The Linux worker's systemd service hasn't been started by a real systemd either.
 - The Windows worker and its installer have been compiled but have never run on Windows.
 - The HTTP adapters haven't been used with a real service such as Ollama or ComfyUI.
 
@@ -143,7 +143,36 @@ On the server:
 fleet-add-worker mac-mini-2
 ```
 
-It prints one command for a Mac and one for Windows. Run the one that fits the new machine.
+It prints one command for a Mac or Linux machine and one for Windows. Run the one that fits the new machine.
+
+### Install on Linux
+
+The same command as for a Mac installs the worker on Linux with systemd, such as Ubuntu, Debian, CentOS Stream or RHEL, on x86-64 or ARM. Use it for a machine with a GPU, or one that runs tools that are easier on Linux.
+
+Jobs run as the account that runs the installer, and can read anything it can, so use a dedicated account that has your tools and models but no personal files. There are two ways:
+
+- **As that account, if it can use sudo.** Log in as it and paste the command `fleet-add-worker` printed. The script asks for your sudo password once, to install the service.
+- **As root, for an account that can't use sudo.** Put `FLEET_WORKER_USER` before `sh`:
+
+  ```sh
+  sudo useradd --create-home fleet-worker   # if you need a new account
+  curl -fsSL https://fleet.example.com/install/worker.sh | FLEET_WORKER_USER=fleet-worker FLEET_NODE_NAME=gpu-box-1 FLEET_NODE_TOKEN=fn_... sh
+  ```
+
+The script does the following:
+
+1. Downloads the worker for your processor and verifies its checksum.
+2. Installs it as `/usr/local/bin/fleet-worker`, with a link to it at `~/fleet/fleet-worker`, so the same commands work as on a Mac. It's kept outside the home folder because SELinux, on by default on CentOS and RHEL, won't let a service run a program from one.
+3. Writes `~/fleet/worker.yaml`, which offers one test service, `system.hostname`, and saves the token where only that account can read it.
+4. Installs a systemd service, `fleet-worker`, that runs as that account from boot with nobody logged in, restarts within 10 seconds after a crash, and waits until it has connected.
+
+Some things to know:
+
+- **The service's PATH** is `~/.local/bin` plus the usual system folders. Give tools the full path to programs elsewhere, such as a conda environment's `python`. The [configuration page](#use-the-configuration-page) shows where common programs are.
+- **Jobs can't gain privileges**, so a tool can't use `sudo`. They keep the account's groups, so a GPU the account can use works.
+- **Stopping or restarting the service** stops running jobs. They're rerun only if their capability sets `retry_if_lost`.
+
+To restart it after changing `worker.yaml`, run `sudo systemctl restart fleet-worker`. To upgrade, run the same command again without the node name and token; as root, `FLEET_WORKER_USER` isn't needed either, because the account is read from the service.
 
 ### Install on Windows
 
@@ -180,13 +209,13 @@ Some things work differently on Windows:
 
 ### Upgrade
 
-Upgrade the server first, by running the install command from a newer release without a node name. Then run this on each Mac, which needs no node name or token. Windows is covered under [Install on Windows](#install-on-windows).
+Upgrade the server first, by running the install command from a newer release without a node name. Then run this on each Mac and Linux machine, which needs no node name or token. Windows is covered under [Install on Windows](#install-on-windows).
 
 ```sh
 curl -fsSL https://fleet.example.com/install/worker.sh | sh
 ```
 
-Data, API keys, tokens and each Mac's `worker.yaml` are kept. Running jobs on a Mac are interrupted during its upgrade, and rerun only if their capability sets `retry_if_lost`.
+Data, API keys, tokens and each machine's `worker.yaml` are kept. Running jobs on a machine are interrupted during its upgrade, and rerun only if their capability sets `retry_if_lost`.
 
 ### Manage credentials
 
@@ -207,9 +236,10 @@ The worker logs each job as it starts, finishes or fails, with how long it took 
 | Where | Watch the log | Files |
 |---|---|---|
 | Mac | `tail -F ~/fleet/worker.log` | `~/fleet/` |
+| Linux | `tail -F ~/fleet/worker.log`, and for crashes, `sudo journalctl -u fleet-worker` | `~/fleet/`, and the program in `/usr/local/bin/` |
 | Windows | `Get-Content -Wait -Tail 20 "$env:LOCALAPPDATA\Fleet\worker.log"` | `%LOCALAPPDATA%\Fleet\` |
 
-`worker.log` moves aside at 10 MB, and the newest three old logs are kept as `worker.log.1`, `.2` and `.3`, so logs can't fill the disk. If the worker itself crashes, the details are in `worker.log.crash`.
+`worker.log` moves aside at 10 MB, and the newest three old logs are kept as `worker.log.1`, `.2` and `.3`, so logs can't fill the disk. If the worker itself crashes, the details are in `worker.log.crash` on a Mac, and in the journal on Linux.
 
 To watch it live in a console, stop the background worker first, so that two aren't running with one token:
 
@@ -219,6 +249,8 @@ cd ~/fleet && ./fleet-worker --config worker.yaml --log-level debug
 # Press Ctrl-C when you're done, then start it in the background again:
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.fleet.worker.plist
 ```
+
+On Linux, use `sudo systemctl stop fleet-worker` and `sudo systemctl start fleet-worker` instead, and run it as the worker's account.
 
 By default a console shows logs and writes no file. Add `--log-file worker.log` to get both.
 
@@ -236,8 +268,9 @@ Logs never contain the node token or header secrets. Job input isn't logged eith
 | The gateway won't start | `sudo journalctl -u fleet-gateway -n 50` |
 | A Mac says `launchd refused to start it` | You're probably connected over SSH. Log in to that user at the screen or through Screen Sharing, then run the command again |
 | A Mac starts but doesn't connect | `tail ~/fleet/worker.log`. `the gateway rejected this node's token` means the token is wrong or revoked |
+| A Linux worker doesn't start | `sudo journalctl -u fleet-worker -n 50`. `status=203/EXEC` usually means SELinux; run `sudo restorecon /usr/local/bin/fleet-worker` |
 | A job fails with `NO_NODE_ONLINE` | `fleet capabilities` shows which nodes are online. Check that the Mac is awake and logged in |
-| You changed `worker.yaml` | Restart the worker: `launchctl kickstart -k gui/$(id -u)/com.fleet.worker` |
+| You changed `worker.yaml` | Restart the worker: `launchctl kickstart -k gui/$(id -u)/com.fleet.worker` on a Mac, or `sudo systemctl restart fleet-worker` on Linux |
 
 ### Uninstall
 
@@ -246,6 +279,14 @@ On a Mac:
 ```sh
 launchctl bootout "gui/$(id -u)/com.fleet.worker"
 rm -rf ~/fleet ~/Library/LaunchAgents/com.fleet.worker.plist
+```
+
+On Linux:
+
+```sh
+sudo systemctl disable --now fleet-worker
+sudo rm -f /etc/systemd/system/fleet-worker.service /usr/local/bin/fleet-worker
+rm -rf ~/fleet   # as the worker's account
 ```
 
 On the server, this also deletes all jobs, results and credentials:
@@ -483,7 +524,7 @@ The running worker serves a page for its tools. On the machine itself:
 ~/fleet/fleet-worker ui --config ~/fleet/worker.yaml
 ```
 
-This opens the page in your browser, already signed in. With `--no-open`, it prints the address instead. The page has:
+This opens the page in your browser, already signed in. With `--no-open`, it prints the address instead. On a machine with no desktop, such as a Linux server, it prints the address and the SSH command to reach it. The page has:
 
 - **Tools:** every tool, with whether it's ready and why not. Switch tools on and off, or start a new one from a template.
 - **The editor:** a form for command-line tools, or the YAML for any tool. Problems show as you type.
@@ -744,4 +785,4 @@ The version is built into the binaries and into the download address in the inst
 | `internal/client/` | Client for the agent API, including stream reconnects |
 | `internal/protocol/` | Messages between gateway and worker |
 | `e2e/` | Tests that run the real binaries, with a proxy that simulates network cuts |
-| `deploy/` | Install scripts for Mac and Windows, plus example worker manifest, launchd, systemd and Caddy files |
+| `deploy/` | Install scripts for the server and for Mac, Linux and Windows workers, plus example worker manifest, launchd, systemd and Caddy files |

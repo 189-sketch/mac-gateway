@@ -37,9 +37,12 @@ cat <<EOF
 Run one of these on the new machine, as the user the worker should run as. Each
 contains the machine's token, which isn't shown again.
 
-On a Mac, in Terminal:
+On a Mac or a Linux machine with systemd, in a terminal:
 
   curl -fsSL $URL/install/worker.sh | FLEET_NODE_NAME=$NAME FLEET_NODE_TOKEN=$token sh
+
+On Linux, the worker runs as a service under the account that runs this, which
+needs sudo. Or, as root, put FLEET_WORKER_USER=ACCOUNT before sh to choose it.
 
 On Windows, in PowerShell opened with "Run as administrator":
 

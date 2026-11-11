@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -98,6 +99,21 @@ func TestConfigurationPageChangesWhatTheGatewayCanRun(t *testing.T) {
 	if status != http.StatusOK || token == "" {
 		t.Fatalf("sign in: %d", status)
 	}
+
+	// On a machine with no desktop, such as a Linux server, it explains how to
+	// reach the page over SSH rather than trying to open a browser.
+	if runtime.GOOS == "linux" {
+		headless := exec.Command(workerBin, "ui", "--config", w.config)
+		headless.Env = withoutEnv(os.Environ(), "DISPLAY", "WAYLAND_DISPLAY")
+		out, err := headless.Output()
+		if err != nil {
+			t.Fatalf("fleet-worker ui with no desktop: %v", err)
+		}
+		forward := "ssh -L " + link.Port() + ":127.0.0.1:" + link.Port() + " "
+		if !strings.Contains(string(out), forward) || !strings.Contains(string(out), "#code=") {
+			t.Fatalf("with no desktop, ui printed:\n%s", out)
+		}
+	}
 	if again, _ := signIn(); again != http.StatusUnauthorized {
 		t.Fatalf("the link worked twice: %d", again)
 	}
@@ -139,4 +155,22 @@ func TestConfigurationPageChangesWhatTheGatewayCanRun(t *testing.T) {
 	if out, err := exec.Command(workerBin, "ui", "--config", w.config, "--no-open").CombinedOutput(); err == nil || !strings.Contains(string(out), "isn't running") {
 		t.Fatalf("ui with no worker: %v %s", err, out)
 	}
+}
+
+// withoutEnv returns env with the named variables removed.
+func withoutEnv(env []string, names ...string) []string {
+	var out []string
+	for _, entry := range env {
+		name, _, _ := strings.Cut(entry, "=")
+		keep := true
+		for _, drop := range names {
+			if name == drop {
+				keep = false
+			}
+		}
+		if keep {
+			out = append(out, entry)
+		}
+	}
+	return out
 }

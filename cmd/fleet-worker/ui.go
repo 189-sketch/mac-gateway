@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -52,6 +53,22 @@ func uiCommand(args []string) error {
 		fmt.Println(url)
 		return nil
 	}
+	if !hasDesktop() {
+		// A server has no browser to open, so say how to reach the page instead.
+		fmt.Println("This machine has no desktop. From your computer, forward the page's port over SSH:")
+		host := "127.0.0.1:7878"
+		if parsed, err := neturl.Parse(state.URL); err == nil && parsed.Port() != "" {
+			host = parsed.Host
+		}
+		_, port, _ := strings.Cut(host, "]:")
+		if port == "" {
+			_, port, _ = strings.Cut(host, ":")
+		}
+		fmt.Printf("\n  ssh -L %s:%s USER@THIS_MACHINE\n\n", port, host)
+		fmt.Println("Then open this address there (it works once, for two minutes):")
+		fmt.Println(url)
+		return nil
+	}
 	fmt.Println("Opening", state.URL)
 	fmt.Println("If no browser opens, open this address on this machine (it works once, for two minutes):")
 	fmt.Println(url)
@@ -87,6 +104,16 @@ func signInCode(state worker.UIState) (string, error) {
 		return "", fmt.Errorf("the worker's page refused: %s", out.Error)
 	}
 	return out.Code, nil
+}
+
+// hasDesktop reports whether a browser could open here. On Linux and other
+// Unix systems, that needs a graphical session.
+func hasDesktop() bool {
+	switch runtime.GOOS {
+	case "darwin", "windows":
+		return true
+	}
+	return os.Getenv("DISPLAY") != "" || os.Getenv("WAYLAND_DISPLAY") != ""
 }
 
 func openBrowser(url string) error {

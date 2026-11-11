@@ -74,6 +74,7 @@ build_from_source() {
 		CGO_ENABLED=0 go build -trimpath -o "$BUNDLE/fleet-gateway" ./cmd/fleet-gateway
 		for arch in arm64 amd64; do
 			CGO_ENABLED=0 GOOS=darwin GOARCH="$arch" go build -trimpath -o "$BUNDLE/fleet-worker-darwin-$arch" ./cmd/fleet-worker
+			CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$BUNDLE/fleet-worker-linux-$arch" ./cmd/fleet-worker
 			CGO_ENABLED=0 GOOS=windows GOARCH="$arch" go build -trimpath -o "$BUNDLE/fleet-worker-windows-$arch.exe" ./cmd/fleet-worker
 		done
 		cp deploy/add-worker.sh deploy/install-worker.sh deploy/install-worker.ps1 deploy/fleet-gateway.service "$BUNDLE/"
@@ -236,7 +237,7 @@ main() {
 	local url="https://$domain"
 	local staging="$WORKDIR/publish"
 	mkdir -p "$staging"
-	local binaries=(fleet-worker-darwin-arm64 fleet-worker-darwin-amd64 fleet-worker-windows-amd64.exe fleet-worker-windows-arm64.exe)
+	local binaries=(fleet-worker-darwin-arm64 fleet-worker-darwin-amd64 fleet-worker-linux-amd64 fleet-worker-linux-arm64 fleet-worker-windows-amd64.exe fleet-worker-windows-arm64.exe)
 	(cd "$BUNDLE" && cp "${binaries[@]}" "$staging/")
 	sed "s|@@GATEWAY_URL@@|$url|g" "$BUNDLE/install-worker.sh" >"$staging/worker.sh"
 	sed "s|@@GATEWAY_URL@@|$url|g" "$BUNDLE/install-worker.ps1" >"$staging/worker.ps1"

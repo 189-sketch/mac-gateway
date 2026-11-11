@@ -14,9 +14,9 @@ WORK="$(mktemp -d)"
 GATEWAY_PID=""
 cleanup() {
 	[ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null
-	if [ -f "$WORK/home/worker.pid" ]; then
-		kill "$(cat "$WORK/home/worker.pid")" 2>/dev/null
-	fi
+	for pidfile in "$WORK"/home/worker.pid "$WORK"/linux-root*/worker.pid; do
+		[ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null
+	done
 	rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -107,6 +107,9 @@ check "publishes the installer with the real URL" grep -q 'GATEWAY_URL="${FLEET_
 refute "leaves no placeholder in the installer" grep -q '@@' "$ROOT/srv/fleet/install/worker.sh"
 check "publishes the arm64 worker" test -f "$ROOT/srv/fleet/install/fleet-worker-darwin-arm64"
 check "publishes the Intel worker" test -f "$ROOT/srv/fleet/install/fleet-worker-darwin-amd64"
+check "publishes the Linux workers" test -f "$ROOT/srv/fleet/install/fleet-worker-linux-amd64" -a -f "$ROOT/srv/fleet/install/fleet-worker-linux-arm64"
+check "the Linux worker really is a Linux program" sh -c "head -c 4 '$ROOT/srv/fleet/install/fleet-worker-linux-arm64' | grep -q ELF"
+check "lists the Linux workers in the checksums" grep -q 'fleet-worker-linux-amd64$' "$ROOT/srv/fleet/install/SHA256SUMS"
 check "publishes the Windows workers" test -f "$ROOT/srv/fleet/install/fleet-worker-windows-amd64.exe" -a -f "$ROOT/srv/fleet/install/fleet-worker-windows-arm64.exe"
 check "lists the Windows workers in the checksums" grep -q 'fleet-worker-windows-arm64.exe$' "$ROOT/srv/fleet/install/SHA256SUMS"
 check "the Windows worker really is a Windows program" sh -c "head -c 2 '$ROOT/srv/fleet/install/fleet-worker-windows-amd64.exe' | grep -q MZ"
@@ -189,6 +192,8 @@ tar -xzf "$RELEASE/fleet-server-linux-amd64.tar.gz" -C "$WORK/bundle-check"
 BUNDLE_DIR="$WORK/bundle-check/fleet-server-linux-amd64"
 check "the bundle includes the gateway" test -x "$BUNDLE_DIR/fleet-gateway"
 check "the bundled gateway reports the version" sh -c "'$BUNDLE_DIR/fleet-gateway' version | grep -q v9.9.9"
+check "the bundle includes the Linux workers" test -x "$BUNDLE_DIR/fleet-worker-linux-amd64" -a -x "$BUNDLE_DIR/fleet-worker-linux-arm64"
+check "the bundled Linux worker reports the version" sh -c "'$BUNDLE_DIR/fleet-worker-linux-amd64' --version | grep -q v9.9.9"
 
 # Hide Go, to prove a release install doesn't need it.
 NO_GO="$WORK/no-go"
@@ -411,6 +416,7 @@ echo "add-worker.sh"
 OUT="$WORK/add.out"
 FLEET_INSTALL_ROOT="$ROOT" PATH="$SERVER_PATH" "$REPO/deploy/add-worker.sh" mac-four >"$OUT" 2>&1
 check "prints the Mac command" grep -q 'FLEET_NODE_NAME=mac-four' "$OUT"
+check "says the command is for Linux too" grep -q 'On a Mac or a Linux machine' "$OUT"
 FLEET_INSTALL_ROOT="$ROOT" PATH="$SERVER_PATH" "$REPO/deploy/add-worker.sh" mac-four >"$OUT" 2>&1
 check "refuses a name already in use" test $? -ne 0
 check "explains the refusal" grep -q 'already registered' "$OUT"
@@ -579,6 +585,209 @@ for cut in $(seq "$MAIN_AT" 97 "$((SIZE - 15))"); do
 	fi
 done
 if [ -z "$ran" ]; then pass "a cut-off script does nothing"; else fail "a script cut at byte $ran still ran"; fi
+
+
+# --- Linux worker install, against the same gateway ---
+
+echo "Linux worker install"
+# systemd, sudo and runuser are stubbed. systemctl restart really starts the
+# worker from the ExecStart line of the unit the installer wrote, so the unit's
+# command is tested; systemd's handling of the rest of the unit isn't.
+LINUX_STUBS="$WORK/linux-stubs"
+mkdir -p "$LINUX_STUBS"
+linuxstub() {
+	printf '#!/bin/sh\n%s\n' "$2" >"$LINUX_STUBS/$1"
+	chmod +x "$LINUX_STUBS/$1"
+}
+linuxstub uname 'case "$1" in -s) echo Linux ;; -m) echo "${STUB_ARCH:-x86_64}" ;; *) exec /bin/uname "$@" ;; esac'
+linuxstub sudo 'echo "sudo $*" >>"$STUB_LOG"
+[ -z "${STUB_NO_SUDO:-}" ] || exit 1
+exec "$@"'
+linuxstub runuser 'echo "runuser $*" >>"$STUB_LOG"
+shift 3
+exec "$@"'
+linuxstub getenforce 'echo "${STUB_SELINUX:-Disabled}"'
+linuxstub restorecon 'echo "restorecon $*" >>"$STUB_LOG"'
+linuxstub systemctl 'echo "systemctl $*" >>"$STUB_LOG"
+case "$1" in
+restart)
+	pidfile="$FLEET_INSTALL_ROOT/worker.pid"
+	if [ -f "$pidfile" ]; then kill "$(cat "$pidfile")" 2>/dev/null; sleep 1; fi
+	unit="$FLEET_INSTALL_ROOT/etc/systemd/system/fleet-worker.service"
+	command="$(sed -n "s/^ExecStart=//p" "$unit")"
+	dir="$(sed -n "s/^WorkingDirectory=//p" "$unit")"
+	(cd "$dir" && exec $command >/dev/null 2>&1) &
+	echo $! >"$pidfile"
+	;;
+esac'
+cp "$MAC_STUBS/curl" "$LINUX_STUBS/curl"
+
+# The real Linux worker, changing only the gateway address, which must be https
+# in a manifest but is plain http here.
+cat >"$PUBLISHED/fleet-worker-linux-amd64" <<'WRAPPER'
+#!/bin/sh
+config="$2"
+shift 2
+linux="$(dirname "$config")/worker.test.yaml"
+sed -e "s|^gateway_url:.*|gateway_url: $TEST_GATEWAY|" "$config" >"$linux"
+exec "$REAL_WORKER" --config "$linux" "$@"
+WRAPPER
+cp "$PUBLISHED/fleet-worker-linux-amd64" "$PUBLISHED/fleet-worker-linux-arm64"
+cp "$ROOT/srv/fleet/install/worker.sh" "$PUBLISHED/worker.sh"
+(cd "$PUBLISHED" && sha256sum fleet-worker-darwin-arm64 fleet-worker-darwin-amd64 fleet-worker-linux-amd64 fleet-worker-linux-arm64 >SHA256SUMS)
+
+online_on() { # capability, machines it should be online on
+	"$WORK/fleet" capabilities | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+caps = data['capabilities'] if isinstance(data, dict) else data
+sys.exit(0 if any(c['name'] == '$1' and c['online_nodes'] == $2 for c in caps) else 1)"
+}
+new_node() { # name; prints its token
+	FLEET_INSTALL_ROOT="$ROOT" PATH="$SERVER_PATH" "$REPO/deploy/add-worker.sh" "$1" 2>/dev/null |
+		sed -n 's/.*FLEET_NODE_TOKEN=\(fn_[0-9a-f]*\).*/\1/p' | head -1
+}
+run_linux_install() { # root, home; environment assignments come before this call.
+	FLEET_INSTALL_ROOT="$1" HOME="$2" PATH="$LINUX_STUBS:$PATH" sh "$PUBLISHED/worker.sh"
+}
+
+LINUX_ROOT="$WORK/linux-root"
+LINUX_HOME="$WORK/linux-home"
+mkdir -p "$LINUX_ROOT/run/systemd/system" "$LINUX_HOME"
+LINUX_TOKEN="$(new_node linux-one)"
+check "got a token for the Linux machine" test -n "$LINUX_TOKEN"
+ME="$(id -un)"
+
+OUT="$WORK/linux.out"
+: >"$STUB_LOG"
+FLEET_NODE_NAME=linux-one FLEET_NODE_TOKEN="$LINUX_TOKEN" run_linux_install "$LINUX_ROOT" "$LINUX_HOME" >"$OUT" 2>&1
+RESULT=$?
+check "installs and connects" test "$RESULT" -eq 0
+[ "$RESULT" -eq 0 ] || sed 's/^/    /' "$OUT" >&2
+check "reports the connection" grep -q 'Connected to https://fleet.example.com' "$OUT"
+check "says which account it runs as" grep -q "running as $ME" "$OUT"
+check "explains how to reach the configuration page" grep -q 'ssh -L 7878:127.0.0.1:7878' "$OUT"
+check "asks for sudo before changing anything" test "$(grep -n 'sudo true' "$STUB_LOG" | head -1 | cut -d: -f1)" = 1
+check "installs the binary outside the home folder" test -x "$LINUX_ROOT/usr/local/bin/fleet-worker"
+refute "leaves no half-installed binary" test -e "$LINUX_ROOT/usr/local/bin/fleet-worker.new"
+check "links it from ~/fleet, as on a Mac" test "$(readlink "$LINUX_HOME/fleet/fleet-worker")" = "$LINUX_ROOT/usr/local/bin/fleet-worker"
+UNIT="$LINUX_ROOT/etc/systemd/system/fleet-worker.service"
+check "writes the service" test -f "$UNIT"
+check "runs the service as this account" grep -qx "User=$ME" "$UNIT"
+check "starts the worker with its config and log" grep -qx "ExecStart=$LINUX_ROOT/usr/local/bin/fleet-worker --config $LINUX_HOME/fleet/worker.yaml --log-file $LINUX_HOME/fleet/worker.log" "$UNIT"
+check "restarts it after a crash" grep -qx 'Restart=always' "$UNIT"
+check "lets the worker stop its own jobs" grep -qx 'KillMode=mixed' "$UNIT"
+check "stops jobs gaining privileges" grep -qx 'NoNewPrivileges=true' "$UNIT"
+check "reloads with SIGHUP" grep -qx 'ExecReload=/bin/kill -HUP $MAINPID' "$UNIT"
+check "starts at boot" grep -q 'systemctl enable --quiet fleet-worker' "$STUB_LOG"
+check "reloads systemd before starting" test "$(position daemon-reload)" -lt "$(position 'restart fleet-worker')"
+check "saves the token privately" test "$(stat -c %a "$LINUX_HOME/fleet/token")" = 600
+check "labels the machine as Linux" grep -q 'os: linux' "$LINUX_HOME/fleet/worker.yaml"
+check "gives it a capability test" grep -q 'test:' "$LINUX_HOME/fleet/worker.yaml"
+check "tells you how to restart it" grep -q 'sudo systemctl restart fleet-worker' "$LINUX_HOME/fleet/worker.yaml"
+refute "leaves SELinux alone when it's off" grep -q restorecon "$STUB_LOG"
+check "the Linux machine is online at the gateway" online_on system.hostname 1
+JOB_OUT="$WORK/linux-job.out"
+"$WORK/fleet" run system.hostname --input '{}' >"$JOB_OUT" 2>&1
+check "runs a job" grep -q "$(uname -n)" "$JOB_OUT"
+[ -s "$JOB_OUT" ] && grep -q "$(uname -n)" "$JOB_OUT" || sed 's/^/    /' "$JOB_OUT" >&2
+
+echo "Upgrading the Linux worker, with SELinux on"
+echo '# my edit' >>"$LINUX_HOME/fleet/worker.yaml"
+TOKEN_BEFORE="$(cat "$LINUX_HOME/fleet/token")"
+: >"$STUB_LOG"
+STUB_SELINUX=Enforcing run_linux_install "$LINUX_ROOT" "$LINUX_HOME" >"$OUT" 2>&1
+RESULT=$?
+check "upgrades without a name or token" test "$RESULT" -eq 0
+[ "$RESULT" -eq 0 ] || sed 's/^/    /' "$OUT" >&2
+check "keeps the edited manifest" grep -q '# my edit' "$LINUX_HOME/fleet/worker.yaml"
+check "keeps the token" test "$(cat "$LINUX_HOME/fleet/token")" = "$TOKEN_BEFORE"
+check "labels the binary for SELinux before starting it" test "$(position "restorecon $LINUX_ROOT/usr/local/bin/fleet-worker")" -lt "$(position 'restart fleet-worker')"
+check "reconnects" online_on system.hostname 1
+
+echo "A bad Linux manifest leaves the running worker alone"
+cp "$LINUX_HOME/fleet/worker.yaml" "$WORK/linux-good.yaml"
+echo 'nonsense_field: true' >>"$LINUX_HOME/fleet/worker.yaml"
+: >"$STUB_LOG"
+run_linux_install "$LINUX_ROOT" "$LINUX_HOME" >"$OUT" 2>&1
+check "refuses to install" test $? -ne 0
+refute "doesn't restart the worker" grep -q 'restart fleet-worker' "$STUB_LOG"
+cp "$WORK/linux-good.yaml" "$LINUX_HOME/fleet/worker.yaml"
+
+echo "A tampered Linux download is refused"
+cp "$LINUX_ROOT/usr/local/bin/fleet-worker" "$WORK/linux-installed"
+echo '# tampered' >>"$PUBLISHED/fleet-worker-linux-amd64"
+: >"$STUB_LOG"
+run_linux_install "$LINUX_ROOT" "$LINUX_HOME" >"$OUT" 2>&1
+check "refuses to install" test $? -ne 0
+check "says why" grep -q "doesn't match its checksum" "$OUT"
+check "doesn't replace the binary" cmp "$WORK/linux-installed" "$LINUX_ROOT/usr/local/bin/fleet-worker"
+refute "doesn't restart the worker" grep -q 'restart fleet-worker' "$STUB_LOG"
+cp "$PUBLISHED/fleet-worker-linux-arm64" "$PUBLISHED/fleet-worker-linux-amd64"
+
+echo "Linux refusals"
+BARE="$WORK/linux-bare"
+mkdir -p "$BARE"
+FLEET_NODE_NAME=x FLEET_NODE_TOKEN=fn_x run_linux_install "$BARE" "$WORK/linux-home-bare" >"$OUT" 2>&1
+check "refuses without systemd" test $? -ne 0
+check "says it needs systemd" grep -q 'systemd' "$OUT"
+refute "changes nothing without systemd" test -e "$WORK/linux-home-bare/fleet"
+mkdir -p "$BARE/run/systemd/system"
+STUB_ARCH=riscv64 FLEET_NODE_NAME=x FLEET_NODE_TOKEN=fn_x run_linux_install "$BARE" "$WORK/linux-home-bare" >"$OUT" 2>&1
+check "refuses an unknown processor" grep -q 'unsupported processor: riscv64' "$OUT"
+FLEET_WORKER_USER=someone-else FLEET_NODE_NAME=x FLEET_NODE_TOKEN=fn_x run_linux_install "$BARE" "$WORK/linux-home-bare" >"$OUT" 2>&1
+check "won't install for another account without root" grep -q 'run this as root' "$OUT"
+mkdir -p "$WORK/linux home"
+FLEET_NODE_NAME=x FLEET_NODE_TOKEN=fn_x run_linux_install "$BARE" "$WORK/linux home" >"$OUT" 2>&1
+check "refuses a home folder systemd can't name" grep -q "can't be installed in" "$OUT"
+STUB_NO_SUDO=1 FLEET_NODE_NAME=x FLEET_NODE_TOKEN=fn_x run_linux_install "$BARE" "$WORK/linux-home-bare" >"$OUT" 2>&1
+check "stops without sudo" test $? -ne 0
+check "suggests running as root" grep -q 'FLEET_WORKER_USER' "$OUT"
+refute "changes nothing without sudo" test -e "$WORK/linux-home-bare/fleet"
+
+echo "Linux install as root, for another account"
+# id and getent stand in for root and a separate account. The files are this
+# test's, so ownership isn't tested, only that every user-side step goes through
+# runuser and none through sudo.
+ROOT_STUBS="$WORK/root-stubs"
+cp -r "$LINUX_STUBS" "$ROOT_STUBS"
+printf '#!/bin/sh\ncase "$*" in\n"-u") echo 0 ;;\n"-un") echo root ;;\n"-u root") echo 0 ;;\n"-u fleet-worker") echo 1001 ;;\n"-u "*) exit 1 ;;\n"-Gn "*) echo fleet-worker ;;\n*) exec /usr/bin/id "$@" ;;\nesac\n' >"$ROOT_STUBS/id"
+printf '#!/bin/sh\n[ "$2" = fleet-worker ] && echo "fleet-worker:x:1001:1001::$STUB_WORKER_HOME:/bin/bash"\n' >"$ROOT_STUBS/getent"
+chmod +x "$ROOT_STUBS/id" "$ROOT_STUBS/getent"
+run_root_install() { # root; environment assignments come before this call.
+	FLEET_INSTALL_ROOT="$1" HOME=/nonexistent PATH="$ROOT_STUBS:$PATH" sh "$PUBLISHED/worker.sh"
+}
+LINUX_ROOT2="$WORK/linux-root2"
+export STUB_WORKER_HOME="$WORK/fleet-worker-home"
+mkdir -p "$LINUX_ROOT2/run/systemd/system" "$STUB_WORKER_HOME"
+LINUX_TOKEN2="$(new_node linux-two)"
+
+OUT="$WORK/linux-root.out"
+FLEET_NODE_NAME=linux-two FLEET_NODE_TOKEN="$LINUX_TOKEN2" run_root_install "$LINUX_ROOT2" >"$OUT" 2>&1
+check "refuses to run jobs as root" grep -q 'jobs would run as root' "$OUT"
+FLEET_WORKER_USER=root FLEET_NODE_NAME=linux-two FLEET_NODE_TOKEN="$LINUX_TOKEN2" run_root_install "$LINUX_ROOT2" >"$OUT" 2>&1
+check "refuses root as the account" grep -q 'jobs would run as root' "$OUT"
+FLEET_WORKER_USER=nobody-here FLEET_NODE_NAME=linux-two FLEET_NODE_TOKEN="$LINUX_TOKEN2" run_root_install "$LINUX_ROOT2" >"$OUT" 2>&1
+check "refuses an account that doesn't exist" grep -q "no account named 'nobody-here'" "$OUT"
+FLEET_WORKER_USER="$(printf 'fleet-worker\nExecStartPre=/bin/true')" FLEET_NODE_NAME=linux-two FLEET_NODE_TOKEN="$LINUX_TOKEN2" run_root_install "$LINUX_ROOT2" >"$OUT" 2>&1
+check "refuses an account name that would add lines to the service" grep -q "isn't an account name" "$OUT"
+refute "changes nothing when refusing" test -e "$STUB_WORKER_HOME/fleet"
+
+: >"$STUB_LOG"
+FLEET_WORKER_USER=fleet-worker FLEET_NODE_NAME=linux-two FLEET_NODE_TOKEN="$LINUX_TOKEN2" run_root_install "$LINUX_ROOT2" >"$OUT" 2>&1
+RESULT=$?
+check "installs and connects" test "$RESULT" -eq 0
+[ "$RESULT" -eq 0 ] || sed 's/^/    /' "$OUT" >&2
+check "installs into that account's home" test -f "$STUB_WORKER_HOME/fleet/worker.yaml"
+check "both Linux machines are online at the gateway" online_on system.hostname 2
+check "runs the service as that account" grep -qx 'User=fleet-worker' "$LINUX_ROOT2/etc/systemd/system/fleet-worker.service"
+check "writes the account's files as the account" grep -q 'runuser -u fleet-worker -- sh -c umask 077' "$STUB_LOG"
+check "checks the config as the account" grep -q "runuser -u fleet-worker -- .*--check" "$STUB_LOG"
+refute "doesn't use sudo as root" grep -q '^sudo' "$STUB_LOG"
+: >"$STUB_LOG"
+run_root_install "$LINUX_ROOT2" >"$OUT" 2>&1
+check "upgrades as root, keeping the service's account" test $? -eq 0
+check "keeps the account" grep -qx 'User=fleet-worker' "$LINUX_ROOT2/etc/systemd/system/fleet-worker.service"
 
 echo
 if [ "$FAILURES" -eq 0 ]; then
