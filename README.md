@@ -222,6 +222,8 @@ launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.fleet.worker.plist
 
 By default a console shows logs and writes no file. Add `--log-file worker.log` to get both.
 
+The [configuration page](#use-the-configuration-page) also shows the latest thousand lines, without stopping the worker.
+
 For more detail in the background worker, add `log_level: debug` to `worker.yaml` and restart it. Debug also shows each command's output line, each request to a service, each check and each message exchanged with the gateway.
 
 Logs never contain the node token or header secrets. Job input isn't logged either, with one exception: **at debug level, the log includes what commands print, and a command can print what it was given.** A failed job's error message also includes the end of its command's output, or the service's reply, at every level.
@@ -436,6 +438,43 @@ fleet-worker tools new tts.clone --template python --config ~/fleet/worker.yaml
 | `powershell` | A PowerShell script (Windows) |
 
 `tools new` writes `tools/NAME.yaml` next to `worker.yaml`, switched off with `enabled: false`. Fill in each `TODO`, set `enabled: true`, and the worker offers it within a few seconds. Run `fleet-worker --config worker.yaml --check` to see any problems first.
+
+### Use the configuration page
+
+The running worker serves a page for its tools. On the machine itself:
+
+```sh
+~/fleet/fleet-worker ui --config ~/fleet/worker.yaml
+```
+
+This opens the page in your browser, already signed in. With `--no-open`, it prints the address instead. The page has:
+
+- **Tools:** every tool, with whether it's ready and why not. Switch tools on and off, or start a new one from a template.
+- **The editor:** a form for command-line tools, or the YAML for any tool. Problems show as you type.
+- **Try it:** runs the tool on this machine with the input you give, using what's in the editor even before you save. It shows the command line, the output as it runs, progress, the exit code, the result and any files, with pictures, audio and video playable in the page.
+- **Activity:** the jobs running now and the worker's log.
+- **This machine:** its settings, where common programs are, and on a Mac, its iPhone and iPad simulators.
+
+Some rules:
+
+- **Only files in the tools folder can be changed.** Tools in `worker.yaml` are shown but not changed, so the page never rewrites the file with the gateway address.
+- **A tool that's on must be valid to save.** One that's off can be saved unfinished. Two tools can't share a name. If the file changed on disk after you opened it, saving is refused rather than overwriting the change.
+- **Saving from the form rewrites the file without its comments.** Switching a tool on or off, or saving from the YAML view, keeps them.
+- **Tries skip the gateway's limits.** They don't count toward `max_jobs` or `requires`. At most two run at once. Their files are kept until the worker restarts, the latest ten at most. A tool with `input_files` can't be tried on the page yet: use [a test](#test-a-capability).
+
+The page can make this machine run any program, so:
+
+- **It's only reachable from this machine.** `ui_listen` in `worker.yaml` sets the address, `127.0.0.1:7878` by default, and must be a loopback address. Set it to `off` to turn the page off. It changes on a restart.
+- **It needs a secret.** The worker makes a new one each time it starts and saves it in `state/ui.json`, which only the worker's user can read. The link from `fleet-worker ui` works once, for two minutes. The secret is kept in the browser tab until it closes.
+- **Other web pages can't use it.** Requests for any name other than `127.0.0.1`, `localhost` or `[::1]` are refused, as are requests from other sites.
+
+To use the page from another computer, forward the port over SSH and open the link it prints:
+
+```sh
+ssh -L 7878:127.0.0.1:7878 mac-mini ~/fleet/fleet-worker ui --config ~/fleet/worker.yaml --no-open
+```
+
+Use the same port number on both ends. The page checks the address it's opened at.
 
 ### Where tools are declared
 

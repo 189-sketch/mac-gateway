@@ -35,9 +35,9 @@ const (
 // still run, and a service by connecting to its host and port.
 type CheckConfig struct {
 	RequestTemplate `yaml:",inline"`
-	Command         []string `yaml:"command"`
-	Every           string   `yaml:"every"`
-	Timeout         string   `yaml:"timeout"`
+	Command         []string `yaml:"command,omitempty"`
+	Every           string   `yaml:"every,omitempty"`
+	Timeout         string   `yaml:"timeout,omitempty"`
 
 	every      time.Duration
 	timeout    time.Duration
@@ -245,6 +245,7 @@ func (w *Worker) restartChecks(parent context.Context) {
 	for name := range w.notReady {
 		if m.byName[name] == nil {
 			delete(w.notReady, name)
+			delete(w.notReadyDetail, name)
 			w.statusChanged = true
 		}
 	}
@@ -258,6 +259,11 @@ func (w *Worker) recordCheck(ctx context.Context, c *Capability) {
 	}
 	w.log.Debug("capability checked", "capability", c.Name, "ready", reason == "", "detail", detail)
 	w.mu.Lock()
+	if reason == "" {
+		delete(w.notReadyDetail, c.Name)
+	} else {
+		w.notReadyDetail[c.Name] = detail
+	}
 	previous := w.notReady[c.Name]
 	if reason == previous {
 		w.mu.Unlock()

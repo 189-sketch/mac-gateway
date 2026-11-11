@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Worker tools</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='2' y='2' width='12' height='12' rx='2' fill='none' stroke='%232a78d6' stroke-width='2'/%3E%3Cpath d='M5 6l2 2-2 2M8.5 10.5h3' fill='none' stroke='%232a78d6' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<section id="signin" class="signin" hidden>
+  <h1>Worker tools</h1>
+  <p id="signin-message">To open this page, run this on the machine where the worker runs:</p>
+  <pre class="command"><code>fleet-worker ui --config /path/to/worker.yaml</code></pre>
+  <p class="hint">It opens this page signed in. You stay signed in until you close the tab or the worker restarts. The page is only reachable from this machine.</p>
+</section>
+
+<div id="app" hidden>
+  <header class="topbar">
+    <div class="brand">
+      <h1 id="node-name">Worker</h1>
+      <span id="connection"></span>
+    </div>
+    <nav class="tabs" aria-label="Sections">
+      <button type="button" class="tab" data-view="tools" aria-current="page">Tools</button>
+      <button type="button" class="tab" data-view="activity">Activity</button>
+      <button type="button" class="tab" data-view="machine">This machine</button>
+    </nav>
+  </header>
+
+  <main>
+    <section id="view-tools" aria-labelledby="tools-title">
+      <div class="section-head">
+        <div>
+          <h2 id="tools-title">Tools</h2>
+          <p class="hint">What this machine offers agents through the gateway. Changes apply within a few seconds, without a restart.</p>
+        </div>
+        <button id="new-tool" type="button" class="primary">New tool</button>
+      </div>
+      <div class="table-wrap">
+        <table class="list">
+          <thead><tr><th scope="col">Tool</th><th scope="col">State</th><th scope="col">Kind</th><th scope="col">On</th></tr></thead>
+          <tbody id="tool-rows"></tbody>
+        </table>
+        <p id="no-tools" class="empty" hidden>No tools yet. Start one from a template with <strong>New tool</strong>.</p>
+      </div>
+    </section>
+
+    <section id="view-editor" hidden aria-labelledby="editor-title">
+      <div class="editor-head">
+        <button id="editor-back" type="button" class="quiet">← Tools</button>
+        <div class="editor-title">
+          <h2 id="editor-title"></h2>
+          <p id="editor-file" class="hint"></p>
+        </div>
+        <div class="editor-actions">
+          <button id="editor-delete" type="button" class="quiet danger">Delete</button>
+          <button id="editor-save" type="button" class="primary">Save</button>
+        </div>
+      </div>
+      <p id="editor-readonly" class="note" hidden>This tool is declared in worker.yaml, so it's shown here but can't be changed. Edit worker.yaml to change it, or try it on the right.</p>
+      <p id="editor-problem" class="problem" role="status" hidden></p>
+      <div class="editor-body">
+        <div class="editor-main">
+          <div class="mode-switch" role="tablist" aria-label="Edit as">
+            <button type="button" id="mode-form" class="mode" role="tab">Form</button>
+            <button type="button" id="mode-yaml" class="mode" role="tab">YAML</button>
+          </div>
+          <p id="form-note" class="hint" hidden></p>
+          <div id="form"></div>
+          <div id="yaml-pane" hidden>
+            <label for="yaml" class="visually-hidden">Tool file</label>
+            <textarea id="yaml" class="code" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off"></textarea>
+          </div>
+        </div>
+
+        <aside class="try" aria-labelledby="try-title">
+          <h3 id="try-title">Try it</h3>
+          <p class="hint">Runs the tool on this machine now, as shown in the editor, even before you save. It runs outside the gateway's job limits.</p>
+          <label for="try-input">Input (JSON)</label>
+          <textarea id="try-input" class="code small" spellcheck="false" rows="6"></textarea>
+          <div class="row">
+            <button id="try-preview" type="button" class="quiet">Show command</button>
+            <button id="try-run" type="button" class="primary">Run</button>
+            <button id="try-cancel" type="button" class="quiet" hidden>Stop</button>
+          </div>
+          <p id="try-problem" class="problem" hidden></p>
+          <div id="try-call" hidden></div>
+          <div id="try-result" hidden></div>
+        </aside>
+      </div>
+    </section>
+
+    <section id="view-activity" hidden aria-labelledby="activity-title">
+      <h2 id="activity-title">Jobs running now</h2>
+      <div id="running" class="table-wrap"></div>
+      <div class="section-head log-head">
+        <h2>Log</h2>
+        <label class="inline"><input id="log-follow" type="checkbox" checked> Follow</label>
+      </div>
+      <pre id="log" class="log" tabindex="0" aria-label="Worker log"></pre>
+    </section>
+
+    <section id="view-machine" hidden aria-labelledby="machine-title">
+      <h2 id="machine-title">This machine</h2>
+      <dl id="facts" class="facts card"></dl>
+      <p class="hint">These settings are in worker.yaml. Most change only when the worker restarts.</p>
+      <div class="section-head">
+        <div>
+          <h2>Programs</h2>
+          <p class="hint">Where common programs are, to use in a tool's command. Tools should give a program's full path.</p>
+        </div>
+        <button id="detect" type="button" class="quiet">Find programs</button>
+      </div>
+      <div id="detected"></div>
+    </section>
+  </main>
+</div>
+
+<dialog id="new-dialog" aria-labelledby="new-title">
+  <form id="new-form" method="dialog">
+    <div class="detail-head">
+      <h2 id="new-title">New tool</h2>
+      <button type="button" class="quiet" data-close>Close</button>
+    </div>
+    <fieldset class="templates">
+      <legend>Start from</legend>
+      <div id="template-list"></div>
+    </fieldset>
+    <label for="new-name">Name</label>
+    <input id="new-name" required pattern="[a-z0-9][a-z0-9._\-]{0,127}" autocomplete="off" spellcheck="false" placeholder="tts.clone">
+    <p class="hint">Lowercase letters, digits, dots, dashes and underscores. Agents see this name. The tool starts switched off.</p>
+    <p id="new-error" class="problem" hidden></p>
+    <div class="row end"><button type="submit" class="primary">Create</button></div>
+  </form>
+</dialog>
+
+<dialog id="browse-dialog" aria-labelledby="browse-title">
+  <div class="detail-head">
+    <h2 id="browse-title">Choose</h2>
+    <button type="button" class="quiet" data-close>Close</button>
+  </div>
+  <form id="browse-go" class="row">
+    <label for="browse-path" class="visually-hidden">Folder</label>
+    <input id="browse-path" class="grow" spellcheck="false" autocomplete="off">
+    <button type="submit" class="quiet">Go</button>
+    <button id="browse-up" type="button" class="quiet">Up</button>
+  </form>
+  <label class="inline"><input id="browse-hidden" type="checkbox"> Show hidden</label>
+  <ul id="browse-list" class="browse"></ul>
+  <p id="browse-error" class="problem" hidden></p>
+  <div class="row end"><button id="browse-pick-folder" type="button" class="primary">Use this folder</button></div>
+</dialog>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

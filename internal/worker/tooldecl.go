@@ -331,11 +331,11 @@ func (c *Capability) applyDefaults(input map[string]any) {
 // ResultConfig says where a command's answer comes from: what it prints, or a
 // file it writes. The answer is returned with the job, rather than as a file.
 type ResultConfig struct {
-	From      string `yaml:"from"`
-	Path      string `yaml:"path"`
-	Format    string `yaml:"format"`
-	Field     string `yaml:"field"`
-	TailLines int    `yaml:"tail_lines"`
+	From      string `yaml:"from,omitempty"`
+	Path      string `yaml:"path,omitempty"`
+	Format    string `yaml:"format,omitempty"`
+	Field     string `yaml:"field,omitempty"`
+	TailLines int    `yaml:"tail_lines,omitempty"`
 }
 
 const (
@@ -381,8 +381,8 @@ func (r *ResultConfig) validate() error {
 // return a folder as a zip, or skip a file the command didn't make.
 type OutputSpec struct {
 	Path     string `yaml:"path"`
-	Archive  string `yaml:"archive"`
-	Optional bool   `yaml:"optional"`
+	Archive  string `yaml:"archive,omitempty"`
+	Optional bool   `yaml:"optional,omitempty"`
 }
 
 const archiveZip = "zip"

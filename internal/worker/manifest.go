@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,6 +51,9 @@ type Manifest struct {
 	// ToolsDir holds one tool per file, such as those made by `fleet-worker tools
 	// new`. It defaults to the tools folder next to this file.
 	ToolsDir string `yaml:"tools_dir"`
+	// UIListen is where the local configuration page is served. It must be on
+	// this machine. "off" turns it off.
+	UIListen string `yaml:"ui_listen"`
 
 	// ToolErrors lists tool files that were skipped because they aren't valid.
 	ToolErrors []ToolFileError `yaml:"-"`
@@ -59,6 +63,40 @@ type Manifest struct {
 	uploadWindow time.Duration
 	byName       map[string]*Capability
 	toolsPath    string
+	uiAddr       string
+	// disabledFiles says which file each disabled tool is in, or "" for worker.yaml.
+	disabledFiles map[string]string
+}
+
+// DefaultUIListen is where the configuration page is served unless set.
+const DefaultUIListen = "127.0.0.1:7878"
+
+// UIAddress is where the configuration page is served, or "" if it's off.
+func (m *Manifest) UIAddress() string { return m.uiAddr }
+
+func (m *Manifest) validateUI() error {
+	switch m.UIListen {
+	case "":
+		m.uiAddr = DefaultUIListen
+		return nil
+	case "off":
+		m.uiAddr = ""
+		return nil
+	}
+	host, port, err := net.SplitHostPort(m.UIListen)
+	if err != nil {
+		return fmt.Errorf("ui_listen: %w", err)
+	}
+	// Whoever can reach the page can make this machine run anything, so it stays
+	// on this machine. From elsewhere, use an SSH tunnel.
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		return errors.New("ui_listen must be a loopback address such as 127.0.0.1:7878, because the page can change what this machine runs; to reach it from elsewhere, use an SSH tunnel")
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 0 || n > 65535 {
+		return fmt.Errorf("ui_listen: port %q isn't valid", port)
+	}
+	m.uiAddr = m.UIListen
+	return nil
 }
 
 // ToolFileError is a tool file that couldn't be used. The worker runs without it,
@@ -112,14 +150,15 @@ type Capability struct {
 	RetryIfLost      bool            `yaml:"retry_if_lost,omitempty"`
 
 	// The http and http_async adapters use these instead of Command.
-	Request     *RequestTemplate `yaml:"request"`
-	Response    *ResponseConfig  `yaml:"response"`
-	Async       *AsyncConfig     `yaml:"async"`
-	AllowRemote bool             `yaml:"allow_remote"`
-	Check       *CheckConfig     `yaml:"check"`
-	Test        *TestConfig      `yaml:"test"`
+	Request     *RequestTemplate `yaml:"request,omitempty"`
+	Response    *ResponseConfig  `yaml:"response,omitempty"`
+	Async       *AsyncConfig     `yaml:"async,omitempty"`
+	AllowRemote bool             `yaml:"allow_remote,omitempty"`
+	Check       *CheckConfig     `yaml:"check,omitempty"`
+	Test        *TestConfig      `yaml:"test,omitempty"`
 
 	testInput    []byte
+	file         string // The tool file it came from, or "" for worker.yaml.
 	fields       schemaFields
 	cwd          string
 	successCodes []int
@@ -193,6 +232,10 @@ func (m *Manifest) validate(baseDir string) error {
 	if _, err := ParseLogLevel(m.LogLevel); err != nil {
 		return fmt.Errorf("log_level: %w", err)
 	}
+	if err := m.validateUI(); err != nil {
+		return err
+	}
+	m.disabledFiles = map[string]string{}
 
 	m.uploadWindow = defaultUploadWindow
 	if m.UploadRetryWindow != "" {
@@ -207,6 +250,7 @@ func (m *Manifest) validate(baseDir string) error {
 	for _, c := range m.Capabilities {
 		if !c.isEnabled() {
 			m.Disabled = append(m.Disabled, c.Name)
+			m.disabledFiles[c.Name] = ""
 			continue
 		}
 		if err := c.validate(baseDir, m.Node.Resources); err != nil {
@@ -259,6 +303,7 @@ func (m *Manifest) loadToolFiles(resources map[string]int) ([]Capability, error)
 		c, err := readToolFile(path)
 		if err == nil && !c.isEnabled() {
 			m.Disabled = append(m.Disabled, c.Name)
+			m.disabledFiles[c.Name] = path
 			continue
 		}
 		if err == nil {
@@ -271,6 +316,7 @@ func (m *Manifest) loadToolFiles(resources map[string]int) ([]Capability, error)
 			m.ToolErrors = append(m.ToolErrors, ToolFileError{Path: path, Err: err})
 			continue
 		}
+		c.file = path
 		out = append(out, *c)
 		m.byName[c.Name] = &out[len(out)-1]
 	}

@@ -276,7 +276,7 @@ func (h *harness) startWorker(name, gatewayURL string, retry bool, extraCapabili
 		h.t.Fatal(err)
 	}
 	var manifest strings.Builder
-	fmt.Fprintf(&manifest, "gateway_url: %s\ntoken_file: token\nstate_dir: state\nupload_retry_window: 2m\nnode:\n  name: %s\n  max_jobs: 4\n  labels: { name: %s }\n  resources: { heavy: 1 }\ncapabilities:",
+	fmt.Fprintf(&manifest, "gateway_url: %s\ntoken_file: token\nstate_dir: state\nupload_retry_window: 2m\nui_listen: off\nnode:\n  name: %s\n  max_jobs: 4\n  labels: { name: %s }\n  resources: { heavy: 1 }\ncapabilities:",
 		gatewayURL, name, name)
 	fmt.Fprintf(&manifest, defaultCapabilities, fakeTool, name, w.markerDir, retry)
 	for _, extra := range extraCapabilities {

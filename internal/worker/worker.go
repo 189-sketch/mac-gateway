@@ -42,9 +42,11 @@ type attempt struct {
 	terminalSeq int64
 	started     time.Time // Zero for an attempt recovered after a restart.
 	output      string    // What the command printed, for the completed event.
-	cancel      context.CancelFunc
-	done        chan struct{}
-	aborted     bool
+	// watch, when set, is given the command's output as it's collected.
+	watch   func(*logTail)
+	cancel  context.CancelFunc
+	done    chan struct{}
+	aborted bool
 }
 
 // Worker maintains the gateway connection and runs attempts.
@@ -57,6 +59,10 @@ type Worker struct {
 	stateDir     string
 	uploadWindow time.Duration
 	reconnect    chan struct{}
+	reloadNow    chan struct{}
+	// connectedAt is when the current session with the gateway began, in Unix
+	// milliseconds, or 0 while disconnected.
+	connectedAt atomic.Int64
 
 	checksMu   sync.Mutex
 	stopChecks context.CancelFunc
@@ -75,6 +81,8 @@ type Worker struct {
 	stopping bool
 	// notReady holds why each capability that failed its last check can't run jobs.
 	notReady map[string]string
+	// notReadyDetail has the specifics, which stay on this machine.
+	notReadyDetail map[string]string
 	// statusChanged means the gateway hasn't been told about the latest notReady.
 	statusChanged bool
 }
@@ -91,6 +99,7 @@ func New(manifest *Manifest, token string, log *slog.Logger) (*Worker, error) {
 		stateDir:     manifest.StateDir,
 		uploadWindow: manifest.uploadWindow,
 		reconnect:    make(chan struct{}, 1),
+		reloadNow:    make(chan struct{}, 1),
 		token:        token,
 		log:          log,
 		httpClient:   &http.Client{Transport: transport},
@@ -100,6 +109,8 @@ func New(manifest *Manifest, token string, log *slog.Logger) (*Worker, error) {
 		attempts:      map[string]*attempt{},
 		pids:          map[string]int{},
 		notReady:      map[string]string{},
+
+		notReadyDetail: map[string]string{},
 	}
 	w.cfg.Store(manifest)
 	if err := w.recover(); err != nil {
@@ -261,6 +272,8 @@ func (w *Worker) session(parent context.Context) error {
 		return err
 	}
 	w.log.Info("connected to gateway", "url", w.gatewayURL)
+	w.connectedAt.Store(time.Now().UnixMilli())
+	defer w.connectedAt.Store(0)
 
 	var reconnecting atomic.Bool
 	go func() {

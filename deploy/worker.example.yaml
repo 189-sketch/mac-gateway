@@ -14,6 +14,10 @@ state_dir: state
 # one from a template with: fleet-worker tools new NAME --template TEMPLATE
 # Changes to either take effect without a restart.
 
+# The configuration page, opened with: fleet-worker ui --config worker.yaml
+# It must be on this machine. Set it to off to turn the page off.
+# ui_listen: 127.0.0.1:7878
+
 node:
   name: mac-mini-1 # Must match the name given to `fleet-gateway node add`.
   max_jobs: 2

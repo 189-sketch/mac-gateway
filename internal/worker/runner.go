@@ -55,18 +55,11 @@ func (w *Worker) run(ctx context.Context, a *attempt, assign protocol.Assign) {
 		return
 	}
 	// The gateway checked this too, but this machine trusts only its own check.
-	if err := schema.Validate(capability.compiled, rawInput); err != nil {
+	input, err := capability.readInput(rawInput)
+	if err != nil {
 		w.fail(a, protocol.CodeInvalidInput, err.Error())
 		return
 	}
-	var input map[string]any
-	decoder := json.NewDecoder(bytes.NewReader(rawInput))
-	decoder.UseNumber()
-	if err := decoder.Decode(&input); err != nil {
-		w.fail(a, protocol.CodeInvalidInput, "input must be a JSON object")
-		return
-	}
-	capability.applyDefaults(input)
 
 	work := filepath.Join(a.dir, workDir)
 	files, failure := w.fetchInputs(ctx, a, capability, assign.Files, work)
@@ -78,14 +71,7 @@ func (w *Worker) run(ctx context.Context, a *attempt, assign protocol.Assign) {
 		return
 	}
 	vars := templateVars{workdir: work, input: input, files: files}
-	var result json.RawMessage
-	var exitCode *int
-	var outcome *protocol.Failure
-	if capability.isService() {
-		result, outcome = w.callService(ctx, a, capability, vars, work)
-	} else {
-		result, exitCode, outcome = w.runCommand(ctx, a, capability, vars, work)
-	}
+	result, exitCode, outcome := w.invoke(ctx, a, capability, vars, work)
 	if outcome != nil {
 		if ctx.Err() == nil || outcome.Code == protocol.CodeTimedOut {
 			w.failWith(a, *outcome)
@@ -93,6 +79,30 @@ func (w *Worker) run(ctx context.Context, a *attempt, assign protocol.Assign) {
 		return
 	}
 	w.deliverOutputs(ctx, a, capability, work, result, exitCode)
+}
+
+// readInput checks a job's input against the tool's schema and fills in defaults.
+func (c *Capability) readInput(raw []byte) (map[string]any, error) {
+	if err := schema.Validate(c.compiled, raw); err != nil {
+		return nil, err
+	}
+	var input map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&input); err != nil {
+		return nil, errors.New("input must be a JSON object")
+	}
+	c.applyDefaults(input)
+	return input, nil
+}
+
+// invoke runs the tool itself, leaving any output files in work.
+func (w *Worker) invoke(ctx context.Context, a *attempt, c *Capability, vars templateVars, work string) (json.RawMessage, *int, *protocol.Failure) {
+	if c.isService() {
+		result, failure := w.callService(ctx, a, c, vars, work)
+		return result, nil, failure
+	}
+	return w.runCommand(ctx, a, c, vars, work)
 }
 
 func (w *Worker) runCommand(ctx context.Context, a *attempt, c *Capability, vars templateVars, work string) (json.RawMessage, *int, *protocol.Failure) {
@@ -128,6 +138,9 @@ func (w *Worker) execute(ctx context.Context, a *attempt, c *Capability, args []
 		return nil, nil, &protocol.Failure{Code: code, Message: message}
 	}
 	tail := &logTail{}
+	if a.watch != nil {
+		a.watch(tail)
+	}
 	cmd := exec.Command(c.executable, args...)
 	cmd.Args = append([]string{c.Command[0]}, args...)
 	cmd.Dir = c.workingDir(work)

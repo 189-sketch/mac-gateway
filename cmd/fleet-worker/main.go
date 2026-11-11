@@ -20,8 +20,12 @@ import (
 var version = "dev"
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "tools" {
-		if err := toolsCommand(os.Args[2:]); err != nil {
+	if len(os.Args) > 1 && (os.Args[1] == "tools" || os.Args[1] == "ui") {
+		command := toolsCommand
+		if os.Args[1] == "ui" {
+			command = uiCommand
+		}
+		if err := command(os.Args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, "fleet-worker:", err)
 			os.Exit(1)
 		}
@@ -107,7 +111,9 @@ func run(configPath, levelFlag string, output io.Writer) error {
 	// Commands get a fresh environment, but drop this anyway as a second safeguard.
 	os.Unsetenv("FLEET_NODE_TOKEN")
 
-	log := slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{Level: level}))
+	// The configuration page shows the newest lines too.
+	logs := worker.NewLogRing(1000)
+	log := slog.New(slog.NewTextHandler(io.MultiWriter(output, logs), &slog.HandlerOptions{Level: level}))
 	log.Info("worker starting", "version", version, "node", manifest.Node.Name, "gateway", manifest.GatewayURL, "log_level", level.String())
 	worker.LogToolErrors(log, manifest)
 	w, err := worker.New(manifest, token, log)
@@ -118,7 +124,6 @@ func run(configPath, levelFlag string, output io.Writer) error {
 	defer stop()
 
 	// Changed tools are picked up by themselves. SIGHUP asks for it straight away.
-	reload := make(chan struct{}, 1)
 	hangups := make(chan os.Signal, 1)
 	signal.Notify(hangups, syscall.SIGHUP)
 	defer signal.Stop(hangups)
@@ -126,18 +131,26 @@ func run(configPath, levelFlag string, output io.Writer) error {
 		for {
 			select {
 			case <-hangups:
-				select {
-				case reload <- struct{}{}:
-				default:
-				}
+				w.RequestReload()
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
-	go w.WatchConfig(ctx, configPath, worker.ReloadEvery, reload)
+	go w.WatchConfig(ctx, configPath, worker.ReloadEvery)
+	pageDone := make(chan struct{})
+	go func() {
+		defer close(pageDone)
+		w.ServeUI(ctx, worker.UIOptions{ConfigPath: configPath, Logs: logs, Version: version})
+	}()
 
 	err = w.Run(ctx)
+	// Let the page remove its sign-in file, so `fleet-worker ui` knows it's gone.
+	stop()
+	select {
+	case <-pageDone:
+	case <-time.After(3 * time.Second):
+	}
 	log.Info("worker stopped")
 	return err
 }

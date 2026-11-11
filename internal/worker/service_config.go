@@ -32,35 +32,35 @@ var (
 // RequestTemplate is one HTTP request a capability may make. Its scheme and host
 // are fixed here in the manifest, so job input can never choose where it goes.
 type RequestTemplate struct {
-	Method   string            `yaml:"method"`
-	URL      string            `yaml:"url"`
-	Headers  map[string]string `yaml:"headers"`
-	JSON     any               `yaml:"json"`
-	Body     string            `yaml:"body"`
-	BodyFile string            `yaml:"body_file"`
+	Method   string            `yaml:"method,omitempty"`
+	URL      string            `yaml:"url,omitempty"`
+	Headers  map[string]string `yaml:"headers,omitempty"`
+	JSON     any               `yaml:"json,omitempty"`
+	Body     string            `yaml:"body,omitempty"`
+	BodyFile string            `yaml:"body_file,omitempty"`
 
 	bodyField string // The input file named by BodyFile.
 }
 
 // ResponseConfig says what to keep from a service's response.
 type ResponseConfig struct {
-	File        string `yaml:"file"`
-	Result      string `yaml:"result"`
-	ResultField string `yaml:"result_field"`
+	File        string `yaml:"file,omitempty"`
+	Result      string `yaml:"result,omitempty"`
+	ResultField string `yaml:"result_field,omitempty"`
 }
 
 // PollConfig is how to find out whether a service's job has finished.
 type PollConfig struct {
 	RequestTemplate `yaml:",inline"`
-	Every           string   `yaml:"every"`
-	GiveUpAfter     string   `yaml:"give_up_after"`
-	StatusField     string   `yaml:"status_field"`
-	Succeeded       []string `yaml:"succeeded"`
-	Failed          []string `yaml:"failed"`
-	PercentField    string   `yaml:"percent_field"`
-	PercentScale    float64  `yaml:"percent_scale"`
-	MessageField    string   `yaml:"message_field"`
-	ErrorField      string   `yaml:"error_field"`
+	Every           string   `yaml:"every,omitempty"`
+	GiveUpAfter     string   `yaml:"give_up_after,omitempty"`
+	StatusField     string   `yaml:"status_field,omitempty"`
+	Succeeded       []string `yaml:"succeeded,omitempty"`
+	Failed          []string `yaml:"failed,omitempty"`
+	PercentField    string   `yaml:"percent_field,omitempty"`
+	PercentScale    float64  `yaml:"percent_scale,omitempty"`
+	MessageField    string   `yaml:"message_field,omitempty"`
+	ErrorField      string   `yaml:"error_field,omitempty"`
 
 	every  time.Duration
 	giveUp time.Duration
@@ -69,10 +69,10 @@ type PollConfig struct {
 // AsyncConfig describes a service that answers with its own job ID, then runs
 // the work in the background.
 type AsyncConfig struct {
-	JobIDField string           `yaml:"job_id_field"`
+	JobIDField string           `yaml:"job_id_field,omitempty"`
 	Poll       PollConfig       `yaml:"poll"`
-	Fetch      *RequestTemplate `yaml:"fetch"`
-	Cancel     *RequestTemplate `yaml:"cancel"`
+	Fetch      *RequestTemplate `yaml:"fetch,omitempty"`
+	Cancel     *RequestTemplate `yaml:"cancel,omitempty"`
 }
 
 func (c *Capability) isService() bool {

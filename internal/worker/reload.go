@@ -18,7 +18,7 @@ const ReloadEvery = 2 * time.Second
 // WatchConfig reloads the manifest and tools folder when either changes, or when
 // asked to through reload. A change that isn't valid is logged and ignored, so a
 // half-saved file never takes tools away from a running machine.
-func (w *Worker) WatchConfig(ctx context.Context, path string, every time.Duration, reload <-chan struct{}) {
+func (w *Worker) WatchConfig(ctx context.Context, path string, every time.Duration) {
 	last := configFingerprint(path, w.config().ToolsPath())
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
@@ -28,7 +28,7 @@ func (w *Worker) WatchConfig(ctx context.Context, path string, every time.Durati
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-		case <-reload:
+		case <-w.reloadNow:
 			forced = true
 		}
 		now := configFingerprint(path, w.config().ToolsPath())
@@ -45,6 +45,15 @@ func (w *Worker) WatchConfig(ctx context.Context, path string, every time.Durati
 	}
 }
 
+// RequestReload asks for the tools to be read again now, rather than at the
+// next look for changes.
+func (w *Worker) RequestReload() {
+	select {
+	case w.reloadNow <- struct{}{}:
+	default:
+	}
+}
+
 // Reload switches to a newly loaded manifest. Jobs already running finish with
 // the tool definitions they started with.
 func (w *Worker) Reload(ctx context.Context, next *Manifest) {
@@ -56,7 +65,7 @@ func (w *Worker) Reload(ctx context.Context, next *Manifest) {
 	// with the worker using it.
 	next.GatewayURL, next.TokenFile, next.StateDir = current.GatewayURL, current.TokenFile, current.StateDir
 	next.AllowInsecureHTTP, next.UploadRetryWindow, next.uploadWindow = current.AllowInsecureHTTP, current.UploadRetryWindow, current.uploadWindow
-	next.LogLevel = current.LogLevel
+	next.LogLevel, next.UIListen, next.uiAddr = current.LogLevel, current.UIListen, current.uiAddr
 
 	LogToolErrors(w.log, next)
 	w.cfg.Store(next)
@@ -94,6 +103,7 @@ func fixedChanges(a, b *Manifest) []string {
 		"allow_insecure_http": a.AllowInsecureHTTP == b.AllowInsecureHTTP,
 		"upload_retry_window": a.uploadWindow == b.uploadWindow,
 		"log_level":           a.LogLevel == b.LogLevel,
+		"ui_listen":           a.uiAddr == b.uiAddr,
 	} {
 		if !same {
 			out = append(out, name)
