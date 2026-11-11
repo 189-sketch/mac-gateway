@@ -73,7 +73,9 @@ func Encode(msgType string, payload any) ([]byte, error) {
 
 // Capability is what a node advertises for one service.
 type Capability struct {
-	Name           string          `json:"name"`
+	Name string `json:"name"`
+	// Description tells an agent what the capability does and when to use it.
+	Description    string          `json:"description,omitempty"`
 	InputSchema    json.RawMessage `json:"input_schema"`
 	Requires       map[string]int  `json:"requires,omitempty"`
 	TimeoutSeconds int64           `json:"timeout_seconds"`
@@ -175,6 +177,10 @@ type Progress struct {
 type Failure struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// Output is the end of what a command printed, and ExitCode how it exited,
+	// when the job got as far as running one.
+	Output   string `json:"output,omitempty"`
+	ExitCode *int   `json:"exit_code,omitempty"`
 }
 
 // ArtifactRef identifies an uploaded output file in a completed event.
@@ -189,4 +195,8 @@ type Completion struct {
 	Artifacts []ArtifactRef `json:"artifacts"`
 	// Result is a small inline answer from an HTTP service, if it was asked for.
 	Result json.RawMessage `json:"result,omitempty"`
+	// ExitCode is a command's exit code, and Output the end of what it printed,
+	// when the job ran one.
+	ExitCode *int   `json:"exit_code,omitempty"`
+	Output   string `json:"output,omitempty"`
 }

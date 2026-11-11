@@ -76,6 +76,7 @@ func TestOpenStoreUpgradesADatabaseWithoutTests(t *testing.T) {
 		`DROP INDEX jobs_test`,
 		`ALTER TABLE jobs DROP COLUMN test_node`,
 		`ALTER TABLE capabilities DROP COLUMN test_input`,
+		`ALTER TABLE capabilities DROP COLUMN description`,
 	} {
 		if _, err := store.db.Exec(statement); err != nil {
 			t.Fatalf("%s: %v", statement, err)

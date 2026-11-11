@@ -455,20 +455,32 @@ func (s *Store) dashboardJobDetail(ctx context.Context, jobID string) (*Dashboar
 	return detail, nil
 }
 
-// withoutResult removes a service's answer from a completed event, which is the
-// one event that can carry a job's output.
+// withoutResult removes what a job produced from its final event: a service's
+// answer, and what a command printed.
 func withoutResult(event EventView) json.RawMessage {
-	if event.Type != protocol.EventCompleted {
+	var clean any
+	switch event.Type {
+	case protocol.EventCompleted:
+		var done protocol.Completion
+		if err := json.Unmarshal(event.Payload, &done); err != nil {
+			return nil
+		}
+		// What a command printed can quote its input, so it goes the same way.
+		done.Result, done.Output = nil, ""
+		clean = done
+	case protocol.EventFailed:
+		var failed protocol.Failure
+		if err := json.Unmarshal(event.Payload, &failed); err != nil {
+			return nil
+		}
+		failed.Output = ""
+		clean = failed
+	default:
 		return event.Payload
 	}
-	var done protocol.Completion
-	if err := json.Unmarshal(event.Payload, &done); err != nil {
-		return nil
-	}
-	done.Result = nil
-	clean, err := json.Marshal(done)
+	raw, err := json.Marshal(clean)
 	if err != nil {
 		return nil
 	}
-	return clean
+	return raw
 }

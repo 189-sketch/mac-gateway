@@ -192,6 +192,10 @@ func OpenStore(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("upgrade schema: %w", err)
 	}
+	if err := ensureColumn(db, "capabilities", "description", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("upgrade schema: %w", err)
+	}
 	if err := ensureColumn(db, "jobs", "test_node", "TEXT"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("upgrade schema: %w", err)
@@ -372,8 +376,8 @@ func (s *Store) RegisterNode(ctx context.Context, nodeID string, h protocol.Hell
 			if err != nil {
 				return err
 			}
-			if _, err := tx.Exec(`INSERT INTO capabilities (node_id, name, input_schema, requires, timeout_seconds, retry_if_lost, input_files, not_ready, test_input) VALUES (?,?,?,?,?,?,?,?,?)`,
-				nodeID, c.Name, string(c.InputSchema), string(requires), c.TimeoutSeconds, boolInt(c.RetryIfLost), string(inputFiles), cleanReason(c.NotReady), string(c.TestInput)); err != nil {
+			if _, err := tx.Exec(`INSERT INTO capabilities (node_id, name, input_schema, requires, timeout_seconds, retry_if_lost, input_files, not_ready, test_input, description) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+				nodeID, c.Name, string(c.InputSchema), string(requires), c.TimeoutSeconds, boolInt(c.RetryIfLost), string(inputFiles), cleanReason(c.NotReady), string(c.TestInput), cleanDescription(c.Description)); err != nil {
 				return err
 			}
 		}
@@ -397,6 +401,11 @@ func (s *Store) SetCapabilityStatus(ctx context.Context, nodeID string, notReady
 	})
 }
 
+// cleanDescription bounds a tool's description, which agents read to pick a tool.
+func cleanDescription(text string) string {
+	return strings.ToValidUTF8(truncate(strings.TrimSpace(text), 2000), "")
+}
+
 // cleanReason bounds what a worker can make the gateway store and show.
 func cleanReason(reason string) string {
 	return strings.ToValidUTF8(truncate(reason, 300), "")
@@ -417,12 +426,13 @@ type CapabilityRow struct {
 	InputFiles     []string
 	NotReady       string // Why the node's own check says this can't run. Empty means ready.
 	TestInput      string // What the node says to run to test this. Empty means it can't be tested.
+	Description    string
 }
 
 // CapabilityRows lists capabilities for active nodes. An empty name lists all.
 func (s *Store) CapabilityRows(ctx context.Context, name string) ([]CapabilityRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT c.node_id, n.name, c.name, c.input_schema, c.requires, c.timeout_seconds, c.retry_if_lost, n.labels, n.resources, n.max_jobs, c.input_files, c.not_ready, c.test_input
+		SELECT c.node_id, n.name, c.name, c.input_schema, c.requires, c.timeout_seconds, c.retry_if_lost, n.labels, n.resources, n.max_jobs, c.input_files, c.not_ready, c.test_input, c.description
 		FROM capabilities c JOIN nodes n ON n.id = c.node_id
 		WHERE n.revoked_ms IS NULL AND (? = '' OR c.name = ?)
 		ORDER BY c.name, n.name`, name, name)
@@ -435,7 +445,7 @@ func (s *Store) CapabilityRows(ctx context.Context, name string) ([]CapabilityRo
 		var c CapabilityRow
 		var requires, labels, resources, inputFiles string
 		var retry int
-		if err := rows.Scan(&c.NodeID, &c.NodeName, &c.Name, &c.InputSchema, &requires, &c.TimeoutSeconds, &retry, &labels, &resources, &c.MaxJobs, &inputFiles, &c.NotReady, &c.TestInput); err != nil {
+		if err := rows.Scan(&c.NodeID, &c.NodeName, &c.Name, &c.InputSchema, &requires, &c.TimeoutSeconds, &retry, &labels, &resources, &c.MaxJobs, &inputFiles, &c.NotReady, &c.TestInput, &c.Description); err != nil {
 			return nil, err
 		}
 		c.RetryIfLost = retry != 0
@@ -551,10 +561,14 @@ type JobView struct {
 	Error      *JobError       `json:"error,omitempty"`
 	Artifacts  []ArtifactView  `json:"artifacts"`
 	Result     json.RawMessage `json:"result,omitempty"`
-	Events     []EventView     `json:"events,omitempty"`
-	CreatedAt  string          `json:"created_at"`
-	StartedAt  string          `json:"started_at,omitempty"`
-	FinishedAt string          `json:"finished_at,omitempty"`
+	// ExitCode and Output are a command's exit code and the end of what it
+	// printed, whether the job succeeded or failed.
+	ExitCode   *int        `json:"exit_code,omitempty"`
+	Output     string      `json:"output,omitempty"`
+	Events     []EventView `json:"events,omitempty"`
+	CreatedAt  string      `json:"created_at"`
+	StartedAt  string      `json:"started_at,omitempty"`
+	FinishedAt string      `json:"finished_at,omitempty"`
 }
 
 func isTerminal(status string) bool {
@@ -605,7 +619,9 @@ func (s *Store) GetJob(ctx context.Context, jobID, apiKeyID string, withEvents b
 		if v.Artifacts, err = s.jobArtifacts(ctx, jobID); err != nil {
 			return nil, err
 		}
-		if v.Result, err = s.jobResult(ctx, jobID); err != nil {
+	}
+	if v.Terminal {
+		if err := s.jobOutcome(ctx, &v); err != nil {
 			return nil, err
 		}
 	}
@@ -617,23 +633,33 @@ func (s *Store) GetJob(ctx context.Context, jobID, apiKeyID string, withEvents b
 	return &v, nil
 }
 
-// jobResult reads the inline result from the event that completed the job.
-func (s *Store) jobResult(ctx context.Context, jobID string) (json.RawMessage, error) {
+// jobOutcome reads the result, exit code and output from the event that ended
+// the job's current attempt. A job that failed on the gateway, such as one that
+// timed out in the queue, has no such event.
+func (s *Store) jobOutcome(ctx context.Context, v *JobView) error {
+	var eventType string
 	var payload sql.NullString
 	err := s.db.QueryRowContext(ctx, `
-		SELECT e.payload FROM job_events e JOIN jobs j ON j.current_attempt = e.attempt_id
-		WHERE e.job_id = ? AND e.type = ?`, jobID, protocol.EventCompleted).Scan(&payload)
+		SELECT e.type, e.payload FROM job_events e JOIN jobs j ON j.current_attempt = e.attempt_id
+		WHERE e.job_id = ? AND e.type IN (?, ?)`, v.ID, protocol.EventCompleted, protocol.EventFailed).Scan(&eventType, &payload)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && !payload.Valid) {
-		return nil, nil
+		return nil
 	}
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var done protocol.Completion
-	if err := json.Unmarshal([]byte(payload.String), &done); err != nil {
-		return nil, nil
+	if eventType == protocol.EventCompleted {
+		var done protocol.Completion
+		if json.Unmarshal([]byte(payload.String), &done) == nil && v.Status == StatusSucceeded {
+			v.Result, v.ExitCode, v.Output = done.Result, done.ExitCode, done.Output
+		}
+		return nil
 	}
-	return done.Result, nil
+	var failed protocol.Failure
+	if json.Unmarshal([]byte(payload.String), &failed) == nil {
+		v.ExitCode, v.Output = failed.ExitCode, failed.Output
+	}
+	return nil
 }
 
 func (s *Store) jobArtifacts(ctx context.Context, jobID string) ([]ArtifactView, error) {

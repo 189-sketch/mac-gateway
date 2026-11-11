@@ -1,0 +1,43 @@
+# template: iOS tests
+# about: Run an Xcode project's tests on an iPhone simulator and report which passed and failed.
+# platforms: darwin
+#
+# Failing tests are a result rather than an error, so the caller gets the report
+# either way. List simulators with: xcrun simctl list devices available
+# Fill in each TODO, then set enabled: true. The worker picks up the change by itself.
+name: TOOL_NAME
+enabled: false
+description: TODO Run the tests of the app in this project on an iPhone simulator, and report the results.
+adapter: cli
+command: [/usr/bin/xcrun, xcodebuild, test]
+args:
+  - -project # Use -workspace for a project with a .xcworkspace
+  - TODO.xcodeproj
+  - -scheme
+  - "{{input.scheme}}"
+  - -destination
+  - "platform=iOS Simulator,name={{input.device}}"
+  - -resultBundlePath
+  - "{{workdir}}/result.xcresult"
+  - { flag: -only-testing, each: input.only_testing } # Once for each test given
+cwd: TODO/path/to/project
+input_schema:
+  type: object
+  required: [scheme]
+  additionalProperties: false
+  properties:
+    scheme: { type: string, minLength: 1 }
+    device: { type: string, default: "TODO iPhone 16" } # An installed simulator
+    only_testing: { type: array, items: { type: string }, description: "Tests to run, such as AppTests/LoginTests" }
+# xcodebuild exits with 65 when tests fail.
+success_exit_codes: [0, 65]
+result: { from: stdout, format: text, tail_lines: 300 }
+outputs:
+  report: { path: result.xcresult, archive: zip, optional: true }
+# Two builds of one project at once would get in each other's way. To prevent
+# it, add a resource such as project_lock: 1 to node.resources in worker.yaml,
+# then uncomment this:
+# requires: { project_lock: 1 }
+timeout: 1h
+test:
+  input: { scheme: TODO }

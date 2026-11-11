@@ -20,6 +20,13 @@ import (
 var version = "dev"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "tools" {
+		if err := toolsCommand(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "fleet-worker:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	configPath := flag.String("config", "worker.yaml", "path to the worker manifest")
 	check := flag.Bool("check", false, "validate the manifest, check each capability and exit")
 	logFile := flag.String("log-file", "", "also write logs to this file, which rotates by itself")
@@ -57,7 +64,7 @@ func runCheck(configPath string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s is valid (node %s, %d capabilities)\n", configPath, manifest.Node.Name, len(manifest.Capabilities))
+	fmt.Printf("%s is valid (node %s, %d tools)\n", configPath, manifest.Node.Name, len(manifest.Capabilities))
 	// A capability that isn't ready is a fact about this moment, not a bad config:
 	// the worker reports it and starts offering it once it passes.
 	for _, result := range worker.VerifyCapabilities(context.Background(), manifest) {
@@ -66,6 +73,16 @@ func runCheck(configPath string) error {
 		} else {
 			fmt.Printf("  not ready: %s: %s (%s)\n", result.Name, result.Reason, result.Detail)
 		}
+	}
+	for _, name := range manifest.Disabled {
+		fmt.Printf("  disabled: %s\n", name)
+	}
+	// The worker would run without these, but a check is the time to fix them.
+	for _, e := range manifest.ToolErrors {
+		fmt.Printf("  invalid: %s\n", e.Error())
+	}
+	if n := len(manifest.ToolErrors); n > 0 {
+		return fmt.Errorf("%d tool file(s) aren't valid and would be skipped", n)
 	}
 	return nil
 }
@@ -92,12 +109,34 @@ func run(configPath, levelFlag string, output io.Writer) error {
 
 	log := slog.New(slog.NewTextHandler(output, &slog.HandlerOptions{Level: level}))
 	log.Info("worker starting", "version", version, "node", manifest.Node.Name, "gateway", manifest.GatewayURL, "log_level", level.String())
+	worker.LogToolErrors(log, manifest)
 	w, err := worker.New(manifest, token, log)
 	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Changed tools are picked up by themselves. SIGHUP asks for it straight away.
+	reload := make(chan struct{}, 1)
+	hangups := make(chan os.Signal, 1)
+	signal.Notify(hangups, syscall.SIGHUP)
+	defer signal.Stop(hangups)
+	go func() {
+		for {
+			select {
+			case <-hangups:
+				select {
+				case reload <- struct{}{}:
+				default:
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go w.WatchConfig(ctx, configPath, worker.ReloadEvery, reload)
+
 	err = w.Run(ctx)
 	log.Info("worker stopped")
 	return err

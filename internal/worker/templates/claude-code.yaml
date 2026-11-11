@@ -1,0 +1,33 @@
+# template: Claude Code
+# about: Ask Claude Code on this machine to answer a question or do a task in a project folder.
+#
+# Log in to Claude Code on this machine first, as the user the worker runs as.
+# The prompt goes in on stdin, so it can never be read as an option.
+# By default Claude can only read files. To let it edit them too, change the
+# allowed tools and add: --permission-mode, acceptEdits
+# Fill in each TODO, then set enabled: true. The worker picks up the change by itself.
+name: TOOL_NAME
+enabled: false
+description: TODO Say what Claude can help with here, such as questions about the project in this folder.
+adapter: cli
+command: [TODO/full/path/to/claude, -p, --output-format, json] # Find it with: which claude
+args:
+  - --allowedTools
+  - Read,Grep,Glob
+  - { flag: --model, value: "{{input.model}}" }
+  - { flag: --max-budget-usd, value: "{{input.max_budget_usd}}" }
+stdin: "{{input.prompt}}"
+cwd: TODO/path/to/project
+input_schema:
+  type: object
+  required: [prompt]
+  additionalProperties: false
+  properties:
+    prompt: { type: string, minLength: 1 }
+    model: { type: string, description: A model alias such as sonnet or opus }
+    max_budget_usd: { type: number, exclusiveMinimum: 0, default: 1, description: The most this run may spend }
+# Claude's JSON output has the answer in its result field.
+result: { from: stdout, format: json, field: result }
+timeout: 30m
+test:
+  input: { prompt: "Reply with the single word: ready", max_budget_usd: 0.2 }

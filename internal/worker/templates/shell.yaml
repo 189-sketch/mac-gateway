@@ -1,0 +1,26 @@
+# template: Shell script
+# about: Run a bash script, passing the parameters as arguments.
+# platforms: darwin linux
+#
+# The script comes from a file and never from the caller, so input can't be run
+# as commands. In the script, use the arguments as "$1", "$2" and so on, always
+# in double quotes.
+# Fill in each TODO, then set enabled: true. The worker picks up the change by itself.
+name: TOOL_NAME
+enabled: false
+description: TODO Say what this does and when to use it. Agents read this to pick a tool.
+adapter: cli
+command: [/bin/bash, TODO/path/to/script.sh]
+args:
+  - "{{input.target}}"
+cwd: TODO/path/to/folder
+input_schema:
+  type: object
+  required: [target]
+  additionalProperties: false
+  properties:
+    target: { type: string, minLength: 1 }
+result: { from: stdout, format: text }
+timeout: 10m
+test:
+  input: { target: TODO a value that is safe to run again and again }

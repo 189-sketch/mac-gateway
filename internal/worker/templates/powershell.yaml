@@ -1,0 +1,24 @@
+# template: PowerShell script
+# about: Run a PowerShell script, passing the parameters as arguments.
+# platforms: windows
+#
+# The script comes from a file and never from the caller, so input can't be run
+# as commands. Declare the script's parameters with param() at its top.
+# Fill in each TODO, then set enabled: true. The worker picks up the change by itself.
+name: TOOL_NAME
+enabled: false
+description: TODO Say what this does and when to use it. Agents read this to pick a tool.
+adapter: cli
+command: ['C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe', -NoProfile, -NonInteractive, -ExecutionPolicy, Bypass, -File, 'TODO\path\to\script.ps1']
+args:
+  - "{{input.target}}"
+input_schema:
+  type: object
+  required: [target]
+  additionalProperties: false
+  properties:
+    target: { type: string, minLength: 1 }
+result: { from: stdout, format: text }
+timeout: 10m
+test:
+  input: { target: TODO a value that is safe to run again and again }

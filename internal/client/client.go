@@ -70,11 +70,14 @@ type Job struct {
 	Error      *Error     `json:"error,omitempty"`
 	Artifacts  []Artifact `json:"artifacts"`
 	// Result is a small inline answer from an HTTP service, if it gives one.
-	Result     json.RawMessage `json:"result,omitempty"`
-	Events     []Event         `json:"events,omitempty"`
-	CreatedAt  string          `json:"created_at"`
-	StartedAt  string          `json:"started_at,omitempty"`
-	FinishedAt string          `json:"finished_at,omitempty"`
+	Result json.RawMessage `json:"result,omitempty"`
+	// ExitCode is the command's exit code, for a job that ran one.
+	ExitCode   *int    `json:"exit_code,omitempty"`
+	Output     string  `json:"output,omitempty"`
+	Events     []Event `json:"events,omitempty"`
+	CreatedAt  string  `json:"created_at"`
+	StartedAt  string  `json:"started_at,omitempty"`
+	FinishedAt string  `json:"finished_at,omitempty"`
 }
 
 // Event is a stored fact about a job.

@@ -27,6 +27,7 @@ const (
 	reasonProgramMissing = "the program can't be run"
 	reasonServiceDown    = "the service isn't answering"
 	reasonCheckFailed    = "its health check failed"
+	reasonFolderMissing  = "its working folder is missing"
 )
 
 // CheckConfig says how a worker verifies that a capability really works. With no
@@ -150,6 +151,9 @@ func checkCapability(ctx context.Context, client *http.Client, c *Capability) (r
 		if err := programRunnable(c.executable, runtime.GOOS); err != nil {
 			return reasonProgramMissing, err.Error()
 		}
+		if err := c.checkWorkingDir(); err != nil {
+			return reasonFolderMissing, err.Error()
+		}
 	}
 	return "", ""
 }
@@ -161,7 +165,7 @@ func runCheckCommand(ctx context.Context, c *Capability) error {
 	cmd := exec.Command(c.Check.executable, c.Check.Command[1:]...)
 	cmd.Args = c.Check.Command
 	cmd.Dir = dir
-	cmd.Env = buildChildEnv(runtime.GOOS, os.LookupEnv, c.Env, dir)
+	cmd.Env = buildChildEnv(runtime.GOOS, os.LookupEnv, c.staticEnv(), dir)
 	setProcessGroup(cmd)
 	if err := cmd.Start(); err != nil {
 		return err
@@ -196,16 +200,28 @@ func programRunnable(path, goos string) error {
 	return nil
 }
 
-// startChecks verifies every capability once, so the first connection already
-// reports the truth, then keeps checking in the background until ctx ends.
-func (w *Worker) startChecks(ctx context.Context) {
-	for i := range w.manifest.Capabilities {
-		c := &w.manifest.Capabilities[i]
+// restartChecks verifies every tool once, so the next hello reports the truth,
+// then keeps checking in the background until ctx ends or the tools change.
+func (w *Worker) restartChecks(parent context.Context) {
+	w.checksMu.Lock()
+	defer w.checksMu.Unlock()
+	if w.stopChecks != nil {
+		w.stopChecks()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	w.stopChecks = cancel
+
+	m := w.config()
+	for i := range m.Capabilities {
+		c := &m.Capabilities[i]
 		w.log.Info("capability offered", "capability", c.Name, "adapter", c.Adapter, "check_every", c.Check.every.String())
 	}
+	if len(m.Capabilities) == 0 {
+		w.log.Warn("this worker offers no tools yet", "tools_dir", m.ToolsPath())
+	}
 	var first sync.WaitGroup
-	for i := range w.manifest.Capabilities {
-		c := &w.manifest.Capabilities[i]
+	for i := range m.Capabilities {
+		c := &m.Capabilities[i]
 		first.Add(1)
 		go func() {
 			w.recordCheck(ctx, c)
@@ -223,6 +239,16 @@ func (w *Worker) startChecks(ctx context.Context) {
 		}()
 	}
 	first.Wait()
+
+	// A tool that's gone has nothing to report.
+	w.mu.Lock()
+	for name := range w.notReady {
+		if m.byName[name] == nil {
+			delete(w.notReady, name)
+			w.statusChanged = true
+		}
+	}
+	w.mu.Unlock()
 }
 
 func (w *Worker) recordCheck(ctx context.Context, c *Capability) {
@@ -256,7 +282,7 @@ func (w *Worker) recordCheck(ctx context.Context, c *Capability) {
 // helloCapabilities describes every capability as of this moment. The hello
 // carries the full picture, so nothing needs resending for this connection.
 func (w *Worker) helloCapabilities() []protocol.Capability {
-	declared := w.manifest.protocolCapabilities()
+	declared := w.config().protocolCapabilities()
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.statusChanged = false

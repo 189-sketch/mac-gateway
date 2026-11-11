@@ -124,7 +124,9 @@ func keyAllows(key *APIKey, capability string) bool {
 // --- Agent API ---
 
 type capabilityView struct {
-	Name        string          `json:"name"`
+	Name string `json:"name"`
+	// Description comes from the first machine that gives one.
+	Description string          `json:"description,omitempty"`
 	InputSchema json.RawMessage `json:"input_schema"`
 	InputFiles  []string        `json:"input_files"`
 	Nodes       []nodeOffer     `json:"nodes"`
@@ -167,6 +169,9 @@ func (g *Gateway) handleCapabilities(w http.ResponseWriter, r *http.Request, key
 			views = append(views, capabilityView{Name: row.Name, InputSchema: json.RawMessage(row.InputSchema), InputFiles: orEmptySlice(row.InputFiles), Nodes: []nodeOffer{}})
 		}
 		view := &views[len(views)-1]
+		if view.Description == "" {
+			view.Description = row.Description
+		}
 		isOnline := online.ids[row.NodeID]
 		ready := isOnline && row.NotReady == ""
 		view.Nodes = append(view.Nodes, nodeOffer{Name: row.NodeName, Online: isOnline, Ready: ready, NotReady: row.NotReady, Labels: row.Labels,

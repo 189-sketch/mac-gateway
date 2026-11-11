@@ -37,18 +37,41 @@ var (
 // Manifest is the worker's local configuration. It is the only place that says
 // what this machine will run: the gateway can't add to it or change it.
 type Manifest struct {
-	GatewayURL        string       `yaml:"gateway_url"`
-	TokenFile         string       `yaml:"token_file"`
-	StateDir          string       `yaml:"state_dir"`
-	AllowInsecureHTTP bool         `yaml:"allow_insecure_http"`
-	UploadRetryWindow string       `yaml:"upload_retry_window"`
-	LogLevel          string       `yaml:"log_level"`
-	Node              NodeConfig   `yaml:"node"`
-	Capabilities      []Capability `yaml:"capabilities"`
+	GatewayURL        string     `yaml:"gateway_url"`
+	TokenFile         string     `yaml:"token_file"`
+	StateDir          string     `yaml:"state_dir"`
+	AllowInsecureHTTP bool       `yaml:"allow_insecure_http"`
+	UploadRetryWindow string     `yaml:"upload_retry_window"`
+	LogLevel          string     `yaml:"log_level"`
+	Node              NodeConfig `yaml:"node"`
+	// Capabilities and Tools are two names for the same list, and may be combined.
+	Capabilities []Capability `yaml:"capabilities"`
+	Tools        []Capability `yaml:"tools"`
+	// ToolsDir holds one tool per file, such as those made by `fleet-worker tools
+	// new`. It defaults to the tools folder next to this file.
+	ToolsDir string `yaml:"tools_dir"`
+
+	// ToolErrors lists tool files that were skipped because they aren't valid.
+	ToolErrors []ToolFileError `yaml:"-"`
+	// Disabled names the tools set to enabled: false.
+	Disabled []string `yaml:"-"`
 
 	uploadWindow time.Duration
 	byName       map[string]*Capability
+	toolsPath    string
 }
+
+// ToolFileError is a tool file that couldn't be used. The worker runs without it,
+// so one bad file doesn't stop the machine's other tools.
+type ToolFileError struct {
+	Path string
+	Err  error
+}
+
+func (e ToolFileError) Error() string { return fmt.Sprintf("%s: %v", e.Path, e.Err) }
+
+// ToolsPath is the folder tool files are read from.
+func (m *Manifest) ToolsPath() string { return m.toolsPath }
 
 // NodeConfig describes this machine.
 type NodeConfig struct {
@@ -64,20 +87,29 @@ type ProgressConfig struct {
 	Regex string `yaml:"regex"`
 }
 
-// Capability is one service this machine offers.
+// Capability is one tool this machine offers.
 type Capability struct {
-	Name        string            `yaml:"name"`
-	Adapter     string            `yaml:"adapter"`
-	Command     []string          `yaml:"command"`
-	Stdin       string            `yaml:"stdin"`
-	Env         map[string]string `yaml:"env"`
-	InputSchema map[string]any    `yaml:"input_schema"`
-	InputFiles  []string          `yaml:"input_files"`
-	Outputs     map[string]string `yaml:"outputs"`
-	Progress    *ProgressConfig   `yaml:"progress"`
-	Requires    map[string]int    `yaml:"requires"`
-	Timeout     string            `yaml:"timeout"`
-	RetryIfLost bool              `yaml:"retry_if_lost"`
+	Name        string `yaml:"name"`
+	Description string `yaml:"description,omitempty"`
+	// Enabled false keeps a tool in its file without offering it.
+	Enabled     *bool                 `yaml:"enabled,omitempty"`
+	Adapter     string                `yaml:"adapter"`
+	Command     []string              `yaml:"command,omitempty"`
+	Args        []ArgSpec             `yaml:"args,omitempty"`
+	Stdin       string                `yaml:"stdin,omitempty"`
+	Cwd         string                `yaml:"cwd,omitempty"`
+	Env         map[string]string     `yaml:"env,omitempty"`
+	InputSchema map[string]any        `yaml:"input_schema"`
+	InputFiles  []string              `yaml:"input_files,omitempty"`
+	Outputs     map[string]OutputSpec `yaml:"outputs,omitempty"`
+	Result      *ResultConfig         `yaml:"result,omitempty"`
+	// SuccessExitCodes lists the exit codes that mean the job worked. It defaults
+	// to 0 alone. xcodebuild, for one, exits with 65 when tests fail.
+	SuccessExitCodes []int           `yaml:"success_exit_codes,omitempty"`
+	Progress         *ProgressConfig `yaml:"progress,omitempty"`
+	Requires         map[string]int  `yaml:"requires,omitempty"`
+	Timeout          string          `yaml:"timeout,omitempty"`
+	RetryIfLost      bool            `yaml:"retry_if_lost,omitempty"`
 
 	// The http and http_async adapters use these instead of Command.
 	Request     *RequestTemplate `yaml:"request"`
@@ -87,12 +119,15 @@ type Capability struct {
 	Check       *CheckConfig     `yaml:"check"`
 	Test        *TestConfig      `yaml:"test"`
 
-	testInput  []byte
-	timeout    time.Duration
-	schemaJSON []byte
-	compiled   *jsonschema.Schema
-	progressRE *regexp.Regexp
-	executable string
+	testInput    []byte
+	fields       schemaFields
+	cwd          string
+	successCodes []int
+	timeout      time.Duration
+	schemaJSON   []byte
+	compiled     *jsonschema.Schema
+	progressRE   *regexp.Regexp
+	executable   string
 }
 
 // LoadManifest reads and validates a manifest. Problems are reported at startup
@@ -108,11 +143,16 @@ func LoadManifest(path string) (*Manifest, error) {
 	if err := decoder.Decode(&m); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	m.Capabilities = append(m.Capabilities, m.Tools...)
+	m.Tools = nil
 	if err := m.validate(filepath.Dir(path)); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &m, nil
 }
+
+// isEnabled is false only for a tool that says enabled: false.
+func (c *Capability) isEnabled() bool { return c.Enabled == nil || *c.Enabled }
 
 func (m *Manifest) validate(baseDir string) error {
 	if m.GatewayURL == "" {
@@ -161,21 +201,95 @@ func (m *Manifest) validate(baseDir string) error {
 		}
 	}
 
-	if len(m.Capabilities) == 0 {
-		return errors.New("at least one capability is required")
-	}
+	// Tools in this file must all be valid, like the rest of it.
+	enabled := make([]Capability, 0, len(m.Capabilities))
 	m.byName = make(map[string]*Capability, len(m.Capabilities))
-	for i := range m.Capabilities {
-		c := &m.Capabilities[i]
-		if err := c.validate(m.Node.Resources); err != nil {
+	for _, c := range m.Capabilities {
+		if !c.isEnabled() {
+			m.Disabled = append(m.Disabled, c.Name)
+			continue
+		}
+		if err := c.validate(baseDir, m.Node.Resources); err != nil {
 			return fmt.Errorf("capability %q: %w", c.Name, err)
 		}
 		if m.byName[c.Name] != nil {
 			return fmt.Errorf("capability %q is declared twice", c.Name)
 		}
-		m.byName[c.Name] = c
+		enabled = append(enabled, c)
+		m.byName[c.Name] = &enabled[len(enabled)-1]
+	}
+
+	m.toolsPath = resolvePath(baseDir, "tools")
+	if m.ToolsDir != "" {
+		m.toolsPath = resolvePath(baseDir, m.ToolsDir)
+	}
+	files, err := m.loadToolFiles(m.Node.Resources)
+	if err != nil {
+		return fmt.Errorf("tools_dir: %w", err)
+	}
+	enabled = append(enabled, files...)
+
+	// byName must point into the final slice, which appending may have moved.
+	m.Capabilities = enabled
+	m.byName = make(map[string]*Capability, len(enabled))
+	for i := range m.Capabilities {
+		m.byName[m.Capabilities[i].Name] = &m.Capabilities[i]
 	}
 	return nil
+}
+
+// loadToolFiles reads one tool from each .yaml or .yml file in the tools folder.
+// A file that isn't valid is skipped and listed in ToolErrors.
+func (m *Manifest) loadToolFiles(resources map[string]int) ([]Capability, error) {
+	entries, err := os.ReadDir(m.toolsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []Capability
+	for _, entry := range entries {
+		name := entry.Name()
+		ext := filepath.Ext(name)
+		if entry.IsDir() || strings.HasPrefix(name, ".") || (ext != ".yaml" && ext != ".yml") {
+			continue
+		}
+		path := filepath.Join(m.toolsPath, name)
+		c, err := readToolFile(path)
+		if err == nil && !c.isEnabled() {
+			m.Disabled = append(m.Disabled, c.Name)
+			continue
+		}
+		if err == nil {
+			err = c.validate(m.toolsPath, resources)
+		}
+		if err == nil && m.byName[c.Name] != nil {
+			err = fmt.Errorf("a tool named %q is already declared", c.Name)
+		}
+		if err != nil {
+			m.ToolErrors = append(m.ToolErrors, ToolFileError{Path: path, Err: err})
+			continue
+		}
+		out = append(out, *c)
+		m.byName[c.Name] = &out[len(out)-1]
+	}
+	return out, nil
+}
+
+// readToolFile decodes one tool, refusing fields it doesn't know.
+func readToolFile(path string) (*Capability, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(raw))
+	decoder.KnownFields(true)
+	var c Capability
+	if err := decoder.Decode(&c); err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+	return &c, nil
 }
 
 // TestConfig says how to show a capability working from start to finish, when
@@ -242,7 +356,7 @@ func resolvePath(baseDir, path string) string {
 	return filepath.Join(baseDir, path)
 }
 
-func (c *Capability) validate(resources map[string]int) error {
+func (c *Capability) validate(baseDir string, resources map[string]int) error {
 	if !capabilityNameRE.MatchString(c.Name) {
 		return errors.New("name must be lowercase letters, digits, '.', '_' or '-'")
 	}
@@ -284,14 +398,22 @@ func (c *Capability) validate(resources map[string]int) error {
 		return fmt.Errorf("input_schema: %w", err)
 	}
 
-	for name, rel := range c.Outputs {
+	if err := c.validateDeclaration(baseDir, seenFiles); err != nil {
+		return err
+	}
+
+	for name, out := range c.Outputs {
 		if !outputNameRE.MatchString(name) {
 			return fmt.Errorf("output name %q is invalid", name)
 		}
+		rel := out.Path
 		if !filepath.IsLocal(rel) {
 			return fmt.Errorf("output %q must be a relative path inside the job's working directory", name)
 		}
-		if !outputNameRE.MatchString(strings.TrimPrefix(filepath.Ext(rel), ".")) && filepath.Ext(rel) != "" {
+		if out.Archive != "" && out.Archive != archiveZip {
+			return fmt.Errorf("output %q: archive %q must be zip", name, out.Archive)
+		}
+		if out.Archive == "" && !outputNameRE.MatchString(strings.TrimPrefix(filepath.Ext(rel), ".")) && filepath.Ext(rel) != "" {
 			return fmt.Errorf("output %q has an invalid file extension", name)
 		}
 	}
@@ -377,6 +499,9 @@ func checkPlaceholders(tpl string, files map[string]bool) error {
 			}
 			continue
 		}
+		if match[1] == "item" {
+			return errors.New("{{item}} can only be used in an args item with each")
+		}
 		if match[1] != "workdir" && !inputVarRE.MatchString(match[1]) {
 			return fmt.Errorf("unknown placeholder %q (use {{workdir}}, {{input.field}} or {{files.field}})", match[0])
 		}
@@ -391,6 +516,12 @@ type templateVars struct {
 	files   map[string]string // Input file field to its local path.
 	// remoteID is a service's own ID for this job, once http_async has one.
 	remoteID string
+	// item is the current list item in an args item that uses each.
+	item    string
+	hasItem bool
+	// allowEnv lets {{env.NAME}} read this worker's environment, which only env
+	// values may do.
+	allowEnv bool
 }
 
 // render fills a template in one pass, so placeholder syntax inside a value is
@@ -404,6 +535,17 @@ func render(tpl string, vars templateVars) (string, error) {
 		}
 		if name == remoteIDVar {
 			return vars.remoteID
+		}
+		if name == "item" && vars.hasItem {
+			return vars.item
+		}
+		if sub := envVarRE.FindStringSubmatch(name); sub != nil && vars.allowEnv {
+			value, ok := os.LookupEnv(sub[1])
+			if (!ok || sub[1] == "FLEET_NODE_TOKEN") && firstErr == nil {
+				firstErr = fmt.Errorf("environment variable %s isn't set", sub[1])
+				return ""
+			}
+			return value
 		}
 		if field, isFile := strings.CutPrefix(name, "files."); isFile {
 			path, ok := vars.files[field]
@@ -443,18 +585,28 @@ func inputText(field string, input map[string]any) (string, error) {
 func renderCommand(args []string, vars templateVars) ([]string, error) {
 	out := make([]string, 0, len(args))
 	for _, arg := range args {
-		rendered, err := render(arg, vars)
+		rendered, err := renderArg(arg, vars)
 		if err != nil {
 			return nil, err
-		}
-		if strings.HasPrefix(rendered, "-") {
-			if loc := placeholderRE.FindStringSubmatchIndex(arg); loc != nil && loc[0] == 0 && strings.HasPrefix(arg[loc[2]:loc[3]], "input.") {
-				return nil, fmt.Errorf("the value for argument %q must not start with '-'", arg)
-			}
 		}
 		out = append(out, rendered)
 	}
 	return out, nil
+}
+
+func renderArg(arg string, vars templateVars) (string, error) {
+	rendered, err := render(arg, vars)
+	if err != nil {
+		return "", err
+	}
+	if strings.HasPrefix(rendered, "-") {
+		if loc := placeholderRE.FindStringSubmatchIndex(arg); loc != nil && loc[0] == 0 {
+			if name := arg[loc[2]:loc[3]]; strings.HasPrefix(name, "input.") || name == "item" {
+				return "", fmt.Errorf("the value for argument %q must not start with '-'", arg)
+			}
+		}
+	}
+	return rendered, nil
 }
 
 // protocolCapabilities is what the worker advertises in its hello message.
@@ -464,6 +616,7 @@ func (m *Manifest) protocolCapabilities() []protocol.Capability {
 		c := &m.Capabilities[i]
 		out = append(out, protocol.Capability{
 			Name:           c.Name,
+			Description:    c.Description,
 			InputSchema:    c.schemaJSON,
 			Requires:       c.Requires,
 			TimeoutSeconds: int64(c.timeout.Seconds()),

@@ -10,6 +10,10 @@ state_dir: state
 # also has each command's output, which can include what a job was given.
 # log_level: info
 
+# Tools can also go in a tools folder next to this file, one per .yaml file. Start
+# one from a template with: fleet-worker tools new NAME --template TEMPLATE
+# Changes to either take effect without a restart.
+
 node:
   name: mac-mini-1 # Must match the name given to `fleet-gateway node add`.
   max_jobs: 2

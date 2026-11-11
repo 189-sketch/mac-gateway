@@ -92,6 +92,14 @@ func (c *Capability) rejectFields() error {
 			return fmt.Errorf("env doesn't apply to adapter %s", c.Adapter)
 		case c.Progress != nil:
 			return fmt.Errorf("progress doesn't apply to adapter %s; http_async reports progress through poll", c.Adapter)
+		case len(c.Args) > 0:
+			return fmt.Errorf("args doesn't apply to adapter %s", c.Adapter)
+		case c.Cwd != "":
+			return fmt.Errorf("cwd doesn't apply to adapter %s", c.Adapter)
+		case c.Result != nil:
+			return fmt.Errorf("result doesn't apply to adapter %s; use response", c.Adapter)
+		case len(c.SuccessExitCodes) > 0:
+			return fmt.Errorf("success_exit_codes doesn't apply to adapter %s", c.Adapter)
 		}
 		return nil
 	}
@@ -406,8 +414,8 @@ func (c *Capability) validateResponse() error {
 	}
 	if r.File != "" {
 		delivered := false
-		for _, rel := range c.Outputs {
-			delivered = delivered || rel == r.File
+		for _, out := range c.Outputs {
+			delivered = delivered || out.Path == r.File
 		}
 		if !delivered {
 			return fmt.Errorf("response.file %q must also be listed in outputs, or it would never be delivered", r.File)

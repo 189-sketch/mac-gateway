@@ -1,0 +1,35 @@
+# template: Python program
+# about: Run a Python script with its own virtual environment, and return its output or files.
+#
+# Using the interpreter inside the project's virtual environment means its
+# packages are found, with no activate step. On Windows it's .venv\Scripts\python.exe.
+# Fill in each TODO, then set enabled: true. The worker picks up the change by itself.
+name: TOOL_NAME
+enabled: false
+description: TODO Say what this does and when to use it. Agents read this to pick a tool.
+adapter: cli
+command: [TODO/path/to/project/.venv/bin/python, TODO/path/to/project/script.py]
+args:
+  - { flag: --text, value: "{{input.text}}" }
+  - { flag: --voice, value: "{{input.voice}}" } # Only when given
+  # The script writes its result here. {{workdir}} is a fresh folder for each job.
+  - { flag: --out, value: "{{workdir}}/out.wav" }
+cwd: TODO/path/to/project # The script runs here, so relative paths in it work.
+env:
+  PYTHONUNBUFFERED: "1" # Print progress as it happens, rather than at the end
+input_schema:
+  type: object
+  required: [text]
+  additionalProperties: false
+  properties:
+    text: { type: string, minLength: 1 }
+    voice: { type: string }
+# Return the file the script wrote. If it prints JSON instead, remove outputs and
+# use: result: { from: stdout, format: json }
+outputs:
+  audio: out.wav
+# Turns lines such as "42%" into progress the caller can see.
+progress: { regex: "(?P<percent>[0-9]+(\\.[0-9]+)?)%" }
+timeout: 30m
+test:
+  input: { text: TODO input that is safe to run again and again }

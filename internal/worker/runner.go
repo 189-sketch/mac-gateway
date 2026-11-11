@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,9 +18,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"mactunnel/internal/protocol"
@@ -28,9 +31,13 @@ import (
 )
 
 const (
-	termGrace          = 5 * time.Second
-	progressInterval   = time.Second
-	logTailLines       = 20
+	termGrace        = 5 * time.Second
+	progressInterval = time.Second
+	logTailLines     = 20
+	// maxOutputBytes is how much of a command's output a job returns. With the
+	// largest result, it still fits the gateway's 2 MiB message limit even if
+	// every byte needs escaping.
+	maxOutputBytes     = 64 << 10
 	maxLineBytes       = 32 << 10
 	maxTransferBackoff = time.Minute
 )
@@ -42,7 +49,7 @@ func (w *Worker) run(ctx context.Context, a *attempt, assign protocol.Assign) {
 	defer close(a.done)
 
 	rawInput := []byte(assign.Input)
-	capability := w.manifest.byName[assign.Capability]
+	capability := w.config().byName[assign.Capability]
 	if capability == nil {
 		w.fail(a, protocol.CodeUnknownCapability, "this node does not offer "+assign.Capability)
 		return
@@ -59,6 +66,7 @@ func (w *Worker) run(ctx context.Context, a *attempt, assign protocol.Assign) {
 		w.fail(a, protocol.CodeInvalidInput, "input must be a JSON object")
 		return
 	}
+	capability.applyDefaults(input)
 
 	work := filepath.Join(a.dir, workDir)
 	files, failure := w.fetchInputs(ctx, a, capability, assign.Files, work)
@@ -71,38 +79,59 @@ func (w *Worker) run(ctx context.Context, a *attempt, assign protocol.Assign) {
 	}
 	vars := templateVars{workdir: work, input: input, files: files}
 	var result json.RawMessage
+	var exitCode *int
 	var outcome *protocol.Failure
 	if capability.isService() {
 		result, outcome = w.callService(ctx, a, capability, vars, work)
 	} else {
-		outcome = w.runCommand(ctx, a, capability, vars, work)
+		result, exitCode, outcome = w.runCommand(ctx, a, capability, vars, work)
 	}
 	if outcome != nil {
 		if ctx.Err() == nil || outcome.Code == protocol.CodeTimedOut {
-			w.fail(a, outcome.Code, outcome.Message)
+			w.failWith(a, *outcome)
 		}
 		return
 	}
-	w.deliverOutputs(ctx, a, capability, work, result)
+	w.deliverOutputs(ctx, a, capability, work, result, exitCode)
 }
 
-func (w *Worker) runCommand(ctx context.Context, a *attempt, c *Capability, vars templateVars, work string) *protocol.Failure {
+func (w *Worker) runCommand(ctx context.Context, a *attempt, c *Capability, vars templateVars, work string) (json.RawMessage, *int, *protocol.Failure) {
+	invalid := func(err error) (json.RawMessage, *int, *protocol.Failure) {
+		return nil, nil, &protocol.Failure{Code: protocol.CodeInvalidInput, Message: err.Error()}
+	}
 	args, err := renderCommand(c.Command[1:], vars)
 	if err != nil {
-		return &protocol.Failure{Code: protocol.CodeInvalidInput, Message: err.Error()}
+		return invalid(err)
 	}
+	extra, err := renderArgs(c.Args, vars)
+	if err != nil {
+		return invalid(err)
+	}
+	args = append(args, extra...)
 	stdin, err := render(c.Stdin, vars)
 	if err != nil {
-		return &protocol.Failure{Code: protocol.CodeInvalidInput, Message: err.Error()}
+		return invalid(err)
 	}
-	return w.execute(ctx, a, c, args, stdin, work)
+	env, err := renderEnv(c.Env, vars)
+	if err != nil {
+		return nil, nil, &protocol.Failure{Code: protocol.CodeStartFailed, Message: err.Error()}
+	}
+	if err := c.checkWorkingDir(); err != nil {
+		w.log.Warn("the tool's working folder can't be used", "capability", c.Name, "cwd", c.cwd, "error", err)
+		return nil, nil, &protocol.Failure{Code: protocol.CodeStartFailed, Message: "the tool's working folder is missing"}
+	}
+	return w.execute(ctx, a, c, args, stdin, env, work)
 }
 
-func (w *Worker) execute(ctx context.Context, a *attempt, c *Capability, args []string, stdin, work string) *protocol.Failure {
+func (w *Worker) execute(ctx context.Context, a *attempt, c *Capability, args []string, stdin string, env map[string]string, work string) (json.RawMessage, *int, *protocol.Failure) {
+	fail := func(code, message string) (json.RawMessage, *int, *protocol.Failure) {
+		return nil, nil, &protocol.Failure{Code: code, Message: message}
+	}
+	tail := &logTail{}
 	cmd := exec.Command(c.executable, args...)
 	cmd.Args = append([]string{c.Command[0]}, args...)
-	cmd.Dir = work
-	cmd.Env = childEnv(c, work)
+	cmd.Dir = c.workingDir(work)
+	cmd.Env = buildChildEnv(runtime.GOOS, os.LookupEnv, env, work)
 	if c.Stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -111,29 +140,55 @@ func (w *Worker) execute(ctx context.Context, a *attempt, c *Capability, args []
 
 	// One pipe for both streams keeps their lines in order. With *os.File as the
 	// destination, Wait returns when the process exits even if a stray child
-	// still holds the pipe open.
+	// still holds the pipe open. A result read from stdout gets a pipe of its own.
 	reader, writer, err := os.Pipe()
 	if err != nil {
-		return &protocol.Failure{Code: protocol.CodeStartFailed, Message: err.Error()}
+		return fail(protocol.CodeStartFailed, err.Error())
 	}
 	defer reader.Close()
 	cmd.Stdout, cmd.Stderr = writer, writer
-
-	if err := cmd.Start(); err != nil {
-		writer.Close()
-		return &protocol.Failure{Code: protocol.CodeStartFailed, Message: err.Error()}
+	var stdoutReader, stdoutWriter *os.File
+	var captured *outputCapture
+	if c.Result != nil && c.Result.From == resultFromStdout {
+		if stdoutReader, stdoutWriter, err = os.Pipe(); err != nil {
+			writer.Close()
+			return fail(protocol.CodeStartFailed, err.Error())
+		}
+		defer stdoutReader.Close()
+		cmd.Stdout = stdoutWriter
+		captured = &outputCapture{limit: maxResultBytes, keepEnd: c.Result.Format == formatText}
 	}
+
+	err = cmd.Start()
 	writer.Close()
+	if stdoutWriter != nil {
+		stdoutWriter.Close()
+	}
+	if err != nil {
+		return fail(protocol.CodeStartFailed, err.Error())
+	}
 	pid := cmd.Process.Pid
 	groupStarted(cmd)
 	w.recordProcess(a, pid)
 	w.emit(a, protocol.EventStarted, nil)
 
-	tail := &logTail{}
+	var readers sync.WaitGroup
+	readers.Add(1)
+	go func() {
+		defer readers.Done()
+		w.readOutput(a, c, reader, tail)
+	}()
+	if stdoutReader != nil {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			w.readOutput(a, c, io.TeeReader(stdoutReader, captured), tail)
+		}()
+	}
 	readerDone := make(chan struct{})
 	go func() {
-		defer close(readerDone)
-		w.readOutput(a, c, reader, tail)
+		readers.Wait()
+		close(readerDone)
 	}()
 
 	waited := make(chan error, 1)
@@ -161,15 +216,40 @@ func (w *Worker) execute(ctx context.Context, a *attempt, c *Capability, args []
 	case <-time.After(2 * time.Second):
 	}
 
+	// From here on, every outcome carries what the command printed.
+	output := tail.output()
 	switch {
 	case timedOut:
-		return &protocol.Failure{Code: protocol.CodeTimedOut, Message: fmt.Sprintf("the command ran longer than its %s timeout", c.timeout)}
+		return nil, nil, &protocol.Failure{Code: protocol.CodeTimedOut, Message: fmt.Sprintf("the command ran longer than its %s timeout", c.timeout), Output: output}
 	case ctx.Err() != nil:
-		return &protocol.Failure{Code: protocol.CodeCommandFailed, Message: "aborted"}
-	case waitErr != nil:
-		return &protocol.Failure{Code: protocol.CodeCommandFailed, Message: fmt.Sprintf("%v\n%s", waitErr, tail.String())}
+		return fail(protocol.CodeCommandFailed, "aborted")
 	}
-	return nil
+	var exitErr *exec.ExitError
+	if waitErr != nil && !errors.As(waitErr, &exitErr) {
+		return nil, nil, &protocol.Failure{Code: protocol.CodeCommandFailed, Message: fmt.Sprintf("%v\n%s", waitErr, tail.String()), Output: output}
+	}
+	code := cmd.ProcessState.ExitCode()
+	if !slices.Contains(c.successCodes, code) {
+		message := fmt.Sprintf("exit status %d", code)
+		if code < 0 {
+			message = cmd.ProcessState.String()
+		}
+		return nil, &code, &protocol.Failure{Code: protocol.CodeCommandFailed, Message: message + "\n" + tail.String(), Output: output, ExitCode: &code}
+	}
+	var result json.RawMessage
+	var failure *protocol.Failure
+	switch {
+	case c.Result == nil:
+	case captured != nil:
+		result, failure = commandResult(c.Result, captured.data, captured.cut())
+	default:
+		result, failure = fileResult(c.Result, work)
+	}
+	if failure != nil {
+		failure.Output, failure.ExitCode = output, &code
+	}
+	a.output = output
+	return result, &code, failure
 }
 
 // stopGroup asks the process group to exit, then forces it after a grace period.
@@ -186,13 +266,8 @@ func stopGroup(pid int, waited <-chan error) error {
 	}
 }
 
-// childEnv deliberately starts empty, so the worker's own environment, which may
-// hold the node token, isn't inherited by commands.
-func childEnv(c *Capability, work string) []string {
-	return buildChildEnv(runtime.GOOS, os.LookupEnv, c.Env, work)
-}
-
-// buildChildEnv picks what a command gets. Windows programs can fail in odd ways
+// buildChildEnv deliberately starts empty, so the worker's own environment, which
+// may hold the node token, isn't inherited by commands. It picks what a command gets. Windows programs can fail in odd ways
 // without its system variables: for one, networking needs SystemRoot.
 func buildChildEnv(goos string, lookup func(string) (string, bool), extra map[string]string, work string) []string {
 	inherit := []string{"PATH", "HOME", "LANG", "LC_ALL"}
@@ -217,11 +292,26 @@ func buildChildEnv(goos string, lookup func(string) (string, bool), extra map[st
 	return out
 }
 
+// logTail keeps what a command printed: the last few lines for an error message,
+// and the last maxOutputBytes for the job's output. Two readers can add to it.
 type logTail struct {
-	lines []string
+	mu        sync.Mutex
+	lines     []string
+	kept      []string
+	keptBytes int
+	cut       bool
 }
 
 func (t *logTail) add(line string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.kept = append(t.kept, line)
+	t.keptBytes += len(line) + 1
+	for t.keptBytes > maxOutputBytes && len(t.kept) > 1 {
+		t.keptBytes -= len(t.kept[0]) + 1
+		t.kept = t.kept[1:]
+		t.cut = true
+	}
 	if len(line) > 500 {
 		line = line[:500]
 	}
@@ -231,7 +321,26 @@ func (t *logTail) add(line string) {
 	}
 }
 
-func (t *logTail) String() string { return strings.Join(t.lines, "\n") }
+// output is everything kept, marked if the start was cut.
+func (t *logTail) output() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	text := strings.Join(t.kept, "\n")
+	if len(text) > maxOutputBytes {
+		text = text[len(text)-maxOutputBytes:]
+		t.cut = true
+	}
+	if t.cut {
+		text = cutNote + text
+	}
+	return strings.ToValidUTF8(text, "\uFFFD")
+}
+
+func (t *logTail) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return strings.Join(t.lines, "\n")
+}
 
 // readOutput drains command output, which must never stop or the command would
 // block on a full pipe.
@@ -299,7 +408,7 @@ func parseProgress(c *Capability, line string) (protocol.Progress, bool) {
 
 // deliverOutputs uploads every declared output, then reports completion. The
 // completed event is sent only after the gateway has the files.
-func (w *Worker) deliverOutputs(ctx context.Context, a *attempt, c *Capability, work string, result json.RawMessage) {
+func (w *Worker) deliverOutputs(ctx context.Context, a *attempt, c *Capability, work string, result json.RawMessage, exitCode *int) {
 	root, err := os.OpenRoot(work)
 	if err != nil {
 		w.fail(a, protocol.CodeOutputMissing, err.Error())
@@ -315,8 +424,20 @@ func (w *Worker) deliverOutputs(ctx context.Context, a *attempt, c *Capability, 
 
 	refs := make([]protocol.ArtifactRef, 0, len(names))
 	for _, name := range names {
-		rel := c.Outputs[name]
-		ref, err := inspectOutput(root, rel, name+filepath.Ext(rel))
+		out := c.Outputs[name]
+		if _, err := root.Lstat(out.Path); errors.Is(err, fs.ErrNotExist) && out.Optional {
+			w.log.Debug("optional output wasn't made", "attempt", a.meta.AttemptID, "output", name)
+			continue
+		}
+		from, rel := root, out.Path
+		if out.Archive == archiveZip {
+			if from, rel, err = archiveOutput(root, out.Path, filepath.Join(a.dir, archivesDir), name); err != nil {
+				w.fail(a, protocol.CodeOutputMissing, fmt.Sprintf("output %q: %v", name, err))
+				return
+			}
+			defer from.Close()
+		}
+		ref, err := inspectOutput(from, rel, out.artifactName(name))
 		if err != nil {
 			w.fail(a, protocol.CodeOutputMissing, fmt.Sprintf("output %q: %v", name, err))
 			return
@@ -324,7 +445,7 @@ func (w *Worker) deliverOutputs(ctx context.Context, a *attempt, c *Capability, 
 		w.log.Info("uploading result", "attempt", a.meta.AttemptID, "file", ref.Name, "bytes", ref.Size)
 		w.emit(a, protocol.EventProgress, protocol.Progress{Stage: "uploading", Message: ref.Name})
 		err = w.retryTransfer(ctx, a, ref.Name, func() error {
-			return w.uploadOnce(ctx, a, root, rel, ref)
+			return w.uploadOnce(ctx, a, from, rel, ref)
 		})
 		if err != nil {
 			if !errors.Is(err, errAttemptFenced) && ctx.Err() == nil {
@@ -335,7 +456,7 @@ func (w *Worker) deliverOutputs(ctx context.Context, a *attempt, c *Capability, 
 		refs = append(refs, ref)
 	}
 	w.log.Info("attempt completed", "job", a.meta.JobID, "attempt", a.meta.AttemptID, "capability", a.meta.Capability, "files", len(refs), "duration", a.elapsed())
-	w.emit(a, protocol.EventCompleted, protocol.Completion{Artifacts: refs, Result: result})
+	w.emit(a, protocol.EventCompleted, protocol.Completion{Artifacts: refs, Result: result, ExitCode: exitCode, Output: a.output})
 }
 
 // inspectOutput hashes an output file. os.Root stops a symlink the command
@@ -344,6 +465,9 @@ func inspectOutput(root *os.Root, rel, artifactName string) (protocol.ArtifactRe
 	info, err := root.Lstat(rel)
 	if err != nil {
 		return protocol.ArtifactRef{}, err
+	}
+	if info.IsDir() {
+		return protocol.ArtifactRef{}, errors.New("is a folder; to return a folder, set archive: zip on this output")
 	}
 	if !info.Mode().IsRegular() {
 		return protocol.ArtifactRef{}, errors.New("not a regular file")
@@ -374,7 +498,7 @@ func (e *transferError) Error() string { return e.message }
 // out the retry window. Home connections drop often, so a transfer may wait out
 // a long outage rather than throw away a finished job's work.
 func (w *Worker) retryTransfer(ctx context.Context, a *attempt, what string, transfer func() error) error {
-	deadline := time.Now().Add(w.manifest.uploadWindow)
+	deadline := time.Now().Add(w.uploadWindow)
 	backoff := time.Second
 	for {
 		err := transfer()
@@ -393,7 +517,7 @@ func (w *Worker) retryTransfer(ctx context.Context, a *attempt, what string, tra
 			return ctx.Err()
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("gave up after %s: %w", w.manifest.uploadWindow, err)
+			return fmt.Errorf("gave up after %s: %w", w.uploadWindow, err)
 		}
 		w.log.Warn("transfer failed, will retry", "attempt", a.meta.AttemptID, "file", what, "error", err)
 		select {
@@ -406,7 +530,7 @@ func (w *Worker) retryTransfer(ctx context.Context, a *attempt, what string, tra
 }
 
 func (w *Worker) artifactURL(a *attempt, name string) string {
-	return fmt.Sprintf("%s/v1/worker/attempts/%s/artifacts/%s", w.manifest.GatewayURL, url.PathEscape(a.meta.AttemptID), url.PathEscape(name))
+	return fmt.Sprintf("%s/v1/worker/attempts/%s/artifacts/%s", w.gatewayURL, url.PathEscape(a.meta.AttemptID), url.PathEscape(name))
 }
 
 func (w *Worker) newUploadRequest(ctx context.Context, method, target string, body io.Reader, ref protocol.ArtifactRef) (*http.Request, error) {
@@ -558,7 +682,7 @@ func (w *Worker) fetchInputs(ctx context.Context, a *attempt, c *Capability, fil
 
 func (w *Worker) downloadOnce(ctx context.Context, a *attempt, f protocol.InputFile, dest string) error {
 	err := transfer.Download(ctx, w.httpClient, transfer.DownloadRequest{
-		URL:    fmt.Sprintf("%s/v1/worker/attempts/%s/files/%s", w.manifest.GatewayURL, url.PathEscape(a.meta.AttemptID), url.PathEscape(f.Field)),
+		URL:    fmt.Sprintf("%s/v1/worker/attempts/%s/files/%s", w.gatewayURL, url.PathEscape(a.meta.AttemptID), url.PathEscape(f.Field)),
 		Token:  w.token,
 		Dest:   dest,
 		Size:   f.Size,

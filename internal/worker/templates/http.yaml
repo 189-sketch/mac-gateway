@@ -1,0 +1,29 @@
+# template: HTTP API
+# about: Call an HTTP endpoint with the parameters as JSON, and return its reply.
+#
+# Only services on this machine (127.0.0.1 or localhost) can be called, unless
+# you add allow_remote: true.
+# Fill in each TODO, then set enabled: true. The worker picks up the change by itself.
+name: TOOL_NAME
+enabled: false
+description: TODO Say what this does and when to use it. Agents read this to pick a tool.
+adapter: http
+request:
+  method: POST
+  url: http://127.0.0.1:TODO_PORT/TODO_PATH
+  # A secret can come from the worker's environment rather than this file:
+  # headers: { Authorization: "Bearer {{env.MY_SERVICE_KEY}}" }
+  json:
+    text: "{{input.text}}"
+response:
+  result: json
+  # result_field: data.answer # To return one field of the reply
+input_schema:
+  type: object
+  required: [text]
+  additionalProperties: false
+  properties:
+    text: { type: string, minLength: 1 }
+timeout: 5m
+test:
+  input: { text: TODO a request that is safe to send again and again }

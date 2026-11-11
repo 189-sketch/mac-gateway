@@ -1,0 +1,31 @@
+# template: Command-line program
+# about: Run a program with the caller's parameters as arguments, and return what it prints.
+#
+# The program runs directly, with no shell. Each item in command and args is one
+# argument, so a parameter can never add options or commands of its own.
+# Fill in each TODO, then set enabled: true. The worker picks up the change by itself.
+name: TOOL_NAME
+enabled: false
+description: TODO Say what this does and when to use it. Agents read this to pick a tool.
+adapter: cli
+command: [TODO/full/path/to/program] # Find it with: which program
+args:
+  # Always passed:
+  - "{{input.target}}"
+  # Passed only when the caller gives a value:
+  - { flag: --format, value: "{{input.format}}" }
+  # Passed only when the caller sets it to true:
+  - { flag: --verbose, when: input.verbose }
+input_schema:
+  type: object
+  required: [target]
+  additionalProperties: false
+  properties:
+    target: { type: string, minLength: 1, description: TODO What to pass to the program }
+    format: { type: string, enum: [text, json] }
+    verbose: { type: boolean }
+# Return what the program prints. Use format: json if it prints JSON.
+result: { from: stdout, format: text }
+timeout: 5m
+test:
+  input: { target: TODO a value that is safe to run again and again }

@@ -1,0 +1,35 @@
+# template: HTTP API with its own job queue
+# about: Submit work to a service that answers with a job ID, follow its progress, then collect the result.
+#
+# For services such as image or video generators that queue work. The worker
+# polls the job, reports its progress, fetches the result and cancels the
+# service's job if the caller cancels.
+# Fill in each TODO, then set enabled: true. The worker picks up the change by itself.
+name: TOOL_NAME
+enabled: false
+description: TODO Say what this does and when to use it. Agents read this to pick a tool.
+adapter: http_async
+request:
+  url: http://127.0.0.1:TODO_PORT/TODO_SUBMIT_PATH
+  json: "{{input}}"
+async:
+  job_id_field: id # Where the submit reply puts the job ID
+  poll:
+    url: http://127.0.0.1:TODO_PORT/TODO_STATUS_PATH/{{remote.id}}
+    every: 2s
+    status_field: state
+    succeeded: [done]
+    failed: [error]
+    percent_field: progress # Remove if the service doesn't report progress
+    error_field: error
+  fetch:
+    url: http://127.0.0.1:TODO_PORT/TODO_RESULT_PATH/{{remote.id}}
+  cancel:
+    method: DELETE
+    url: http://127.0.0.1:TODO_PORT/TODO_STATUS_PATH/{{remote.id}}
+response:
+  file: out.bin # Saves the fetched result, which outputs then returns
+outputs:
+  result: out.bin
+input_schema: { type: object }
+timeout: 1h

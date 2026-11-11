@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -40,6 +41,7 @@ type attempt struct {
 
 	terminalSeq int64
 	started     time.Time // Zero for an attempt recovered after a restart.
+	output      string    // What the command printed, for the completed event.
 	cancel      context.CancelFunc
 	done        chan struct{}
 	aborted     bool
@@ -47,7 +49,18 @@ type attempt struct {
 
 // Worker maintains the gateway connection and runs attempts.
 type Worker struct {
-	manifest   *Manifest
+	// cfg is replaced whole when the tools change, so readers take one snapshot
+	// and never see half of an update. Settings that can't change while running
+	// are copied into the fields below.
+	cfg          atomic.Pointer[Manifest]
+	gatewayURL   string
+	stateDir     string
+	uploadWindow time.Duration
+	reconnect    chan struct{}
+
+	checksMu   sync.Mutex
+	stopChecks context.CancelFunc
+
 	token      string
 	log        *slog.Logger
 	httpClient *http.Client
@@ -68,16 +81,19 @@ type Worker struct {
 
 // New creates a worker and recovers anything left by a previous run.
 func New(manifest *Manifest, token string, log *slog.Logger) (*Worker, error) {
-	if err := os.MkdirAll(attemptsDir(manifest), 0o700); err != nil {
+	if err := os.MkdirAll(attemptsDir(manifest.StateDir), 0o700); err != nil {
 		return nil, fmt.Errorf("create state directory: %w", err)
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = 5 * time.Minute
 	w := &Worker{
-		manifest:   manifest,
-		token:      token,
-		log:        log,
-		httpClient: &http.Client{Transport: transport},
+		gatewayURL:   manifest.GatewayURL,
+		stateDir:     manifest.StateDir,
+		uploadWindow: manifest.uploadWindow,
+		reconnect:    make(chan struct{}, 1),
+		token:        token,
+		log:          log,
+		httpClient:   &http.Client{Transport: transport},
 
 		serviceClient: newServiceClient(),
 		notify:        make(chan struct{}, 1),
@@ -85,19 +101,23 @@ func New(manifest *Manifest, token string, log *slog.Logger) (*Worker, error) {
 		pids:          map[string]int{},
 		notReady:      map[string]string{},
 	}
+	w.cfg.Store(manifest)
 	if err := w.recover(); err != nil {
 		return nil, fmt.Errorf("recover state: %w", err)
 	}
 	return w, nil
 }
 
-func attemptsDir(m *Manifest) string { return filepath.Join(m.StateDir, "attempts") }
+// config is the current manifest. Callers must not change it.
+func (w *Worker) config() *Manifest { return w.cfg.Load() }
+
+func attemptsDir(stateDir string) string { return filepath.Join(stateDir, "attempts") }
 
 // recover reloads attempts from disk. Any attempt without a final event died
 // with the previous worker, so it is reported as failed; the gateway decides
 // whether it can be retried.
 func (w *Worker) recover() error {
-	root := attemptsDir(w.manifest)
+	root := attemptsDir(w.stateDir)
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return err
@@ -153,7 +173,7 @@ func (w *Worker) cancelOrphanRemote(meta attemptMeta) {
 	if meta.RemoteID == "" {
 		return
 	}
-	if c := w.manifest.byName[meta.Capability]; c != nil {
+	if c := w.config().byName[meta.Capability]; c != nil {
 		w.log.Warn("stopping orphaned service job", "attempt", meta.AttemptID, "capability", meta.Capability)
 		go w.cancelRemote(c, meta.RemoteID)
 	}
@@ -168,13 +188,17 @@ func isFinalEvent(eventType string) bool {
 // next start reports those attempts as interrupted.
 func (w *Worker) Run(ctx context.Context) error {
 	defer w.stopAllCommands()
-	w.startChecks(ctx)
+	w.restartChecks(ctx)
 	delay := minReconnectDelay
 	for ctx.Err() == nil {
 		started := time.Now()
 		err := w.session(ctx)
 		if ctx.Err() != nil {
 			break
+		}
+		if errors.Is(err, errReconnect) {
+			w.log.Info("reconnecting to tell the gateway about changed tools")
+			continue
 		}
 		w.log.Warn("disconnected from gateway", "error", err)
 		if time.Since(started) > stableSessionAfter {
@@ -211,9 +235,16 @@ func (w *Worker) session(parent context.Context) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
+	// This connection's hello will carry the latest tools, so an earlier request
+	// to reconnect is already met.
+	select {
+	case <-w.reconnect:
+	default:
+	}
+
 	dialCtx, cancelDial := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancelDial()
-	ws, resp, err := websocket.Dial(dialCtx, w.manifest.GatewayURL+"/v1/worker/connect", &websocket.DialOptions{
+	ws, resp, err := websocket.Dial(dialCtx, w.gatewayURL+"/v1/worker/connect", &websocket.DialOptions{
 		HTTPHeader: http.Header{"Authorization": {"Bearer " + w.token}},
 	})
 	if err != nil {
@@ -229,7 +260,17 @@ func (w *Worker) session(parent context.Context) error {
 	if err != nil {
 		return err
 	}
-	w.log.Info("connected to gateway", "url", w.manifest.GatewayURL)
+	w.log.Info("connected to gateway", "url", w.gatewayURL)
+
+	var reconnecting atomic.Bool
+	go func() {
+		select {
+		case <-w.reconnect:
+			reconnecting.Store(true)
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 
 	writeErr := make(chan error, 1)
 	go func() {
@@ -239,18 +280,27 @@ func (w *Worker) session(parent context.Context) error {
 	err = w.readLoop(ctx, ws, 3*heartbeat)
 	cancel()
 	<-writeErr
+	if reconnecting.Load() && parent.Err() == nil {
+		// Close cleanly, so the gateway sees a goodbye rather than a lost machine.
+		ws.Close(websocket.StatusNormalClosure, "tools changed")
+		return errReconnect
+	}
 	return err
 }
 
+// errReconnect ends a session so the next hello can describe changed tools.
+var errReconnect = errors.New("reconnecting to update tools")
+
 func (w *Worker) handshake(ctx context.Context, ws *websocket.Conn) (time.Duration, error) {
+	node := w.config().Node
 	hello := protocol.Hello{
 		ProtocolVersion: protocol.Version,
-		NodeName:        w.manifest.Node.Name,
+		NodeName:        node.Name,
 		OS:              runtime.GOOS,
 		Arch:            runtime.GOARCH,
-		Labels:          w.manifest.Node.Labels,
-		Resources:       w.manifest.Node.Resources,
-		MaxJobs:         w.manifest.Node.MaxJobs,
+		Labels:          node.Labels,
+		Resources:       node.Resources,
+		MaxJobs:         node.MaxJobs,
 		Capabilities:    w.helloCapabilities(),
 		Attempts:        w.attemptStates(),
 	}
@@ -450,7 +500,7 @@ func (w *Worker) startAttempt(assign protocol.Assign) {
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &attempt{
 		meta:    attemptMeta{JobID: assign.JobID, AttemptID: assign.AttemptID, Capability: assign.Capability},
-		dir:     filepath.Join(attemptsDir(w.manifest), assign.AttemptID),
+		dir:     filepath.Join(attemptsDir(w.stateDir), assign.AttemptID),
 		cancel:  cancel,
 		started: time.Now(),
 		done:    make(chan struct{}),
@@ -561,9 +611,14 @@ func (a *attempt) elapsed() string {
 }
 
 func (w *Worker) fail(a *attempt, code, message string) {
+	w.failWith(a, protocol.Failure{Code: code, Message: message})
+}
+
+// failWith reports a failure that may carry the command's output and exit code.
+func (w *Worker) failWith(a *attempt, f protocol.Failure) {
 	w.log.Warn("attempt failed", "job", a.meta.JobID, "attempt", a.meta.AttemptID, "capability", a.meta.Capability,
-		"code", code, "message", message, "duration", a.elapsed())
-	w.emit(a, protocol.EventFailed, protocol.Failure{Code: code, Message: message})
+		"code", f.Code, "message", f.Message, "duration", a.elapsed())
+	w.emit(a, protocol.EventFailed, f)
 }
 
 // abortAttempt stops an attempt the gateway has given up on and deletes it. No

@@ -6,9 +6,9 @@ Run jobs on idle home computers through one cloud API. An agent calls the gatewa
 Agent ──HTTPS──▶ Gateway (cloud server) ◀──outbound WSS + HTTPS── Worker (Mac mini) ──▶ local tools
 ```
 
-Workers only make outbound connections, so your home network needs no open ports. Each worker can run only what its local manifest declares. The gateway sends a capability name and input, never a command.
+Workers only make outbound connections, so your home network needs no open ports. Each worker can run only the tools it declares itself. The gateway sends a tool name and input, never a command.
 
-This covers steps 1 to 3 of the design: the gateway, the worker, adapters for command-line tools and HTTP services, progress streaming, cancellation, file transfer, the `fleet` command, a status dashboard and a Windows worker.
+This covers steps 1 to 3 of the design and the first part of the general tool model: the gateway, the worker, tools that wrap any command-line program or HTTP service with built-in templates, live reloading of tools, progress streaming, cancellation, file transfer, the `fleet` command, a status dashboard and a Windows worker.
 
 **What has been tested:** the suite runs the real gateway and worker on Linux, with a stand-in tool and a stand-in HTTP service, and the dashboard has been checked in headless Chromium.
 
@@ -339,7 +339,7 @@ curl -X POST -H "Authorization: Bearer $KEY" --data-binary @clip.mov "$FLEET/v1/
 
 | Route | Purpose |
 |---|---|
-| `GET /v1/capabilities` | Capabilities this key may use, with `input_files` listing the files each one needs |
+| `GET /v1/capabilities` | Tools this key may use, with each one's `description`, `input_schema` and the `input_files` it needs |
 | `POST /v1/jobs` | Create a job. Returns 202, or 200 when the idempotency key repeats an identical request |
 | `GET /v1/jobs/{id}` | Job status. `?wait=N` waits up to 60 seconds for it to finish, and `?include=events` adds its event history |
 | `GET /v1/jobs/{id}/events` | Follow a job as Server-Sent Events |
@@ -362,7 +362,16 @@ The stream sends these events:
 
 To resume after a disconnect, send the last `id` you saw as `Last-Event-ID`, or as `?after=ID`. You'll miss nothing and see nothing twice. Decide the outcome from `status` and `end`: a `failed` event can be followed by a rerun if the job has `retry_if_lost`.
 
-A job that used an HTTP service may also have a `result` holding the service's answer, as described under [Add a service](#add-a-service). `fleet run` and `fleet status` print it with the rest of the job.
+Everything a tool produces comes back with the job, so an agent can use it:
+
+| Field | What it holds |
+|---|---|
+| `result` | The tool's answer: what a command printed or a service replied, as text or JSON, if the tool sets `result` or `response`. Up to 1 MB |
+| `output` | The last 64 KB of everything a command printed, on stdout and stderr, whether the job succeeded or failed |
+| `exit_code` | How a command exited, whether the job succeeded or failed |
+| `artifacts` | Result files, each with a download `url` |
+
+`fleet run` and `fleet status` print them with the rest of the job.
 
 ### Job states
 
@@ -404,20 +413,80 @@ HTTP services add these error codes:
 
 `retryable` is advice for the agent. The gateway doesn't resubmit these by itself.
 
-## Add a service
+## Add a tool
 
-Add a capability to the machine's `worker.yaml` and restart the worker. The gateway needs no changes.
+A tool is anything on the machine an agent may call: a program such as `claude -p`, `curl` or `python tts.py`, a script, or an HTTP service. The worker declares each one, and the gateway learns about it when the worker connects. The gateway needs no changes. ("Tool" and "capability" mean the same thing here.)
 
-- **Placeholders:** `command` and `stdin` can use `{{workdir}}`, `{{input.field}}` and `{{files.field}}`. `command[0]` can't contain any.
+### Start from a template
+
+```sh
+fleet-worker tools templates      # List them
+fleet-worker tools new tts.clone --template python --config ~/fleet/worker.yaml
+```
+
+| Template | For |
+|---|---|
+| `cli` | Any program, with parameters as arguments, returning what it prints |
+| `python` | A Python script, using its virtual environment's interpreter |
+| `claude-code` | `claude -p` in a project folder, read-only unless you allow editing |
+| `http` | An HTTP API, sending the parameters as JSON and returning its reply |
+| `http-async` | A service with its own job queue: submit, follow, fetch, cancel |
+| `ios-test` | `xcodebuild test` on an iPhone simulator, with failing tests as a report (Mac only) |
+| `shell` | A bash script (Mac and Linux) |
+| `powershell` | A PowerShell script (Windows) |
+
+`tools new` writes `tools/NAME.yaml` next to `worker.yaml`, switched off with `enabled: false`. Fill in each `TODO`, set `enabled: true`, and the worker offers it within a few seconds. Run `fleet-worker --config worker.yaml --check` to see any problems first.
+
+### Where tools are declared
+
+- **The `tools` folder:** one tool per `.yaml` file. Set `tools_dir` in `worker.yaml` to use a different folder.
+- **`worker.yaml`:** under `tools:` or `capabilities:`, which are the same list.
+
+The worker watches both, so adding, changing or removing a tool takes effect without a restart. On Mac and Linux, `kill -HUP` applies a change straight away. Jobs already running finish as they started. A tool file that isn't valid is skipped and logged, and the others carry on. A `worker.yaml` that isn't valid leaves the worker as it was. A few settings, such as `gateway_url` and `state_dir`, only change on a restart, and the log says so.
+
+### Declare a command-line tool
+
+```yaml
+name: claude.ask
+description: Answers questions about the my-app project. # Agents read this to pick a tool.
+adapter: cli
+command: [/opt/homebrew/bin/claude, -p, --output-format, json]
+args:
+  - { flag: --model, value: "{{input.model}}" }          # Only when given
+  - { flag: --verbose, when: input.verbose }             # Only when true
+  - { flag: --add-dir, each: input.dirs }                # Once for each list item
+stdin: "{{input.prompt}}"
+cwd: /Users/me/src/my-app                                # Instead of an empty job folder
+env:
+  API_KEY: "{{env.MY_API_KEY}}"                          # From the worker's own environment
+input_schema:
+  type: object
+  required: [prompt]
+  properties:
+    prompt: { type: string }
+    model: { type: string }
+    verbose: { type: boolean }
+    dirs: { type: array, items: { type: string } }
+result: { from: stdout, format: json, field: result }
+success_exit_codes: [0]
+timeout: 30m
+```
+
+- **Calling:** the program runs directly, with no shell. Each item in `command` and `args` is exactly one argument, so input can never add options or commands. An argument that starts with a placeholder is refused if its value begins with `-`. For free text, prefer `stdin`.
+- **Placeholders:** `{{input.field}}`, `{{files.field}}` and `{{workdir}}`, a fresh folder for each job. `args` items with `each` also have `{{item}}`. `env` values can also use `{{env.NAME}}`, filled in from the worker's environment, but never with the node token. Text in a job's input is never read as a placeholder.
+- **Optional parameters:** a plain item in `command`, `args`, `stdin` or `env` always uses its fields, so they must be `required` or have a `default` in the schema. The worker checks this at startup. Parameters a caller may leave out go in `args` items with `value`, `when` or `each`. Schema defaults are filled in for fields a job leaves out.
+- **Result:** `result` returns what the command prints (`from: stdout`, the default) or a file it writes (`from: file` with `path`). Use `format: text` (the default) or `format: json`, with `field` to pick one value from the JSON. Text over 1 MB keeps its end, and `tail_lines` keeps only the last lines, which suits build and test logs.
+- **Exit codes:** `success_exit_codes` lists the codes that mean it worked, 0 by default. Any other code fails the job. Either way, the job has the `exit_code` and `output`.
+- **Working folder:** `cwd` runs the command in a folder of yours, which must exist, rather than in the job's folder. Outputs and `{{workdir}}` still use the job's folder.
 - **Input files:** `input_files` lists the files a job must supply, and all are required. The worker downloads and verifies them first, then `{{files.field}}` gives the local path.
-- **Option injection:** an argument starting with a placeholder is refused if its value begins with `-`. Prefer `stdin` for free text.
-- **Outputs:** `outputs` maps result names to paths inside the working directory. Symlinks are refused.
+- **Outputs:** `outputs` maps result names to paths inside the job's folder. `{ path: report, archive: zip }` returns a folder as `report.zip`, and `optional: true` skips a file the command didn't make. Links are never followed.
 - **Progress:** `progress.regex` reads command output using the named groups `percent`, `current`, `total` and `message`.
-- **Capacity:** `requires` reserves units from `node.resources`, so heavy jobs don't overlap. `node.max_jobs` caps the total.
-- **Environment:** commands get only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR` and whatever the capability's `env` sets.
+- **Capacity:** `requires` reserves units from `node.resources`, so heavy jobs don't overlap. `node.max_jobs` caps the total. A resource with 1 unit works as a lock, such as for one project folder.
+- **Environment:** commands get only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR` and what the tool's `env` sets.
+- **Switching off:** `enabled: false` keeps a tool in its file without offering it.
 - **Readiness:** see [How the gateway finds out what a machine can do](#how-the-gateway-finds-out-what-a-machine-can-do).
 
-Unknown fields, missing programs and invalid schemas stop the worker at startup. To validate a config and see whether each capability is ready right now, with the details, run `fleet-worker --config worker.yaml --check`.
+Unknown fields, missing programs and invalid schemas in `worker.yaml` stop the worker at startup. To validate everything and see whether each tool is ready right now, with the details, run `fleet-worker --config worker.yaml --check`. It exits with an error if any tool file would be skipped.
 
 ### How the gateway finds out what a machine can do
 
@@ -569,7 +638,7 @@ It needs its own kind of key. On the server:
 sudo -u fleet /usr/local/bin/fleet-gateway key add ops --dashboard --data /var/lib/fleet
 ```
 
-A dashboard key can see the status of every job from every agent, but can't run or cancel anything, and can't read job input, `result` values or result files. Agent keys can't open the dashboard. The key is kept only in the browser tab and is forgotten when the tab closes.
+A dashboard key can see the status of every job from every agent, but can't run or cancel anything, and can't read job input, `result` values, command `output` or result files. Agent keys can't open the dashboard. The key is kept only in the browser tab and is forgotten when the tab closes.
 
 **Error messages are visible to anyone with a dashboard key.** They can include what a command printed or a service replied, and that may quote part of a job's input.
 
