@@ -42,19 +42,23 @@ Mac installs use a one-line command rather than a double-click download. A file 
 ### What you need
 
 - **Server:** Debian, Ubuntu, CentOS Stream 9 or newer, or a current RHEL-family system, on x86-64 or ARM64, with a normal (non-root) user who has `sudo`. On CentOS 7, CentOS 8 or CentOS Stream 8, whose package repositories have been retired, install Caddy and a `caddy` systemd service by hand first. Installing from a release doesn't need Go.
-- **Domain:** a domain name with its DNS pointing at the server.
-- **Firewall:** ports 80 and 443 open on the server, including in any cloud security group. The script opens them in firewalld if it's running, but it can't change other firewalls. Caddy needs both to get its HTTPS certificate.
-- **Worker machine:** macOS 13 or newer on Apple silicon or Intel, or Windows 10 or 11 on x64 or ARM64. Your home network doesn't need any open ports.
+- **An address:** the server's public IPv4 address is enough. A domain name with its DNS pointing at the server works too, and is better for a server whose IP address can change.
+- **Firewall:** ports 80 and 443 open on the server, including in any cloud security group. The script opens them in firewalld if it's running, but it can't change other firewalls. Let's Encrypt checks the server through them before issuing its HTTPS certificate.
+- **Worker machine:** macOS 13 or newer on Apple silicon or Intel, Linux with systemd, or Windows 10 or 11 on x64 or ARM64. Your home network doesn't need any open ports.
 
 Run the commands below in your own terminal. They print secrets that are shown only once, so don't paste the output into chats or tickets.
 
 ### 1. Install the gateway
 
-Run one of these on the server, replacing `fleet.example.com` with your domain and `mac-mini-1` with a name for your first machine.
+Run one of these on the server. With no address, the script finds the server's public IP address and uses that. Or give a domain, such as `fleet.example.com`, or the IP address yourself, then optionally a name for your first machine, `mac-mini-1` by default.
 
 **One line, if the repo is public:**
 
 ```sh
+# On the server's IP address:
+curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.4.0/install-gateway.sh | bash
+
+# On a domain, naming the first machine:
 curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.4.0/install-gateway.sh | bash -s -- fleet.example.com mac-mini-1
 ```
 
@@ -74,13 +78,26 @@ tar -xzf fleet-server-linux-amd64.tar.gz
 
 Whichever you use, the script does the following:
 
-1. Gets the binaries, and verifies their checksums if it downloaded them.
-2. Installs the gateway as the `fleet-gateway` service, with its data in `/var/lib/fleet`.
-3. Installs Caddy if it's missing and sets up HTTPS. Your existing Caddy sites are kept.
-4. Publishes the worker installer and worker binaries at `https://your-domain/install/`. They contain no secrets, and anyone can download them.
-5. Prints an API key for your agent and the command to run on your Mac.
+1. Works out the address: the one you gave, the one from the last install, or this server's public IP address, which it asks `api.ipify.org` for, or failing that, `checkip.amazonaws.com` or `ifconfig.me`.
+2. Gets the binaries, and verifies their checksums if it downloaded them.
+3. Installs the gateway as the `fleet-gateway` service, with its data in `/var/lib/fleet`.
+4. Installs Caddy if it's missing, from Caddy's own package repository, and sets up HTTPS. Caddy gets the certificate from Let's Encrypt and renews it by itself. Your existing Caddy sites are kept.
+5. Publishes the worker installer and worker binaries at `https://ADDRESS/install/`. They contain no secrets, and anyone can download them.
+6. Prints an API key for your agent, the command to add the gateway to Claude Code, and the command to run on your first machine.
 
-It stops before changing anything if another program is using port 80 or 443. It exits with a warning if the server isn't reachable over HTTPS yet, but still prints your credentials. In that case, fix DNS or the firewall; Caddy keeps retrying, so you don't need to run the script again.
+It stops before changing anything if another program is using port 80 or 443. It exits with a warning if the server isn't reachable over HTTPS yet, but still prints your credentials. In that case, fix DNS or the firewall; Caddy keeps retrying, so you don't need to run the script again. If the new Caddy config isn't valid, it puts the old one back and leaves Caddy as it was.
+
+Running it again with no address keeps the address it used before. Giving a different one moves the gateway there, but workers installed before keep the old address until you change `gateway_url` in their `worker.yaml`.
+
+#### On an IP address
+
+Let's Encrypt issues certificates for IP addresses, but only short-lived ones, which last about six days. Caddy renews them every few days without you doing anything. So that this works:
+
+- **Caddy 2.11.4 or newer is needed.** The script upgrades an older Caddy from its package repository, and stops before changing anything if it can't.
+- **The script adds one line to Caddy's global options,** `default_sni` with the server's address, marked `# fleet-gateway`. A client that connects to an IP address sends no server name, and behind a cloud provider's NAT, the address it reached isn't one the server itself has, so Caddy needs telling which certificate to use. It stops if your Caddyfile already sets `default_sni`. Moving to a domain removes the line.
+- **The server must keep reaching Let's Encrypt.** If renewals fail for about four days, for example because outgoing connections are blocked, the certificate expires and workers can't connect until it's renewed.
+- **The address must be public and stay the same.** Private addresses, such as `10.x.x.x` or `192.168.x.x`, are refused, because Let's Encrypt can't reach them. If the server's IP address changes, every worker has to be told the new one, so use a fixed (elastic or static) address, or a domain.
+- **IPv6 isn't supported yet.** Use the server's IPv4 address, or a domain.
 
 On CentOS and similar systems, the script also changes system settings that would otherwise block the gateway:
 
@@ -264,7 +281,8 @@ Logs never contain the node token or header secrets. Job input isn't logged eith
 
 | Problem | What to check |
 |---|---|
-| `https://your-domain` isn't reachable | DNS, ports 80 and 443 in the cloud security group, then `sudo journalctl -u caddy -n 50` |
+| `https://ADDRESS` isn't reachable | For a domain, its DNS. Then ports 80 and 443 in the cloud security group, then `sudo journalctl -u caddy -n 50` |
+| Workers stop connecting to an IP address after some days | The certificate wasn't renewed. Check that the server can reach Let's Encrypt, then `sudo journalctl -u caddy -n 50` |
 | The gateway won't start | `sudo journalctl -u fleet-gateway -n 50` |
 | A Mac says `launchd refused to start it` | You're probably connected over SSH. Log in to that user at the screen or through Screen Sharing, then run the command again |
 | A Mac starts but doesn't connect | `tail ~/fleet/worker.log`. `the gateway rejected this node's token` means the token is wrong or revoked |
@@ -294,7 +312,7 @@ On the server, this also deletes all jobs, results and credentials:
 ```sh
 sudo systemctl disable --now fleet-gateway
 sudo rm -rf /var/lib/fleet /srv/fleet /etc/systemd/system/fleet-gateway.service /usr/local/bin/fleet-gateway /usr/local/bin/fleet-add-worker /etc/caddy/fleet.caddy
-sudo sed -i '/^import fleet.caddy$/d' /etc/caddy/Caddyfile
+sudo sed -i -e '/^import fleet.caddy$/d' -e '/# fleet-gateway$/d' /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 sudo userdel fleet
 ```

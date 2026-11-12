@@ -3,26 +3,32 @@
 # server. Any of these works:
 #
 #   From a release, with nothing else installed (needs a public repo):
-#     curl -fsSL RELEASE_URL/install-gateway.sh | bash -s -- fleet.example.com [node-name]
+#     curl -fsSL RELEASE_URL/install-gateway.sh | bash -s -- [ADDRESS] [node-name]
 #
 #   From an unpacked release bundle:
-#     ./install-gateway.sh fleet.example.com [node-name]
+#     ./install-gateway.sh [ADDRESS] [node-name]
 #
 #   From a checkout of the repo, which builds the binaries and needs Go:
-#     ./deploy/install-gateway.sh fleet.example.com [node-name]
+#     ./deploy/install-gateway.sh [ADDRESS] [node-name]
 #
-# It installs the gateway and Caddy as services and publishes the worker installer
-# at https://DOMAIN/install/. On a first install, it prints an API key and the
-# command to run on your first Mac, named mac-mini-1 by default. Run it as a normal
-# user with sudo rights.
+# ADDRESS is a domain name such as fleet.example.com, or this server's public IPv4
+# address. With none, a first install finds this server's public IP address, and a
+# later run keeps the address it used before.
+#
+# It installs the gateway and Caddy as services, and Caddy gets and renews an HTTPS
+# certificate from Let's Encrypt by itself, for an IP address too. It publishes the
+# worker installer at https://ADDRESS/install/. On a first install, it prints an API
+# key and the command to run on your first machine, named mac-mini-1 by default.
+# Run it as a normal user with sudo rights.
 #
 # Re-running it upgrades the gateway and keeps existing data and credentials. It
 # only registers another machine if you pass a node name.
 #
-# Before running it, point DOMAIN's DNS at this server and open ports 80 and 443
-# in any cloud security group. This script can't do either for you. If firewalld is
-# running, it opens those two ports there. If SELinux is on, it lets Caddy reach
-# the gateway and read the published installer, which SELinux would otherwise block.
+# Before running it, open ports 80 and 443 in any cloud security group, and for a
+# domain, point its DNS at this server. This script can't do either for you. If
+# firewalld is running, it opens those two ports there. If SELinux is on, it lets
+# Caddy reach the gateway and read the published installer, which SELinux would
+# otherwise block.
 #
 # Everything is inside main, so a download cut off partway can't run half a script.
 
@@ -111,8 +117,8 @@ enable_caddy_copr() {
 	sudo dnf copr enable -y -q @caddy/caddy "epel-$version-$(uname -m)"
 }
 
+# Installs Caddy, or upgrades it to the newest version its repository has.
 install_caddy() {
-	step "Installing Caddy"
 	if command -v apt-get >/dev/null; then
 		sudo apt-get update -qq
 		sudo apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https gnupg
@@ -125,9 +131,126 @@ install_caddy() {
 	else
 		sudo dnf install -y -q dnf-plugins-core &&
 			enable_caddy_copr &&
-			sudo dnf install -y -q caddy ||
+			sudo dnf install -y -q caddy &&
+			sudo dnf upgrade -y -q caddy ||
 			die "couldn't install Caddy with dnf, and nothing has been changed. If this system's package repositories have been retired, as CentOS 8 and CentOS Stream 8's have, install Caddy and a caddy systemd service by hand, then run this again"
 	fi
+}
+
+# Let's Encrypt's certificates for IP addresses need Caddy 2.11.4 or newer, which
+# can ask for its short-lived certificate profile and handles IP addresses fully.
+MIN_CADDY_FOR_IP="2 11 4"
+
+caddy_version() { # caddy binary; prints "MAJOR MINOR PATCH", or nothing
+	"$1" version 2>/dev/null | sed -n 's/^v\([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2 \3/p' | head -n 1
+}
+
+version_at_least() { # "MAJOR MINOR PATCH" "MAJOR MINOR PATCH"
+	local have want
+	read -r -a have <<<"$1"
+	read -r -a want <<<"$2"
+	[ "${#have[@]}" -eq 3 ] || return 1
+	local i
+	for i in 0 1 2; do
+		[ "${have[$i]}" -gt "${want[$i]}" ] && return 0
+		[ "${have[$i]}" -lt "${want[$i]}" ] && return 1
+	done
+	return 0
+}
+
+is_ipv4() {
+	[[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+	local octet
+	for octet in "${BASH_REMATCH[@]:1}"; do
+		[ "$((10#$octet))" -le 255 ] || return 1
+		# A leading zero means octal to some programs.
+		[[ "$octet" == 0 || "$octet" != 0* ]] || return 1
+	done
+}
+
+# Let's Encrypt only issues for addresses reachable from the internet.
+is_public_ipv4() {
+	local a b
+	IFS=. read -r a b _ _ <<<"$1"
+	case "$a" in
+	0 | 10 | 127) return 1 ;;
+	esac
+	[ "$a" -ge 224 ] && return 1
+	[ "$a" -eq 169 ] && [ "$b" -eq 254 ] && return 1
+	[ "$a" -eq 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ] && return 1
+	[ "$a" -eq 192 ] && [ "$b" -eq 168 ] && return 1
+	[ "$a" -eq 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ] && return 1
+	return 0
+}
+
+# Asks services that echo the caller's address, since behind a cloud provider's
+# NAT this machine can't see its own public address.
+detect_public_ip() {
+	local service ip
+	for service in https://api.ipify.org https://checkip.amazonaws.com https://ifconfig.me/ip; do
+		ip="$(curl -4 -fsS --max-time 5 "$service" 2>/dev/null | tr -d '[:space:]')" || continue
+		if is_ipv4 "$ip"; then
+			echo "$ip"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Lines this script adds to the Caddyfile end with this, so it can find and
+# replace them, and leave the rest alone.
+CADDY_MARK='# fleet-gateway'
+
+# Sets this server's address as default_sni in the Caddyfile's global options, or
+# with an empty address, removes it. A client that connects to an IP address sends
+# no server name, and behind a cloud provider's NAT, the address it reached isn't
+# one this machine has, so Caddy needs telling which certificate to use.
+#
+# with_default_sni writes the changed Caddyfile to a new file. It fails with 3 if
+# the Caddyfile already sets default_sni itself.
+with_default_sni() { # Caddyfile, IP address or empty, output file
+	local file="$1" ip="$2" updated="$3"
+	local stripped="$updated.stripped"
+	if [ -f "$file" ]; then
+		sudo cat "$file" | { grep -v -- "$CADDY_MARK\$" || true; } >"$stripped"
+	else
+		: >"$stripped"
+	fi
+	if [ -z "$ip" ]; then
+		cp "$stripped" "$updated"
+	else
+		awk -v ip="$ip" -v mark="$CADDY_MARK" '
+			function ours() { print "{ " mark; print "\tdefault_sni " ip " " mark; print "} " mark }
+			!placed && /^[[:space:]]*(#.*)?$/ { print; next }
+			!placed {
+				placed = 1
+				# A global options block is a lone { at the very top.
+				if ($0 ~ /^[[:space:]]*\{[[:space:]]*(#.*)?$/) {
+					print
+					print "\tdefault_sni " ip " " mark
+					depth = 1
+					next
+				}
+				ours()
+			}
+			depth > 0 {
+				if (depth == 1 && $0 ~ /^[[:space:]]*default_sni[[:space:]]/) clash = 1
+				line = $0
+				sub(/#.*/, "", line)
+				depth += gsub(/\{/, "{", line) - gsub(/\}/, "}", line)
+			}
+			{ print }
+			END {
+				if (!placed) ours()
+				if (clash) exit 3
+			}
+		' "$stripped" >"$updated" || return
+	fi
+}
+
+set_default_sni() { # Caddyfile, IP address or empty
+	with_default_sni "$1" "$2" "$WORKDIR/Caddyfile.updated"
+	sudo tee "$1" <"$WORKDIR/Caddyfile.updated" >/dev/null
 }
 
 selinux_active() {
@@ -166,15 +289,41 @@ open_firewalld() {
 main() {
 	set -euo pipefail
 
-	local domain="${1:-}"
+	local address="${1:-}"
 	local node_name_given="${2:-}"
 	local node_name="${node_name_given:-mac-mini-1}"
-	[ -n "$domain" ] || die "usage: install-gateway.sh DOMAIN [node-name]"
-	[[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}$ ]] || die "'$domain' doesn't look like a domain name"
 	[[ "$node_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "'$node_name' isn't a valid node name"
 	[ "$(id -u)" -ne 0 ] || die "run this as a normal user with sudo rights, not as root"
-
 	command -v curl >/dev/null || die "curl isn't installed"
+
+	# The address workers and agents use, and the one in installed workers' settings.
+	local previous_url=""
+	if [ -f "$ROOT/srv/fleet/gateway-url" ]; then
+		previous_url="$(cat "$ROOT/srv/fleet/gateway-url")"
+	fi
+	if [ -z "$address" ] && [ -n "$previous_url" ]; then
+		address="${previous_url#https://}"
+		step "Keeping the address from the last install, $address"
+	elif [ -z "$address" ]; then
+		step "No domain given, so finding this server's public IP address"
+		address="$(detect_public_ip)" ||
+			die "couldn't find this server's public IP address. Give it, or a domain, as the first argument: install-gateway.sh ADDRESS"
+		echo "This server is at $address. If that's wrong, run this again with the right address."
+	fi
+
+	local mode
+	if is_ipv4 "$address"; then
+		is_public_ipv4 "$address" ||
+			die "$address is a private address, which Let's Encrypt can't issue a certificate for. Use this server's public IP address, or a domain"
+		mode=ip
+	elif [[ "$address" == *:* ]]; then
+		die "IPv6 addresses aren't supported yet. Use this server's public IPv4 address, or a domain"
+	elif [[ "$address" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}$ ]]; then
+		mode=domain
+	else
+		die "'$address' doesn't look like a domain name or an IPv4 address"
+	fi
+
 	command -v caddy >/dev/null || command -v apt-get >/dev/null || command -v dnf >/dev/null ||
 		die "this script can install Caddy only with apt or dnf. On this system, which may be CentOS 7, install Caddy and a caddy systemd service by hand, then run this again"
 
@@ -193,14 +342,33 @@ main() {
 
 	WORKDIR="$(mktemp -d)"
 	trap 'rm -rf "$WORKDIR"' EXIT
+	if [ "$mode" = ip ]; then
+		local sni_status=0
+		with_default_sni "$ROOT/etc/caddy/Caddyfile" "$address" "$WORKDIR/Caddyfile.check" || sni_status=$?
+		case "$sni_status" in
+		0) ;;
+		3) die "/etc/caddy/Caddyfile already sets default_sni in its global options. Remove that line, or set it to $address, then run this again. Nothing has been changed" ;;
+		*) die "couldn't read /etc/caddy/Caddyfile to add this server's address to it. Nothing has been changed" ;;
+		esac
+	fi
 	find_bundle
 	"$BUNDLE/fleet-gateway" version >/dev/null 2>&1 ||
 		die "this bundle's gateway can't run here. This machine is $(uname -m), and the bundle is in $BUNDLE, which must not be mounted noexec"
 
-	command -v caddy >/dev/null || install_caddy
+	if ! command -v caddy >/dev/null; then
+		step "Installing Caddy"
+		install_caddy
+	fi
 	# sudo may not search where Caddy is, such as /usr/local/bin on CentOS.
 	local caddy
 	caddy="$(command -v caddy)" || die "Caddy still isn't on PATH after installing it"
+	if [ "$mode" = ip ] && ! version_at_least "$(caddy_version "$caddy")" "$MIN_CADDY_FOR_IP"; then
+		step "Upgrading Caddy, because a certificate for an IP address needs Caddy ${MIN_CADDY_FOR_IP// /.} or newer"
+		install_caddy
+		caddy="$(command -v caddy)" || die "Caddy isn't on PATH after upgrading it"
+		version_at_least "$(caddy_version "$caddy")" "$MIN_CADDY_FOR_IP" ||
+			die "this server's Caddy is $("$caddy" version 2>/dev/null | head -n 1), and a certificate for an IP address needs ${MIN_CADDY_FOR_IP// /.} or newer. Upgrade Caddy, or use a domain, then run this again. Nothing has been changed"
+	fi
 	sudo systemctl cat caddy >/dev/null 2>&1 ||
 		die "Caddy is installed, but there's no caddy systemd service to run it. Create one, then run this again"
 
@@ -234,7 +402,7 @@ main() {
 
 	step "Publishing the worker installer"
 	local public="$ROOT/srv/fleet/install"
-	local url="https://$domain"
+	local url="https://$address"
 	local staging="$WORKDIR/publish"
 	mkdir -p "$staging"
 	local binaries=(fleet-worker-darwin-arm64 fleet-worker-darwin-amd64 fleet-worker-linux-amd64 fleet-worker-linux-arm64 fleet-worker-windows-amd64.exe fleet-worker-windows-arm64.exe)
@@ -250,10 +418,35 @@ main() {
 	allow_caddy_under_selinux
 	open_firewalld
 	sudo install -d -m 755 "$ROOT/etc/caddy"
+	sudo touch "$ROOT/etc/caddy/Caddyfile"
+	# Keep the current config, to put back if the new one isn't valid.
+	local backup="$WORKDIR/caddy-backup"
+	mkdir -p "$backup"
+	sudo cat "$ROOT/etc/caddy/Caddyfile" >"$backup/Caddyfile"
+	local had_fleet_caddy=""
+	if [ -f "$ROOT/etc/caddy/fleet.caddy" ]; then
+		sudo cat "$ROOT/etc/caddy/fleet.caddy" >"$backup/fleet.caddy"
+		had_fleet_caddy=yes
+	fi
+
+	# Let's Encrypt issues certificates for IP addresses only with its short-lived
+	# profile. They last about six days, and Caddy renews them every few days.
+	local tls_block=""
+	if [ "$mode" = ip ]; then
+		tls_block="	tls {
+		issuer acme {
+			profile shortlived
+		}
+	}
+"
+		set_default_sni "$ROOT/etc/caddy/Caddyfile" "$address"
+	else
+		set_default_sni "$ROOT/etc/caddy/Caddyfile" ""
+	fi
 	# This goes in its own file, so a Caddyfile you already have keeps working.
 	sudo tee "$ROOT/etc/caddy/fleet.caddy" >/dev/null <<CADDY
-$domain {
-	handle_path /install/* {
+$address {
+${tls_block}	handle_path /install/* {
 		root * /srv/fleet/install
 		file_server
 	}
@@ -262,14 +455,31 @@ $domain {
 	}
 }
 CADDY
-	sudo touch "$ROOT/etc/caddy/Caddyfile"
 	if ! sudo grep -qxF 'import fleet.caddy' "$ROOT/etc/caddy/Caddyfile"; then
 		echo 'import fleet.caddy' | sudo tee -a "$ROOT/etc/caddy/Caddyfile" >/dev/null
 	fi
-	sudo "$caddy" validate --adapter caddyfile --config "$ROOT/etc/caddy/Caddyfile" >/dev/null 2>&1 ||
-		die "the Caddy config is invalid; see: sudo $caddy validate --config /etc/caddy/Caddyfile"
+	local problem
+	if ! problem="$(sudo "$caddy" validate --adapter caddyfile --config "$ROOT/etc/caddy/Caddyfile" 2>&1)"; then
+		sudo tee "$ROOT/etc/caddy/Caddyfile" <"$backup/Caddyfile" >/dev/null
+		if [ -n "$had_fleet_caddy" ]; then
+			sudo tee "$ROOT/etc/caddy/fleet.caddy" <"$backup/fleet.caddy" >/dev/null
+		else
+			sudo rm -f "$ROOT/etc/caddy/fleet.caddy"
+		fi
+		echo "$problem" | tail -n 5 >&2
+		die "the new Caddy config isn't valid, so the old one was put back and Caddy wasn't restarted"
+	fi
 	sudo systemctl enable caddy >/dev/null 2>&1
 	sudo systemctl restart caddy
+
+	if [ -n "$previous_url" ] && [ "$previous_url" != "$url" ]; then
+		cat >&2 <<MOVED
+
+Note: the gateway's address changed from $previous_url to $url. Workers installed
+before still use the old one. On each, change gateway_url in worker.yaml and
+restart the worker.
+MOVED
+	fi
 
 	step "Checking $url (getting a certificate can take a minute)"
 	local reachable=""
@@ -308,12 +518,17 @@ KEY
 	fi
 
 	if [ -z "$reachable" ]; then
+		local first_check="DNS for $address points at this server's public IP"
+		if [ "$mode" = ip ]; then
+			first_check="$address really is this server's public IP address"
+		fi
 		cat >&2 <<WARNING
 
 WARNING: the gateway is running, but $url isn't reachable yet, so the worker
 install command won't work until it is. Check that:
-  - DNS for $domain points at this server's public IP
-  - ports 80 and 443 are open in any firewall or cloud security group
+  - $first_check
+  - ports 80 and 443 are open in any firewall or cloud security group, because
+    Let's Encrypt checks this server through them before issuing a certificate
 Then see: sudo journalctl -u caddy -n 50
 Caddy keeps retrying the certificate, so you don't need to run this again.
 WARNING

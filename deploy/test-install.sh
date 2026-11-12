@@ -53,11 +53,17 @@ exec "$@"'
 stub systemctl 'echo "systemctl $*" >>"$STUB_LOG"'
 stub useradd 'echo "useradd $*" >>"$STUB_LOG"'
 stub chown 'exit 0'
-stub caddy 'exit 0'
+stub caddy '[ "${1:-}" = version ] && echo "v${STUB_CADDY_VERSION:-2.11.9} h1:stub"
+exit 0'
 stub ss '[ -n "${STUB_PORT_HOLDER:-}" ] && echo "$STUB_PORT_HOLDER"
 exit 0'
 stub curl 'case "$*" in
 *127.0.0.1:8080/healthz*) exit 0 ;;
+*api.ipify.org* | *checkip.amazonaws.com* | *ifconfig.me*)
+	echo "curl $*" >>"$STUB_LOG"
+	[ -z "${STUB_NO_PUBLIC_IP:-}" ] || exit 6
+	echo "${STUB_PUBLIC_IP:-203.0.113.10}"
+	;;
 */healthz*) [ -z "${STUB_UNREACHABLE:-}" ] ;;
 *releases/download/*)
 	out=""
@@ -145,6 +151,107 @@ OUT="$WORK/third.out"
 run_gateway_install "$ROOT" fleet.example.com mac-three >"$OUT" 2>&1
 check "registers the new node" grep -q 'FLEET_NODE_NAME=mac-three' "$OUT"
 
+echo "Running it again with no address"
+OUT="$WORK/no-address.out"
+: >"$STUB_LOG"
+run_gateway_install "$ROOT" >"$OUT" 2>&1
+check "exits successfully" test $? -eq 0
+check "keeps the domain" grep -q 'Keeping the address from the last install, fleet.example.com' "$OUT"
+refute "doesn't look up a public IP" grep -q ipify "$STUB_LOG"
+check "still serves the domain" grep -q '^fleet.example.com {' "$ROOT/etc/caddy/fleet.caddy"
+
+echo "With no domain, on this server's IP address"
+ROOT_IP="$WORK/root-ip"
+mkdir -p "$ROOT_IP/etc/caddy"
+# The Caddyfile Caddy's package installs.
+printf '# The Caddyfile is an easy way to configure your Caddy web server.\n\n:80 {\n\troot * /usr/share/caddy\n\tfile_server\n}\n' >"$ROOT_IP/etc/caddy/Caddyfile"
+OUT="$WORK/ip.out"
+: >"$STUB_LOG"
+run_gateway_install "$ROOT_IP" >"$OUT" 2>&1
+RESULT=$?
+check "installs" test "$RESULT" -eq 0
+[ "$RESULT" -eq 0 ] || sed 's/^/    /' "$OUT" >&2
+check "finds the public IP address" grep -q 'This server is at 203.0.113.10' "$OUT"
+check "asks for an IPv4 address" grep -q 'curl -4 .*api.ipify.org' "$STUB_LOG"
+check "prints the IP address as the gateway URL" grep -q 'FLEET_URL=https://203.0.113.10$' "$OUT"
+check "prints the worker command for the IP address" grep -q 'curl -fsSL https://203.0.113.10/install/worker.sh | FLEET_NODE_NAME=mac-mini-1' "$OUT"
+check "prints the MCP command for the IP address" grep -q 'claude mcp add --transport http fleet https://203.0.113.10/mcp' "$OUT"
+check "publishes the installer with the IP address" grep -q 'GATEWAY_URL="${FLEET_GATEWAY_URL:-https://203.0.113.10}"' "$ROOT_IP/srv/fleet/install/worker.sh"
+check "serves the IP address in Caddy" grep -q '^203.0.113.10 {' "$ROOT_IP/etc/caddy/fleet.caddy"
+check "asks Let's Encrypt for its short-lived profile" grep -q 'profile shortlived' "$ROOT_IP/etc/caddy/fleet.caddy"
+check "tells Caddy which certificate to use without a server name" grep -qx '	default_sni 203.0.113.10 # fleet-gateway' "$ROOT_IP/etc/caddy/Caddyfile"
+check "puts the global options first" test "$(grep -v '^#\|^$' "$ROOT_IP/etc/caddy/Caddyfile" | head -1)" = '{ # fleet-gateway'
+check "keeps the package's site" grep -q 'root \* /usr/share/caddy' "$ROOT_IP/etc/caddy/Caddyfile"
+check "imports the Caddy config" grep -qx 'import fleet.caddy' "$ROOT_IP/etc/caddy/Caddyfile"
+
+OUT="$WORK/ip-again.out"
+: >"$STUB_LOG"
+run_gateway_install "$ROOT_IP" >"$OUT" 2>&1
+check "runs again" test $? -eq 0
+check "keeps the IP address" grep -q 'Keeping the address from the last install, 203.0.113.10' "$OUT"
+check "adds default_sni once" test "$(grep -c default_sni "$ROOT_IP/etc/caddy/Caddyfile")" = 1
+check "adds the global options once" test "$(grep -c '^{ # fleet-gateway$' "$ROOT_IP/etc/caddy/Caddyfile")" = 1
+
+echo "Moving from the IP address to a domain"
+OUT="$WORK/ip-to-domain.out"
+run_gateway_install "$ROOT_IP" fleet.example.com >"$OUT" 2>&1
+check "runs" test $? -eq 0
+refute "removes what it added to the global options" grep -q 'fleet-gateway' "$ROOT_IP/etc/caddy/Caddyfile"
+refute "drops the short-lived profile" grep -q 'shortlived' "$ROOT_IP/etc/caddy/fleet.caddy"
+check "warns that installed workers use the old address" grep -q 'changed from https://203.0.113.10 to https://fleet.example.com' "$OUT"
+
+echo "An IP address next to existing global options"
+ROOT_GLOBAL="$WORK/root-global"
+mkdir -p "$ROOT_GLOBAL/etc/caddy"
+printf '{\n\temail ops@example.com\n}\n\nother.example.com {\n\trespond "hello"\n}\n' >"$ROOT_GLOBAL/etc/caddy/Caddyfile"
+run_gateway_install "$ROOT_GLOBAL" 198.51.100.7 mac-ip >"$WORK/global.out" 2>&1
+check "installs with an address given" test $? -eq 0
+check "adds default_sni inside the existing global options" test "$(sed -n 2p "$ROOT_GLOBAL/etc/caddy/Caddyfile")" = '	default_sni 198.51.100.7 # fleet-gateway'
+check "keeps the existing options" grep -q 'email ops@example.com' "$ROOT_GLOBAL/etc/caddy/Caddyfile"
+check "doesn't add a second global block" test "$(grep -c '^{' "$ROOT_GLOBAL/etc/caddy/Caddyfile")" = 1
+check "registers the named machine" grep -q 'FLEET_NODE_NAME=mac-ip' "$WORK/global.out"
+
+echo "IP address refusals"
+ROOT_REFUSE="$WORK/root-refuse"
+mkdir -p "$ROOT_REFUSE/etc/caddy"
+printf '{\n\tdefault_sni other.example.com\n}\n' >"$ROOT_REFUSE/etc/caddy/Caddyfile"
+cp "$ROOT_REFUSE/etc/caddy/Caddyfile" "$WORK/clash.before"
+run_gateway_install "$ROOT_REFUSE" 198.51.100.7 >"$WORK/clash.out" 2>&1
+check "refuses when the Caddyfile sets its own default_sni" grep -q 'already sets default_sni' "$WORK/clash.out"
+check "leaves that Caddyfile alone" cmp "$WORK/clash.before" "$ROOT_REFUSE/etc/caddy/Caddyfile"
+refute "installs nothing then" test -e "$ROOT_REFUSE/usr/local/bin/fleet-gateway"
+rm -f "$ROOT_REFUSE/etc/caddy/Caddyfile"
+for private in 10.0.0.5 172.20.1.2 192.168.1.10 100.64.3.4 127.0.0.1; do
+	run_gateway_install "$ROOT_REFUSE" "$private" >"$WORK/private.out" 2>&1
+	check "refuses the private address $private" grep -q 'private address' "$WORK/private.out"
+done
+run_gateway_install "$ROOT_REFUSE" 2001:db8::1 >"$WORK/v6.out" 2>&1
+check "refuses IPv6 for now" grep -q "IPv6 addresses aren't supported yet" "$WORK/v6.out"
+run_gateway_install "$ROOT_REFUSE" 300.1.2.3 >/dev/null 2>&1
+check "refuses an invalid address" test $? -ne 0
+STUB_NO_PUBLIC_IP=1 run_gateway_install "$ROOT_REFUSE" >"$WORK/noip.out" 2>&1
+check "stops if it can't find the public IP" grep -q "couldn't find this server's public IP address" "$WORK/noip.out"
+STUB_PUBLIC_IP=10.1.2.3 run_gateway_install "$ROOT_REFUSE" >"$WORK/natip.out" 2>&1
+check "refuses a private address it found" grep -q 'private address' "$WORK/natip.out"
+refute "installs nothing when refusing an address" test -e "$ROOT_REFUSE/usr/local/bin/fleet-gateway"
+
+echo "A Caddy config that doesn't validate is put back"
+ROOT_BADCADDY="$WORK/root-badcaddy"
+mkdir -p "$ROOT_BADCADDY/etc/caddy"
+printf ':80 {\n\trespond "mine"\n}\n' >"$ROOT_BADCADDY/etc/caddy/Caddyfile"
+cp "$ROOT_BADCADDY/etc/caddy/Caddyfile" "$WORK/badcaddy.before"
+mkdir -p "$WORK/badcaddy-stubs"
+printf '#!/bin/sh\n[ "${1:-}" = version ] && echo v2.11.9\n[ "${1:-}" = validate ] && { echo "Error: something is wrong" >&2; exit 1; }\nexit 0\n' >"$WORK/badcaddy-stubs/caddy"
+chmod +x "$WORK/badcaddy-stubs/caddy"
+: >"$STUB_LOG"
+FLEET_INSTALL_ROOT="$ROOT_BADCADDY" PATH="$WORK/badcaddy-stubs:$SERVER_PATH" "$REPO/deploy/install-gateway.sh" 198.51.100.7 >"$WORK/badcaddy.out" 2>&1
+check "stops" test $? -ne 0
+check "says the old config was put back" grep -q 'the old one was put back' "$WORK/badcaddy.out"
+check "shows Caddy's complaint" grep -q 'something is wrong' "$WORK/badcaddy.out"
+check "restores the Caddyfile" cmp "$WORK/badcaddy.before" "$ROOT_BADCADDY/etc/caddy/Caddyfile"
+refute "removes the new site file" test -e "$ROOT_BADCADDY/etc/caddy/fleet.caddy"
+refute "doesn't restart Caddy" grep -q 'restart caddy' "$STUB_LOG"
+
 echo "Server not reachable over HTTPS yet"
 ROOT3="$WORK/root3"
 mkdir -p "$ROOT3"
@@ -198,7 +305,7 @@ check "the bundled Linux worker reports the version" sh -c "'$BUNDLE_DIR/fleet-w
 # Hide Go, to prove a release install doesn't need it.
 NO_GO="$WORK/no-go"
 mkdir -p "$NO_GO"
-for tool in bash sh env id seq sleep grep sed mktemp rm cat cp mv mkdir dirname tar gzip sha256sum install touch tee uname cut head chmod; do
+for tool in bash sh env id seq sleep grep sed awk tr mktemp rm cat cp mv mkdir dirname tar gzip sha256sum install touch tee uname cut head chmod; do
 	ln -s "$(command -v "$tool")" "$NO_GO/$tool"
 done
 RELEASE_PATH="$STUBS:$NO_GO"
@@ -243,7 +350,7 @@ rhelstub dnf 'echo "dnf $*" >>"$STUB_LOG"
 [ -z "${STUB_DNF_FAIL:-}" ] || exit 1
 case "$*" in
 *"copr enable -y -q @caddy/caddy") [ -z "${STUB_COPR_NEEDS_EPEL:-}" ] || exit 1 ;;
-*"-q caddy") printf "#!/bin/sh\nexit 0\n" >"$(dirname "$0")/caddy"; chmod +x "$(dirname "$0")/caddy" ;;
+*"-q caddy") printf "#!/bin/sh\n[ \"\${1:-}\" = version ] && echo v${STUB_NEW_CADDY:-2.11.7}\nexit 0\n" >"$(dirname "$0")/caddy"; chmod +x "$(dirname "$0")/caddy" ;;
 esac'
 rhelstub getenforce 'echo "${STUB_SELINUX:-Enforcing}"'
 rhelstub setsebool 'echo "setsebool $*" >>"$STUB_LOG"'
@@ -347,6 +454,34 @@ STUB_NO_CADDY_SERVICE=1 run_centos_install "$CENTOS12" >"$OUT" 2>&1
 check "stops if Caddy has no service" test $? -ne 0
 check "explains the missing service" grep -q 'no caddy systemd service' "$OUT"
 refute "changes nothing if Caddy has no service" test -e "$CENTOS12/usr/local/bin/fleet-gateway"
+rm -f "$RHEL/caddy"
+
+echo "An IP address on CentOS with an older Caddy"
+# Caddy is already installed, but too old for an IP address certificate.
+printf '#!/bin/sh\n[ "${1:-}" = version ] && echo v2.10.2\nexit 0\n' >"$RHEL/caddy"
+chmod +x "$RHEL/caddy"
+CENTOS_IP="$WORK/centos-ip"
+mkdir -p "$CENTOS_IP"
+: >"$STUB_LOG"
+OUT="$WORK/centos-ip.out"
+FLEET_INSTALL_ROOT="$CENTOS_IP" PATH="$RHEL:$NO_GO" "$NO_GO/bash" "$BUNDLE_DIR/install-gateway.sh" 198.51.100.7 >"$OUT" 2>&1
+RESULT=$?
+check "installs" test "$RESULT" -eq 0
+[ "$RESULT" -eq 0 ] || sed 's/^/    /' "$OUT" >&2
+check "says why it upgrades Caddy" grep -q 'needs Caddy 2.11.4 or newer' "$OUT"
+check "upgrades Caddy" grep -q 'dnf upgrade -y -q caddy' "$STUB_LOG"
+check "upgrades Caddy before touching the gateway" test "$(position 'dnf upgrade -y -q caddy')" -lt "$(position 'restart fleet-gateway')"
+check "serves the IP address" grep -q '^198.51.100.7 {' "$CENTOS_IP/etc/caddy/fleet.caddy"
+
+printf '#!/bin/sh\n[ "${1:-}" = version ] && echo v2.10.2\nexit 0\n' >"$RHEL/caddy"
+chmod +x "$RHEL/caddy"
+CENTOS_OLD="$WORK/centos-old"
+mkdir -p "$CENTOS_OLD"
+OUT="$WORK/centos-old.out"
+STUB_NEW_CADDY=2.11.3 FLEET_INSTALL_ROOT="$CENTOS_OLD" PATH="$RHEL:$NO_GO" "$NO_GO/bash" "$BUNDLE_DIR/install-gateway.sh" 198.51.100.7 >"$OUT" 2>&1
+check "stops if Caddy can't be upgraded far enough" test $? -ne 0
+check "names the version it found" grep -q 'Caddy is v2.11.3' "$OUT"
+refute "changes nothing then" test -e "$CENTOS_OLD/usr/local/bin/fleet-gateway"
 rm -f "$RHEL/caddy"
 
 # Some sudo setups can't find Caddy by name, so the script must use its full path.
