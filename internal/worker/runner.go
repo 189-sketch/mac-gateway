@@ -543,7 +543,8 @@ func (w *Worker) retryTransfer(ctx context.Context, a *attempt, what string, tra
 }
 
 func (w *Worker) artifactURL(a *attempt, name string) string {
-	return fmt.Sprintf("%s/v1/worker/attempts/%s/artifacts/%s", w.gatewayURL, url.PathEscape(a.meta.AttemptID), url.PathEscape(name))
+	gatewayURL, _ := w.connection()
+	return fmt.Sprintf("%s/v1/worker/attempts/%s/artifacts/%s", gatewayURL, url.PathEscape(a.meta.AttemptID), url.PathEscape(name))
 }
 
 func (w *Worker) newUploadRequest(ctx context.Context, method, target string, body io.Reader, ref protocol.ArtifactRef) (*http.Request, error) {
@@ -551,7 +552,8 @@ func (w *Worker) newUploadRequest(ctx context.Context, method, target string, bo
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+w.token)
+	_, token := w.connection()
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-Content-SHA256", ref.SHA256)
 	return req, nil
 }
@@ -694,9 +696,10 @@ func (w *Worker) fetchInputs(ctx context.Context, a *attempt, c *Capability, fil
 }
 
 func (w *Worker) downloadOnce(ctx context.Context, a *attempt, f protocol.InputFile, dest string) error {
+	gatewayURL, token := w.connection()
 	err := transfer.Download(ctx, w.httpClient, transfer.DownloadRequest{
-		URL:    fmt.Sprintf("%s/v1/worker/attempts/%s/files/%s", w.gatewayURL, url.PathEscape(a.meta.AttemptID), url.PathEscape(f.Field)),
-		Token:  w.token,
+		URL:    fmt.Sprintf("%s/v1/worker/attempts/%s/files/%s", gatewayURL, url.PathEscape(a.meta.AttemptID), url.PathEscape(f.Field)),
+		Token:  token,
 		Dest:   dest,
 		Size:   f.Size,
 		SHA256: f.SHA256,

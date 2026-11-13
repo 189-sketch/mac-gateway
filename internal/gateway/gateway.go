@@ -80,6 +80,9 @@ type Gateway struct {
 	uploadsMu sync.Mutex
 	uploads   map[string]*uploadSlot
 
+	testMu   sync.Mutex
+	testKeys map[string]mcpTestKey
+
 	linkKey []byte
 	// runCtx ends when the gateway shuts down, which tells a request that ended
 	// because of the shutdown from one its client gave up on.
@@ -107,14 +110,15 @@ func New(cfg Config, store *Store, log *slog.Logger) (*Gateway, error) {
 		cfg.MCPWait = DefaultConfig().MCPWait
 	}
 	return &Gateway{
-		linkKey: linkKey,
-		runCtx:  context.Background(),
-		cfg:     cfg,
-		store:   store,
-		log:     log,
-		wake:    make(chan struct{}, 1),
-		conns:   map[string]*nodeConn{},
-		uploads: map[string]*uploadSlot{},
+		linkKey:  linkKey,
+		runCtx:   context.Background(),
+		cfg:      cfg,
+		store:    store,
+		log:      log,
+		wake:     make(chan struct{}, 1),
+		conns:    map[string]*nodeConn{},
+		uploads:  map[string]*uploadSlot{},
+		testKeys: map[string]mcpTestKey{},
 		policy: RetryPolicy{
 			Lease:         cfg.Lease,
 			LostGrace:     cfg.LostGrace,

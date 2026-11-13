@@ -55,7 +55,6 @@ type Worker struct {
 	// and never see half of an update. Settings that can't change while running
 	// are copied into the fields below.
 	cfg          atomic.Pointer[Manifest]
-	gatewayURL   string
 	stateDir     string
 	uploadWindow time.Duration
 	reconnect    chan struct{}
@@ -67,7 +66,18 @@ type Worker struct {
 	checksMu   sync.Mutex
 	stopChecks context.CancelFunc
 
-	token      string
+	// The gateway and token change when the machine is paired while running.
+	// Empty means it isn't paired yet.
+	connMu      sync.Mutex
+	gatewayURL  string
+	token       string
+	connChanged chan struct{}
+	// connectError is why the last attempt to connect failed, or "" if it didn't.
+	connectError atomic.Pointer[string]
+	// life ends when the worker stops. It's what background work started outside
+	// Run, such as a reload asked for by the page, is tied to.
+	life atomic.Pointer[context.Context]
+
 	log        *slog.Logger
 	httpClient *http.Client
 	// serviceClient talks to local services. It's separate because httpClient's
@@ -100,6 +110,7 @@ func New(manifest *Manifest, token string, log *slog.Logger) (*Worker, error) {
 		uploadWindow: manifest.uploadWindow,
 		reconnect:    make(chan struct{}, 1),
 		reloadNow:    make(chan struct{}, 1),
+		connChanged:  make(chan struct{}, 1),
 		token:        token,
 		log:          log,
 		httpClient:   &http.Client{Transport: transport},
@@ -113,10 +124,50 @@ func New(manifest *Manifest, token string, log *slog.Logger) (*Worker, error) {
 		notReadyDetail: map[string]string{},
 	}
 	w.cfg.Store(manifest)
+	background := context.Background()
+	w.life.Store(&background)
 	if err := w.recover(); err != nil {
 		return nil, fmt.Errorf("recover state: %w", err)
 	}
 	return w, nil
+}
+
+// connection is the gateway this machine is paired with and its token there.
+// Both are empty until it's paired.
+func (w *Worker) connection() (gatewayURL, token string) {
+	w.connMu.Lock()
+	defer w.connMu.Unlock()
+	return w.gatewayURL, w.token
+}
+
+// SetConnection points the worker at a gateway, now, without a restart. It's
+// how a machine that started unpaired begins working once it's paired.
+func (w *Worker) SetConnection(gatewayURL, token string) {
+	w.connMu.Lock()
+	changed := w.gatewayURL != gatewayURL || w.token != token
+	w.gatewayURL, w.token = gatewayURL, token
+	w.connMu.Unlock()
+	if !changed {
+		return
+	}
+	w.log.Info("gateway connection changed", "gateway", gatewayURL)
+	w.setConnectError("")
+	for _, signal := range []chan struct{}{w.connChanged, w.reconnect} {
+		select {
+		case signal <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (w *Worker) setConnectError(text string) { w.connectError.Store(&text) }
+
+// ConnectError is why the worker isn't connected, when the last attempt failed.
+func (w *Worker) ConnectError() string {
+	if text := w.connectError.Load(); text != nil {
+		return *text
+	}
+	return ""
 }
 
 // config is the current manifest. Callers must not change it.
@@ -199,18 +250,37 @@ func isFinalEvent(eventType string) bool {
 // next start reports those attempts as interrupted.
 func (w *Worker) Run(ctx context.Context) error {
 	defer w.stopAllCommands()
+	w.life.Store(&ctx)
 	w.restartChecks(ctx)
 	delay := minReconnectDelay
+	saidUnpaired := false
 	for ctx.Err() == nil {
+		select {
+		case <-w.connChanged:
+			delay = minReconnectDelay
+		default:
+		}
+		if gatewayURL, token := w.connection(); gatewayURL == "" || token == "" {
+			if !saidUnpaired {
+				saidUnpaired = true
+				w.log.Warn("not paired with a gateway yet; open the page with `fleet-worker ui` to connect this machine")
+			}
+			select {
+			case <-w.connChanged:
+			case <-ctx.Done():
+			}
+			continue
+		}
 		started := time.Now()
 		err := w.session(ctx)
 		if ctx.Err() != nil {
 			break
 		}
 		if errors.Is(err, errReconnect) {
-			w.log.Info("reconnecting to tell the gateway about changed tools")
+			w.log.Info("reconnecting to tell the gateway what changed")
 			continue
 		}
+		w.setConnectError(err.Error())
 		w.log.Warn("disconnected from gateway", "error", err)
 		if time.Since(started) > stableSessionAfter {
 			delay = minReconnectDelay
@@ -219,6 +289,10 @@ func (w *Worker) Run(ctx context.Context) error {
 		wait := delay/2 + rand.N(delay/2+1)
 		select {
 		case <-time.After(wait):
+		case <-w.connChanged:
+			// Pairing again shouldn't wait out a delay earned by the old settings.
+			delay = minReconnectDelay
+			continue
 		case <-ctx.Done():
 		}
 		delay = min(delay*2, maxReconnectDelay)
@@ -253,14 +327,15 @@ func (w *Worker) session(parent context.Context) error {
 	default:
 	}
 
+	gatewayURL, token := w.connection()
 	dialCtx, cancelDial := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancelDial()
-	ws, resp, err := websocket.Dial(dialCtx, w.gatewayURL+"/v1/worker/connect", &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer " + w.token}},
+	ws, resp, err := websocket.Dial(dialCtx, gatewayURL+"/v1/worker/connect", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + token}},
 	})
 	if err != nil {
 		if resp != nil && resp.StatusCode == http.StatusUnauthorized {
-			return errors.New("the gateway rejected this node's token")
+			return errRejected
 		}
 		return fmt.Errorf("connect: %w", err)
 	}
@@ -271,7 +346,8 @@ func (w *Worker) session(parent context.Context) error {
 	if err != nil {
 		return err
 	}
-	w.log.Info("connected to gateway", "url", w.gatewayURL)
+	w.log.Info("connected to gateway", "url", gatewayURL)
+	w.setConnectError("")
 	w.connectedAt.Store(time.Now().UnixMilli())
 	defer w.connectedAt.Store(0)
 
@@ -303,6 +379,10 @@ func (w *Worker) session(parent context.Context) error {
 
 // errReconnect ends a session so the next hello can describe changed tools.
 var errReconnect = errors.New("reconnecting to update tools")
+
+// errRejected means the gateway doesn't know this machine's token, so only
+// pairing again can fix it.
+var errRejected = errors.New("the gateway rejected this node's token")
 
 func (w *Worker) handshake(ctx context.Context, ws *websocket.Conn) (time.Duration, error) {
 	node := w.config().Node

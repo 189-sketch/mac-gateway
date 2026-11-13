@@ -362,8 +362,9 @@ func TestReloadOnlyReconnectsForChangesTheGatewaySees(t *testing.T) {
 	path := writeWorker(t, "", nil)
 	a, _ := LoadManifest(path)
 	b, _ := LoadManifest(path)
+	// The gateway can change while running, which is how pairing takes effect.
 	b.GatewayURL, b.LogLevel = "https://other.example.com", "debug"
-	if got := fixedChanges(a, b); !slices.Equal(got, []string{"gateway_url", "log_level"}) {
+	if got := fixedChanges(a, b); !slices.Equal(got, []string{"log_level"}) {
 		t.Errorf("fixed changes = %q", got)
 	}
 }

@@ -48,25 +48,33 @@ type uiRunning struct {
 }
 
 type uiStatus struct {
-	Node           string      `json:"node"`
-	Gateway        string      `json:"gateway"`
-	Connected      bool        `json:"connected"`
-	ConnectedSince string      `json:"connected_since,omitempty"`
-	Version        string      `json:"version"`
-	Platform       string      `json:"platform"`
-	ConfigFile     string      `json:"config_file"`
-	ToolsDir       string      `json:"tools_dir"`
-	StateDir       string      `json:"state_dir"`
-	MaxJobs        int         `json:"max_jobs"`
-	Tools          []uiTool    `json:"tools"`
-	Running        []uiRunning `json:"running"`
+	Node    string `json:"node"`
+	Gateway string `json:"gateway"`
+	// Paired is false until this machine has a gateway and a token for it.
+	Paired    bool `json:"paired"`
+	Connected bool `json:"connected"`
+	// ConnectionError is why the last attempt to connect failed, and Rejected
+	// that the gateway doesn't know this machine's token, so it must pair again.
+	ConnectionError string      `json:"connection_error,omitempty"`
+	Rejected        bool        `json:"rejected,omitempty"`
+	ConnectedSince  string      `json:"connected_since,omitempty"`
+	Version         string      `json:"version"`
+	Platform        string      `json:"platform"`
+	ConfigFile      string      `json:"config_file"`
+	ToolsDir        string      `json:"tools_dir"`
+	StateDir        string      `json:"state_dir"`
+	MaxJobs         int         `json:"max_jobs"`
+	Tools           []uiTool    `json:"tools"`
+	Running         []uiRunning `json:"running"`
 }
 
 func (s *uiServer) status(w http.ResponseWriter, r *http.Request) {
 	m := s.w.config()
+	gatewayURL, token := s.w.connection()
 	out := uiStatus{
 		Node:       m.Node.Name,
-		Gateway:    m.GatewayURL,
+		Gateway:    gatewayURL,
+		Paired:     gatewayURL != "" && token != "",
 		Version:    s.opts.Version,
 		Platform:   runtime.GOOS + "/" + runtime.GOARCH,
 		ConfigFile: s.configPath,
@@ -79,6 +87,9 @@ func (s *uiServer) status(w http.ResponseWriter, r *http.Request) {
 	if since := s.w.connectedAt.Load(); since != 0 {
 		out.Connected = true
 		out.ConnectedSince = time.UnixMilli(since).UTC().Format(time.RFC3339)
+	} else if out.Paired {
+		out.ConnectionError = s.w.ConnectError()
+		out.Rejected = out.ConnectionError == errRejected.Error()
 	}
 
 	s.w.mu.Lock()

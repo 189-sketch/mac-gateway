@@ -6,11 +6,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"mactunnel/internal/gateway"
 )
@@ -25,7 +27,8 @@ const usage = `usage:
   fleet-gateway node revoke <name>   [--data DIR]
   fleet-gateway key add <name> --capabilities 'tts.*,video.*' [--data DIR]   print a new API key
   fleet-gateway key add <name> --dashboard [--data DIR]   print a new key for viewing the dashboard
-  fleet-gateway key revoke <name>    [--data DIR]`
+  fleet-gateway key revoke <name>    [--data DIR]
+  fleet-gateway pair [--data DIR] [--wait 15m] [--until-connected]   show the codes of machines asking to pair`
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -44,6 +47,8 @@ func run(args []string) error {
 		return nil
 	case "serve":
 		return serve(args[1:])
+	case "pair":
+		return pair(args[1:], os.Stdout)
 	case "node", "key":
 		if len(args) < 3 {
 			return errors.New(usage)
@@ -143,4 +148,89 @@ func manageCredential(kind, action, name string, args []string) error {
 		return errors.New(usage)
 	}
 	return nil
+}
+
+// pair shows the code of each machine that asks to pair, as it asks, and says
+// when one has connected. Codes are shown here and nowhere else: being able to
+// run this on the server is what proves a person may add a machine.
+func pair(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("pair", flag.ContinueOnError)
+	dataDir := fs.String("data", gateway.DefaultConfig().DataDir, "data directory")
+	wait := fs.Duration("wait", 15*time.Minute, "how long to keep watching; 0 lists what's waiting now and exits")
+	untilConnected := fs.Bool("until-connected", false, "stop as soon as a machine has connected")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if _, err := os.Stat(*dataDir); err != nil {
+		return fmt.Errorf("the gateway's data isn't in %s: %w", *dataDir, err)
+	}
+	store, err := gateway.OpenStore(*dataDir)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	started := time.Now()
+	deadline := started.Add(*wait)
+	shown := map[string]bool{}
+	paired := map[string]bool{}
+	connected := map[string]bool{}
+	for {
+		pairings, err := store.Pairings(ctx, started)
+		if err != nil {
+			return err
+		}
+		for _, p := range pairings {
+			if p.Paired {
+				if !paired[p.ID] {
+					paired[p.ID] = true
+					fmt.Fprintf(out, "==> Paired %s. It's connecting now.\n", p.NodeName)
+				}
+				continue
+			}
+			if shown[p.ID] {
+				continue
+			}
+			shown[p.ID] = true
+			what := p.Name
+			if p.OS != "" {
+				what += " (" + p.OS + "/" + p.Arch + ")"
+			}
+			fmt.Fprintf(out, "\n==> %s at %s is asking to pair. Type this code on that machine:\n\n        %s\n\n    It works for %d minutes. If you didn't start this, ignore it.\n",
+				what, p.Remote, gateway.FormatPairingCode(p.Code), int(time.Until(p.Expires).Round(time.Minute).Minutes()))
+		}
+		nodes, err := store.NodesSeenSince(ctx, started)
+		if err != nil {
+			return err
+		}
+		for _, n := range nodes {
+			if connected[n.Name] {
+				continue
+			}
+			connected[n.Name] = true
+			tools := fmt.Sprintf("%d tools", n.Tools)
+			if n.Tools == 1 {
+				tools = "1 tool"
+			}
+			fmt.Fprintf(out, "==> %s is connected, offering %s.\n", n.Name, tools)
+		}
+		if *untilConnected && len(connected) > 0 {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			if *wait > 0 && len(connected) == 0 {
+				fmt.Fprintln(out, "No machine has connected yet. Run this again when you're ready to pair one.")
+			} else if *wait == 0 && len(shown) == 0 {
+				fmt.Fprintln(out, "No machine is asking to pair.")
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(time.Second):
+		}
+	}
 }

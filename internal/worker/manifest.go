@@ -194,23 +194,15 @@ func LoadManifest(path string) (*Manifest, error) {
 func (c *Capability) isEnabled() bool { return c.Enabled == nil || *c.Enabled }
 
 func (m *Manifest) validate(baseDir string) error {
-	if m.GatewayURL == "" {
-		return errors.New("gateway_url is required")
-	}
-	parsed, err := url.Parse(m.GatewayURL)
-	if err != nil {
-		return fmt.Errorf("gateway_url: %w", err)
-	}
-	switch parsed.Scheme {
-	case "https":
-	case "http":
-		if !m.AllowInsecureHTTP && !isLoopback(parsed.Hostname()) {
-			return errors.New("gateway_url must use https, because plain http would expose the node token and job data")
+	// With no gateway_url, the worker starts unpaired and waits to be connected
+	// from its configuration page or with `fleet-worker pair`.
+	var err error
+	if m.GatewayURL != "" {
+		if err := checkGatewayURL(m.GatewayURL, m.AllowInsecureHTTP); err != nil {
+			return err
 		}
-	default:
-		return errors.New("gateway_url must start with https://")
+		m.GatewayURL = strings.TrimRight(m.GatewayURL, "/")
 	}
-	m.GatewayURL = strings.TrimRight(m.GatewayURL, "/")
 
 	if m.Node.Name == "" {
 		return errors.New("node.name is required")
@@ -385,6 +377,27 @@ func ParseLogLevel(text string) (slog.Level, error) {
 		return slog.LevelError, nil
 	}
 	return 0, fmt.Errorf("%q must be debug, info, warn or error", text)
+}
+
+// checkGatewayURL refuses an address that would send the node token in the clear.
+func checkGatewayURL(address string, allowInsecure bool) error {
+	parsed, err := url.Parse(address)
+	if err != nil {
+		return fmt.Errorf("gateway_url: %w", err)
+	}
+	if parsed.Host == "" {
+		return errors.New("gateway_url must start with https://")
+	}
+	switch parsed.Scheme {
+	case "https":
+	case "http":
+		if !allowInsecure && !isLoopback(parsed.Hostname()) {
+			return errors.New("gateway_url must use https, because plain http would expose the node token and job data")
+		}
+	default:
+		return errors.New("gateway_url must start with https://")
+	}
+	return nil
 }
 
 func isLoopback(host string) bool {
@@ -674,16 +687,23 @@ func (m *Manifest) protocolCapabilities() []protocol.Capability {
 	return out
 }
 
+// ErrNoToken means this machine has no node token yet, so it isn't paired.
+var ErrNoToken = errors.New("this machine has no node token yet")
+
 // ReadToken loads the node token from FLEET_NODE_TOKEN or token_file. Like SSH
-// keys, a token file must be private to its owner.
+// keys, a token file must be private to its owner. With no token anywhere, the
+// error is ErrNoToken.
 func (m *Manifest) ReadToken() (string, error) {
 	if token := strings.TrimSpace(os.Getenv("FLEET_NODE_TOKEN")); token != "" {
 		return token, nil
 	}
 	if m.TokenFile == "" {
-		return "", errors.New("set token_file in the manifest or FLEET_NODE_TOKEN in the environment")
+		return "", fmt.Errorf("%w: set token_file in the manifest or FLEET_NODE_TOKEN in the environment", ErrNoToken)
 	}
 	info, err := os.Stat(m.TokenFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("%w: %s doesn't exist", ErrNoToken, m.TokenFile)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -697,7 +717,7 @@ func (m *Manifest) ReadToken() (string, error) {
 	}
 	token := strings.TrimSpace(string(raw))
 	if token == "" {
-		return "", fmt.Errorf("%s is empty", m.TokenFile)
+		return "", fmt.Errorf("%w: %s is empty", ErrNoToken, m.TokenFile)
 	}
 	return token, nil
 }

@@ -172,7 +172,7 @@ func OpenStore(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schemaSQL); err != nil {
+	if _, err := db.Exec(schemaSQL + pairingSchemaSQL); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
@@ -328,6 +328,9 @@ type APIKey struct {
 	ID        string
 	Patterns  []string
 	Dashboard bool // Can view the dashboard, and can't use the agent API.
+	// Node is set on the short-lived key a machine uses to test its own connection.
+	// Such a key sees and runs only that machine's tools.
+	Node string
 }
 
 // APIKeyBySecret returns the active key matching a secret.

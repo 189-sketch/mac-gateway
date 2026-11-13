@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Worker tools</title>
+<title>Worker</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='2' y='2' width='12' height='12' rx='2' fill='none' stroke='%232a78d6' stroke-width='2'/%3E%3Cpath d='M5 6l2 2-2 2M8.5 10.5h3' fill='none' stroke='%232a78d6' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="style.css">
 </head>
@@ -23,6 +23,7 @@
     </div>
     <nav class="tabs" aria-label="Sections">
       <button type="button" class="tab" data-view="tools" aria-current="page">Tools</button>
+      <button type="button" class="tab" data-view="connection">Connection</button>
       <button type="button" class="tab" data-view="activity">Activity</button>
       <button type="button" class="tab" data-view="machine">This machine</button>
     </nav>
@@ -88,6 +89,69 @@
           <div id="try-call" hidden></div>
           <div id="try-result" hidden></div>
         </aside>
+      </div>
+    </section>
+
+    <section id="view-connection" hidden aria-labelledby="connection-title">
+      <div class="card panel">
+        <h2 id="connection-title">Gateway</h2>
+        <p id="conn-state" class="conn-state"></p>
+        <p id="conn-detail" class="hint"></p>
+        <div id="conn-actions" class="row" hidden>
+          <button id="conn-change" type="button" class="quiet">Connect to a different gateway</button>
+        </div>
+
+        <div id="pair-form" hidden>
+          <div class="field">
+            <label for="pair-gateway">Gateway address</label>
+            <input id="pair-gateway" autocomplete="off" spellcheck="false" autocapitalize="off" placeholder="203.0.113.10 or fleet.example.com">
+            <p class="hint">The IP address or domain of the server where you installed the gateway.</p>
+          </div>
+          <div class="choices" role="radiogroup" aria-label="How to connect">
+            <label class="inline"><input type="radio" name="pair-method" value="code" checked> With a pairing code</label>
+            <label class="inline"><input type="radio" name="pair-method" value="key"> With a key from the server</label>
+          </div>
+
+          <div id="pair-code-ask">
+            <p class="hint">The server shows a code for this machine, and you type it here. Nothing has to be copied to this machine.</p>
+            <div class="row"><button id="pair-start" type="button" class="primary">Get a pairing code</button></div>
+          </div>
+          <div id="pair-code-enter" hidden>
+            <p class="note">The server is now showing a code for <strong id="pair-name"></strong>. If the gateway's installer is still waiting there, the code is on its screen. Otherwise run <code>sudo fleet-pair</code> on the server.</p>
+            <div class="field">
+              <label for="pair-code">Pairing code</label>
+              <input id="pair-code" class="code-input" autocomplete="off" spellcheck="false" autocapitalize="characters" placeholder="ABCD-EFGH" maxlength="12">
+            </div>
+            <div class="row">
+              <button id="pair-confirm" type="button" class="primary">Pair this machine</button>
+              <button id="pair-again" type="button" class="quiet">Get a new code</button>
+            </div>
+          </div>
+          <div id="pair-key-pane" hidden>
+            <div class="field">
+              <label for="pair-key">Key</label>
+              <input id="pair-key" type="password" autocomplete="off" spellcheck="false" placeholder="fn_...">
+              <p class="hint">On the server, run <code>sudo fleet-add-worker NAME</code> with a name for this machine, and paste the token it prints.</p>
+            </div>
+            <div class="row"><button id="pair-key-go" type="button" class="primary">Connect</button></div>
+          </div>
+          <p id="pair-problem" class="problem" role="status" hidden></p>
+          <div id="pair-cancel-row" class="row" hidden><button id="pair-cancel" type="button" class="quiet">Keep the current gateway</button></div>
+        </div>
+      </div>
+
+      <div class="card panel">
+        <h2>Test the MCP connection</h2>
+        <p class="hint">Does what an agent does, from this machine: opens the gateway's MCP endpoint, lists this machine's tools, and calls one with its test input. It uses a key the gateway makes for the test, which works for two minutes and reaches only this machine.</p>
+        <div class="row"><button id="mcp-test" type="button" class="primary">Run the test</button><span id="mcp-verdict"></span></div>
+        <ol id="mcp-steps" class="steps"></ol>
+        <div id="mcp-howto" hidden>
+          <h3>Use it from an agent</h3>
+          <p class="hint">Add the gateway to your agent as an MCP server at this address, with the API key the gateway's installer printed on the server:</p>
+          <pre class="command"><code id="mcp-url"></code></pre>
+          <p class="hint">In Claude Code, for example:</p>
+          <pre class="command"><code id="mcp-command"></code></pre>
+        </div>
       </div>
     </section>
 

@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,7 +20,7 @@ const ReloadEvery = 2 * time.Second
 // asked to through reload. A change that isn't valid is logged and ignored, so a
 // half-saved file never takes tools away from a running machine.
 func (w *Worker) WatchConfig(ctx context.Context, path string, every time.Duration) {
-	last := configFingerprint(path, w.config().ToolsPath())
+	last := configFingerprint(path, w.config())
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	for {
@@ -31,7 +32,7 @@ func (w *Worker) WatchConfig(ctx context.Context, path string, every time.Durati
 		case <-w.reloadNow:
 			forced = true
 		}
-		now := configFingerprint(path, w.config().ToolsPath())
+		now := configFingerprint(path, w.config())
 		if now == last && !forced {
 			continue
 		}
@@ -43,6 +44,16 @@ func (w *Worker) WatchConfig(ctx context.Context, path string, every time.Durati
 		}
 		w.Reload(ctx, next)
 	}
+}
+
+// ReloadFrom reads the manifest again and switches to it before returning.
+func (w *Worker) ReloadFrom(path string) error {
+	next, err := LoadManifest(path)
+	if err != nil {
+		return err
+	}
+	w.Reload(*w.life.Load(), next)
+	return nil
 }
 
 // RequestReload asks for the tools to be read again now, rather than at the
@@ -63,12 +74,25 @@ func (w *Worker) Reload(ctx context.Context, next *Manifest) {
 	}
 	// Keep what can't change while running, so the new manifest is consistent
 	// with the worker using it.
-	next.GatewayURL, next.TokenFile, next.StateDir = current.GatewayURL, current.TokenFile, current.StateDir
-	next.AllowInsecureHTTP, next.UploadRetryWindow, next.uploadWindow = current.AllowInsecureHTTP, current.UploadRetryWindow, current.uploadWindow
+	next.StateDir = current.StateDir
+	next.UploadRetryWindow, next.uploadWindow = current.UploadRetryWindow, current.uploadWindow
 	next.LogLevel, next.UIListen, next.uiAddr = current.LogLevel, current.UIListen, current.uiAddr
 
 	LogToolErrors(w.log, next)
 	w.cfg.Store(next)
+	// Pairing writes the gateway's address and a token, and takes effect here.
+	// A token given only in the environment isn't in a file to read again, so
+	// with none found the current one stays.
+	gatewayURL, token := w.connection()
+	if fresh, err := next.ReadToken(); err == nil {
+		token = fresh
+	} else if !errors.Is(err, ErrNoToken) {
+		w.log.Error("couldn't read the node token, so the worker keeps the one it has", "error", err)
+	}
+	if next.GatewayURL != "" {
+		gatewayURL = next.GatewayURL
+	}
+	w.SetConnection(gatewayURL, token)
 	w.log.Info("tools reloaded", "tools", strings.Join(toolNames(next), ", "))
 	w.restartChecks(ctx)
 	if !sameHello(current, next) {
@@ -97,10 +121,7 @@ func toolNames(m *Manifest) []string {
 func fixedChanges(a, b *Manifest) []string {
 	var out []string
 	for name, same := range map[string]bool{
-		"gateway_url":         a.GatewayURL == b.GatewayURL,
-		"token_file":          a.TokenFile == b.TokenFile,
 		"state_dir":           a.StateDir == b.StateDir,
-		"allow_insecure_http": a.AllowInsecureHTTP == b.AllowInsecureHTTP,
 		"upload_retry_window": a.uploadWindow == b.uploadWindow,
 		"log_level":           a.LogLevel == b.LogLevel,
 		"ui_listen":           a.uiAddr == b.uiAddr,
@@ -126,7 +147,8 @@ func sameHello(a, b *Manifest) bool {
 
 // configFingerprint changes when the manifest or any file in the tools folder
 // does. Comparing sizes and times is enough, and much cheaper than reading.
-func configFingerprint(path, toolsDir string) string {
+func configFingerprint(path string, m *Manifest) string {
+	toolsDir := m.ToolsPath()
 	var b strings.Builder
 	stamp := func(name string) {
 		if info, err := os.Stat(name); err == nil {
@@ -134,6 +156,10 @@ func configFingerprint(path, toolsDir string) string {
 		}
 	}
 	stamp(path)
+	// The token file too, so pairing again with the same gateway takes effect.
+	if m.TokenFile != "" {
+		stamp(m.TokenFile)
+	}
 	if entries, err := os.ReadDir(toolsDir); err == nil {
 		for _, entry := range entries {
 			stamp(filepath.Join(toolsDir, entry.Name()))

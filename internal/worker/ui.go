@@ -65,6 +65,8 @@ type uiServer struct {
 
 	mu    sync.Mutex
 	codes map[string]time.Time
+	// pairing is the request waiting for the code from the server, if any.
+	pairing *PairingRequest
 
 	tries *tryRunner
 }
@@ -210,6 +212,11 @@ func (s *uiServer) handler() http.Handler {
 	mux.HandleFunc("POST /api/files", s.withToken(s.newFile))
 	mux.HandleFunc("POST /api/files/{file}/enabled", s.withToken(s.setEnabled))
 	mux.HandleFunc("GET /api/builtin/{name}", s.withToken(s.readBuiltin))
+
+	mux.HandleFunc("POST /api/pair/start", s.withToken(s.pairStart))
+	mux.HandleFunc("POST /api/pair/confirm", s.withToken(s.pairConfirm))
+	mux.HandleFunc("POST /api/pair/key", s.withToken(s.pairWithKey))
+	mux.HandleFunc("POST /api/mcp-test", s.withToken(s.mcpTest))
 
 	mux.HandleFunc("POST /api/convert", s.withToken(s.convert))
 	mux.HandleFunc("POST /api/check", s.withToken(s.check))

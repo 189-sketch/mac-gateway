@@ -177,6 +177,17 @@ func (g *Gateway) mcpKey(r *http.Request) (*APIKey, *rpcError) {
 	if secret == "" {
 		return nil, newRPCError(http.StatusUnauthorized, rpcInvalidRequest, "send an API key as Authorization: Bearer <key>")
 	}
+	if strings.HasPrefix(secret, mcpTestKeyPrefix) {
+		key, err := g.mcpTestKey(r.Context(), secret)
+		if err != nil {
+			g.logError(r.Context(), "check test key", err)
+			return nil, newRPCError(http.StatusInternalServerError, rpcInternalError, "internal error")
+		}
+		if key == nil {
+			return nil, newRPCError(http.StatusUnauthorized, rpcInvalidRequest, "this connection test's key has expired")
+		}
+		return key, nil
+	}
 	key, err := g.store.APIKeyBySecret(r.Context(), secret)
 	if err != nil {
 		g.logError(r.Context(), "check API key", err)

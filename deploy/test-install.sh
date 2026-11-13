@@ -14,7 +14,7 @@ WORK="$(mktemp -d)"
 GATEWAY_PID=""
 cleanup() {
 	[ -n "$GATEWAY_PID" ] && kill "$GATEWAY_PID" 2>/dev/null
-	for pidfile in "$WORK"/home/worker.pid "$WORK"/linux-root*/worker.pid; do
+	for pidfile in "$WORK"/home/worker.pid "$WORK"/linux-root*/worker.pid "$WORK"/pair-root/worker.pid "$WORK"/skip-root/worker.pid "$WORK"/rel-root/worker.pid; do
 		[ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null
 	done
 	rm -rf "$WORK"
@@ -174,7 +174,13 @@ check "installs" test "$RESULT" -eq 0
 check "finds the public IP address" grep -q 'This server is at 203.0.113.10' "$OUT"
 check "asks for an IPv4 address" grep -q 'curl -4 .*api.ipify.org' "$STUB_LOG"
 check "prints the IP address as the gateway URL" grep -q 'FLEET_URL=https://203.0.113.10$' "$OUT"
-check "prints the worker command for the IP address" grep -q 'curl -fsSL https://203.0.113.10/install/worker.sh | FLEET_NODE_NAME=mac-mini-1' "$OUT"
+check "prints the worker command for the IP address" grep -qx '  curl -fsSL https://203.0.113.10/install/worker.sh | sh' "$OUT"
+refute "makes no token nobody asked for" grep -q 'FLEET_NODE_TOKEN' "$OUT"
+check "prints the MCP address" grep -q 'Address:  https://203.0.113.10/mcp' "$OUT"
+check "says where pairing codes appear" grep -q 'sudo fleet-pair' "$OUT"
+check "installs fleet-pair" test -x "$ROOT_IP/usr/local/bin/fleet-pair"
+check "fleet-pair runs" sh -c "FLEET_INSTALL_ROOT='$ROOT_IP' PATH='$SERVER_PATH' '$ROOT_IP/usr/local/bin/fleet-pair' --wait 0 | grep -q 'No machine is asking to pair'"
+refute "doesn't wait for a machine when nobody is watching" grep -q 'Waiting for a machine' "$OUT"
 check "prints the MCP command for the IP address" grep -q 'claude mcp add --transport http fleet https://203.0.113.10/mcp' "$OUT"
 check "publishes the installer with the IP address" grep -q 'GATEWAY_URL="${FLEET_GATEWAY_URL:-https://203.0.113.10}"' "$ROOT_IP/srv/fleet/install/worker.sh"
 check "serves the IP address in Caddy" grep -q '^203.0.113.10 {' "$ROOT_IP/etc/caddy/fleet.caddy"
@@ -191,6 +197,33 @@ check "runs again" test $? -eq 0
 check "keeps the IP address" grep -q 'Keeping the address from the last install, 203.0.113.10' "$OUT"
 check "adds default_sni once" test "$(grep -c default_sni "$ROOT_IP/etc/caddy/Caddyfile")" = 1
 check "adds the global options once" test "$(grep -c '^{ # fleet-gateway$' "$ROOT_IP/etc/caddy/Caddyfile")" = 1
+
+echo "Asking about a domain"
+# The answers come from a file standing in for the terminal.
+ROOT_ASK="$WORK/root-ask"
+mkdir -p "$ROOT_ASK"
+echo "" >"$WORK/answer-none"
+OUT="$WORK/ask-none.out"
+FLEET_INSTALL_TTY="$WORK/answer-none" FLEET_NO_WAIT=1 run_gateway_install "$ROOT_ASK" >"$OUT" 2>&1
+check "installs" test $? -eq 0
+check "asks whether there's a domain" grep -q 'Domain name for this server, if it has one (press Enter to use its IP address, 203.0.113.10)' "$OUT"
+check "uses the IP address when the answer is empty" grep -q '^203.0.113.10 {' "$ROOT_ASK/etc/caddy/fleet.caddy"
+ROOT_ASK2="$WORK/root-ask2"
+mkdir -p "$ROOT_ASK2"
+echo "Fleet.Example.org" >"$WORK/answer-domain"
+FLEET_INSTALL_TTY="$WORK/answer-domain" FLEET_NO_WAIT=1 run_gateway_install "$ROOT_ASK2" >"$OUT" 2>&1
+check "installs on the domain given, in lower case" grep -q '^fleet.example.org {' "$ROOT_ASK2/etc/caddy/fleet.caddy"
+refute "doesn't treat a domain as an IP address" grep -q 'shortlived' "$ROOT_ASK2/etc/caddy/fleet.caddy"
+ROOT_ASK3="$WORK/root-ask3"
+mkdir -p "$ROOT_ASK3"
+printf 'not a domain\nfleet.example.net\n' >"$WORK/answer-retry"
+FLEET_INSTALL_TTY="$WORK/answer-retry" FLEET_NO_WAIT=1 run_gateway_install "$ROOT_ASK3" >"$OUT" 2>&1
+check "asks again after an answer that isn't a domain" grep -q "doesn't look like a domain name" "$OUT"
+check "then uses the domain" grep -q '^fleet.example.net {' "$ROOT_ASK3/etc/caddy/fleet.caddy"
+OUT="$WORK/ask-wait.out"
+: >"$STUB_LOG"
+FLEET_INSTALL_TTY="$WORK/answer-none" FLEET_NO_WAIT=1 run_gateway_install "$ROOT_ASK" fleet.example.com >"$OUT" 2>&1
+refute "doesn't ask when an address is given" grep -q 'Domain name for this server' "$OUT"
 
 echo "Moving from the IP address to a domain"
 OUT="$WORK/ip-to-domain.out"
@@ -261,7 +294,7 @@ stub sleep 'exit 0'
 STUB_UNREACHABLE=1 run_gateway_install "$ROOT3" fleet.example.com >"$OUT" 2>&1
 check "exits with an error" test $? -ne 0
 check "still prints the one-time API key" grep -q 'FLEET_API_KEY=fk_' "$OUT"
-check "still prints the one-time node token" grep -q 'FLEET_NODE_TOKEN=fn_' "$OUT"
+check "still prints the worker command" grep -q 'curl -fsSL https://fleet.example.com/install/worker.sh | sh' "$OUT"
 check "explains what to check" grep -q 'security group' "$OUT"
 rm "$STUBS/sleep"
 
@@ -288,16 +321,20 @@ mv "$REPO/dist/release" "$RELEASE"
 rmdir "$REPO/dist" 2>/dev/null
 export STUB_RELEASE="$RELEASE"
 check "checksums cover the release" sh -c "cd '$RELEASE' && sha256sum -c SHA256SUMS"
-for file in fleet-server-linux-amd64.tar.gz fleet-server-linux-arm64.tar.gz fleet-linux-amd64 fleet-linux-arm64 fleet-darwin-arm64 fleet-darwin-amd64 install-gateway.sh install-cli.sh; do
+for file in fleet-server-linux-amd64.tar.gz fleet-server-linux-arm64.tar.gz fleet-linux-amd64 fleet-linux-arm64 fleet-darwin-arm64 fleet-darwin-amd64 install-gateway.sh install-cli.sh install-worker.sh install-worker.ps1 fleet-worker-darwin-arm64 fleet-worker-darwin-amd64 fleet-worker-linux-amd64 fleet-worker-linux-arm64 fleet-worker-windows-amd64.exe fleet-worker-windows-arm64.exe; do
 	check "includes $file" test -f "$RELEASE/$file"
 done
 check "fills in the download address" grep -q 'releases/download/v9.9.9' "$RELEASE/install-gateway.sh"
 refute "leaves no placeholder" grep -q '@@RELEASE_URL@@' "$RELEASE/install-gateway.sh"
+check "the worker installer knows where the release is" grep -q 'RELEASE_URL="${FLEET_RELEASE_URL:-https://github.com/.*/releases/download/v9.9.9}"' "$RELEASE/install-worker.sh"
+check "the worker installer has no gateway yet" grep -q 'GATEWAY_URL="${FLEET_GATEWAY_URL:-@@GATEWAY_URL@@}"' "$RELEASE/install-worker.sh"
+refute "keeps the Windows installer plain ASCII in the release" grep -qP '[^\x00-\x7F]' "$RELEASE/install-worker.ps1"
 check "binaries report the version" sh -c "'$RELEASE/fleet-linux-amd64' version | grep -q v9.9.9"
 mkdir -p "$WORK/bundle-check"
 tar -xzf "$RELEASE/fleet-server-linux-amd64.tar.gz" -C "$WORK/bundle-check"
 BUNDLE_DIR="$WORK/bundle-check/fleet-server-linux-amd64"
 check "the bundle includes the gateway" test -x "$BUNDLE_DIR/fleet-gateway"
+check "the bundle includes fleet-pair" test -x "$BUNDLE_DIR/pair.sh"
 check "the bundled gateway reports the version" sh -c "'$BUNDLE_DIR/fleet-gateway' version | grep -q v9.9.9"
 check "the bundle includes the Linux workers" test -x "$BUNDLE_DIR/fleet-worker-linux-amd64" -a -x "$BUNDLE_DIR/fleet-worker-linux-arm64"
 check "the bundled Linux worker reports the version" sh -c "'$BUNDLE_DIR/fleet-worker-linux-amd64' --version | grep -q v9.9.9"
@@ -305,7 +342,7 @@ check "the bundled Linux worker reports the version" sh -c "'$BUNDLE_DIR/fleet-w
 # Hide Go, to prove a release install doesn't need it.
 NO_GO="$WORK/no-go"
 mkdir -p "$NO_GO"
-for tool in bash sh env id seq sleep grep sed awk tr mktemp rm cat cp mv mkdir dirname tar gzip sha256sum install touch tee uname cut head chmod; do
+for tool in bash sh env id seq sleep grep sed awk tr mktemp rm cat cp mv mkdir dirname tar gzip sha256sum install touch tee uname cut head chmod stat; do
 	ln -s "$(command -v "$tool")" "$NO_GO/$tool"
 done
 RELEASE_PATH="$STUBS:$NO_GO"
@@ -323,6 +360,8 @@ check "prints the Mac command" grep -q 'FLEET_NODE_NAME=mac-piped' "$OUT"
 check "installs the release's gateway" sh -c "'$ROOT5/usr/local/bin/fleet-gateway' version | grep -q v9.9.9"
 check "installs fleet-add-worker" test -x "$ROOT5/usr/local/bin/fleet-add-worker"
 check "publishes the worker" test -f "$ROOT5/srv/fleet/install/fleet-worker-darwin-arm64"
+check "installs fleet-pair" test -x "$ROOT5/usr/local/bin/fleet-pair"
+check "publishes a worker installer that names the gateway and the release" sh -c "grep -q 'GATEWAY_URL=.*:-https://fleet.example.com}' '$ROOT5/srv/fleet/install/worker.sh' && grep -q 'RELEASE_URL=.*releases/download/v9.9.9}' '$ROOT5/srv/fleet/install/worker.sh'"
 
 echo "From an unpacked bundle"
 ROOT6="$WORK/root6"
@@ -551,6 +590,7 @@ echo "add-worker.sh"
 OUT="$WORK/add.out"
 FLEET_INSTALL_ROOT="$ROOT" PATH="$SERVER_PATH" "$REPO/deploy/add-worker.sh" mac-four >"$OUT" 2>&1
 check "prints the Mac command" grep -q 'FLEET_NODE_NAME=mac-four' "$OUT"
+check "prints the token by itself, for the worker's page" grep -qx '  fn_[0-9a-f]*' "$OUT"
 check "says the command is for Linux too" grep -q 'On a Mac or a Linux machine' "$OUT"
 FLEET_INSTALL_ROOT="$ROOT" PATH="$SERVER_PATH" "$REPO/deploy/add-worker.sh" mac-four >"$OUT" 2>&1
 check "refuses a name already in use" test $? -ne 0
@@ -612,9 +652,13 @@ mkdir -p "$PUBLISHED"
 cp "$ROOT/srv/fleet/install/worker.sh" "$PUBLISHED/"
 cat >"$PUBLISHED/fleet-worker-darwin-arm64" <<'WRAPPER'
 #!/bin/sh
+case "$1" in
+ui) echo "worker $*" >>"$STUB_LOG"; exit 0 ;;
+pair) exec "$REAL_WORKER" "$@" ;;
+esac
 config="$2"
 linux="$(dirname "$config")/worker.linux.yaml"
-sed -e "s|^gateway_url:.*|gateway_url: $TEST_GATEWAY|" -e "s|/usr/bin/say|/bin/cat|" "$config" >"$linux"
+sed -e "s|^gateway_url: \"https://.*|gateway_url: $TEST_GATEWAY|" -e "s|/usr/bin/say|/bin/cat|" -e '$a ui_listen: off' "$config" >"$linux"
 exec "$REAL_WORKER" --config "$linux" $3
 WRAPPER
 cp "$PUBLISHED/fleet-worker-darwin-arm64" "$PUBLISHED/fleet-worker-darwin-amd64"
@@ -632,10 +676,11 @@ run_worker_install() { # Environment assignments come before this call.
 }
 
 OUT="$WORK/worker.out"
-FLEET_NODE_NAME=mac-worker FLEET_NODE_TOKEN="" run_worker_install >"$OUT" 2>&1
-check "refuses without a token" test $? -ne 0
 FLEET_NODE_NAME='bad;name' FLEET_NODE_TOKEN=fn_x run_worker_install >"$OUT" 2>&1
 check "refuses an invalid node name" test $? -ne 0
+FLEET_NODE_TOKEN='fn_x; rm -rf /' run_worker_install >"$OUT" 2>&1
+check "refuses a token that isn't one" test $? -ne 0
+refute "changes nothing when refusing" test -e "$MAC_HOME/fleet"
 FLEET_NODE_NAME=mac-worker FLEET_NODE_TOKEN=fn_x STUB_ARCH=sparc run_worker_install >"$OUT" 2>&1
 check "refuses an unknown chip" test $? -ne 0
 rm -rf "$MAC_HOME/fleet"
@@ -656,6 +701,9 @@ check "installs and connects" test "$RESULT" -eq 0
 [ "$RESULT" -eq 0 ] || sed 's/^/    /' "$OUT" >&2
 check "reports the connection" grep -q 'Connected to https://fleet.example.com' "$OUT"
 check "prints the power settings to apply" grep -q 'sudo pmset' "$OUT"
+check "opens the worker's page" grep -q "worker ui --config $MAC_HOME/fleet/worker.yaml --wait 15s" "$STUB_LOG"
+check "points to the MCP test" grep -q 'reach this machine.s tools through MCP' "$OUT"
+check "says how to open the page again" grep -q "fleet-worker ui --config $MAC_HOME/fleet/worker.yaml" "$OUT"
 check "explains how to watch the log" grep -q 'tail -F .*worker.log' "$OUT"
 check "gives the Mac a capability test" grep -q 'test:' "$MAC_HOME/fleet/worker.yaml"
 check "saves the token privately" test "$(stat -c %a "$MAC_HOME/fleet/token")" = 600
@@ -761,10 +809,14 @@ cp "$MAC_STUBS/curl" "$LINUX_STUBS/curl"
 # in a manifest but is plain http here.
 cat >"$PUBLISHED/fleet-worker-linux-amd64" <<'WRAPPER'
 #!/bin/sh
+case "$1" in
+ui) echo "worker $*" >>"$STUB_LOG"; exit 0 ;;
+pair) exec "$REAL_WORKER" "$@" ;;
+esac
 config="$2"
 shift 2
 linux="$(dirname "$config")/worker.test.yaml"
-sed -e "s|^gateway_url:.*|gateway_url: $TEST_GATEWAY|" "$config" >"$linux"
+sed -e "s|^gateway_url: \"https://.*|gateway_url: $TEST_GATEWAY|" -e '$a ui_listen: off' "$config" >"$linux"
 exec "$REAL_WORKER" --config "$linux" "$@"
 WRAPPER
 cp "$PUBLISHED/fleet-worker-linux-amd64" "$PUBLISHED/fleet-worker-linux-arm64"
@@ -877,7 +929,7 @@ FLEET_NODE_NAME=x FLEET_NODE_TOKEN=fn_x run_linux_install "$BARE" "$WORK/linux h
 check "refuses a home folder systemd can't name" grep -q "can't be installed in" "$OUT"
 STUB_NO_SUDO=1 FLEET_NODE_NAME=x FLEET_NODE_TOKEN=fn_x run_linux_install "$BARE" "$WORK/linux-home-bare" >"$OUT" 2>&1
 check "stops without sudo" test $? -ne 0
-check "suggests running as root" grep -q 'FLEET_WORKER_USER' "$OUT"
+check "suggests running as root" grep -q 'Run this as root instead' "$OUT"
 refute "changes nothing without sudo" test -e "$WORK/linux-home-bare/fleet"
 
 echo "Linux install as root, for another account"
@@ -887,7 +939,7 @@ echo "Linux install as root, for another account"
 ROOT_STUBS="$WORK/root-stubs"
 cp -r "$LINUX_STUBS" "$ROOT_STUBS"
 printf '#!/bin/sh\ncase "$*" in\n"-u") echo 0 ;;\n"-un") echo root ;;\n"-u root") echo 0 ;;\n"-u fleet-worker") echo 1001 ;;\n"-u "*) exit 1 ;;\n"-Gn "*) echo fleet-worker ;;\n*) exec /usr/bin/id "$@" ;;\nesac\n' >"$ROOT_STUBS/id"
-printf '#!/bin/sh\n[ "$2" = fleet-worker ] && echo "fleet-worker:x:1001:1001::$STUB_WORKER_HOME:/bin/bash"\n' >"$ROOT_STUBS/getent"
+printf '#!/bin/sh\ncase "$2" in\nfleet-worker) echo "fleet-worker:x:1001:1001::$STUB_WORKER_HOME:/bin/bash" ;;\nroot) echo "root:x:0:0:root:$STUB_ROOT_HOME:/bin/bash" ;;\nesac\n' >"$ROOT_STUBS/getent"
 chmod +x "$ROOT_STUBS/id" "$ROOT_STUBS/getent"
 run_root_install() { # root; environment assignments come before this call.
 	FLEET_INSTALL_ROOT="$1" HOME=/nonexistent PATH="$ROOT_STUBS:$PATH" sh "$PUBLISHED/worker.sh"
@@ -898,10 +950,6 @@ mkdir -p "$LINUX_ROOT2/run/systemd/system" "$STUB_WORKER_HOME"
 LINUX_TOKEN2="$(new_node linux-two)"
 
 OUT="$WORK/linux-root.out"
-FLEET_NODE_NAME=linux-two FLEET_NODE_TOKEN="$LINUX_TOKEN2" run_root_install "$LINUX_ROOT2" >"$OUT" 2>&1
-check "refuses to run jobs as root" grep -q 'jobs would run as root' "$OUT"
-FLEET_WORKER_USER=root FLEET_NODE_NAME=linux-two FLEET_NODE_TOKEN="$LINUX_TOKEN2" run_root_install "$LINUX_ROOT2" >"$OUT" 2>&1
-check "refuses root as the account" grep -q 'jobs would run as root' "$OUT"
 FLEET_WORKER_USER=nobody-here FLEET_NODE_NAME=linux-two FLEET_NODE_TOKEN="$LINUX_TOKEN2" run_root_install "$LINUX_ROOT2" >"$OUT" 2>&1
 check "refuses an account that doesn't exist" grep -q "no account named 'nobody-here'" "$OUT"
 FLEET_WORKER_USER="$(printf 'fleet-worker\nExecStartPre=/bin/true')" FLEET_NODE_NAME=linux-two FLEET_NODE_TOKEN="$LINUX_TOKEN2" run_root_install "$LINUX_ROOT2" >"$OUT" 2>&1
@@ -923,6 +971,109 @@ refute "doesn't use sudo as root" grep -q '^sudo' "$STUB_LOG"
 run_root_install "$LINUX_ROOT2" >"$OUT" 2>&1
 check "upgrades as root, keeping the service's account" test $? -eq 0
 check "keeps the account" grep -qx 'User=fleet-worker' "$LINUX_ROOT2/etc/systemd/system/fleet-worker.service"
+
+echo "Linux install as root, running as root"
+# The token alone is given, so the installer asks the gateway whose it is.
+LINUX_ROOT3="$WORK/linux-root3"
+export STUB_ROOT_HOME="$WORK/root-home"
+mkdir -p "$LINUX_ROOT3/run/systemd/system" "$STUB_ROOT_HOME"
+LINUX_TOKEN3="$(new_node linux-three)"
+OUT="$WORK/linux-as-root.out"
+: >"$STUB_LOG"
+FLEET_GATEWAY_URL="$TEST_GATEWAY" FLEET_NODE_TOKEN="$LINUX_TOKEN3" run_root_install "$LINUX_ROOT3" >"$OUT" 2>&1
+RESULT=$?
+check "installs and connects as root" test "$RESULT" -eq 0
+[ "$RESULT" -eq 0 ] || sed 's/^/    /' "$OUT" >&2
+check "installs into root's home" test -f "$STUB_ROOT_HOME/fleet/worker.yaml"
+check "runs the service as root" grep -qx 'User=root' "$LINUX_ROOT3/etc/systemd/system/fleet-worker.service"
+check "warns that jobs run as root" grep -q 'the worker will run as root' "$OUT"
+check "learns the machine's name from its token" grep -qx '  name: linux-three' "$STUB_ROOT_HOME/fleet/worker.yaml"
+check "says it connected" grep -q "Connected to $TEST_GATEWAY" "$OUT"
+refute "doesn't switch user to act as root" grep -q '^runuser' "$STUB_LOG"
+refute "doesn't use sudo as root" grep -q '^sudo' "$STUB_LOG"
+check "all three Linux machines are online" online_on system.hostname 3
+
+echo "Pairing with a code"
+# The installer asks the gateway to pair and waits for the code, which is read
+# from the server exactly as a person would, and typed into a stand-in terminal.
+PAIR_ROOT="$WORK/pair-root"
+PAIR_HOME="$WORK/pair-home"
+mkdir -p "$PAIR_ROOT/run/systemd/system" "$PAIR_HOME"
+mkfifo "$WORK/pair-tty"
+OUT="$WORK/pair.out"
+: >"$STUB_LOG"
+# Held open here, so the installer isn't kept waiting for someone to type.
+exec 9<>"$WORK/pair-tty"
+FLEET_GATEWAY_URL="$TEST_GATEWAY" FLEET_NODE_NAME=paired-box FLEET_INSTALL_TTY="$WORK/pair-tty" run_linux_install "$PAIR_ROOT" "$PAIR_HOME" >"$OUT" 2>&1 &
+INSTALL_PID=$!
+show_codes() { FLEET_INSTALL_ROOT="$ROOT" PATH="$SERVER_PATH" "$ROOT/usr/local/bin/fleet-pair" --wait 0 2>/dev/null; }
+CODE=""
+for _ in $(seq 1 40); do
+	CODE="$(show_codes | sed -n 's/^ *\([A-Z2-9]\{4\}-[A-Z2-9]\{4\}\)$/\1/p' | head -1)"
+	[ -n "$CODE" ] && break
+	sleep 0.5
+done
+check "the server shows a pairing code" test -n "$CODE"
+check "the server says which machine is asking" sh -c "FLEET_INSTALL_ROOT='$ROOT' PATH='$SERVER_PATH' '$ROOT/usr/local/bin/fleet-pair' --wait 0 | grep -q 'paired-box (linux/.*) at 127.0.0.1 is asking to pair'"
+refute "the code isn't in the gateway's log" grep -q "${CODE:-no-code}\|$(echo "${CODE:-no-code}" | tr -d -)" "$WORK/gateway.log"
+# A wrong code first, then the right one in lower case, as someone might type it.
+{
+	echo "AAAA-AAAA"
+	echo "$CODE" | tr 'A-Z' 'a-z'
+} >&9
+wait "$INSTALL_PID"
+RESULT=$?
+exec 9>&-
+check "installs, pairs and connects" test "$RESULT" -eq 0
+[ "$RESULT" -eq 0 ] || sed 's/^/    /' "$OUT" >&2
+check "says where to find the code" grep -q 'sudo fleet-pair' "$OUT"
+check "says the wrong code was wrong" grep -q "That code isn't right" "$OUT"
+check "says it paired" grep -q "Paired with $TEST_GATEWAY as paired-box" "$OUT"
+check "says it connected" grep -q "Connected to $TEST_GATEWAY" "$OUT"
+check "saves the token privately" test "$(stat -c %a "$PAIR_HOME/fleet/token")" = 600
+check "the token is a node token" grep -q '^fn_[0-9a-f]\{64\}$' "$PAIR_HOME/fleet/token"
+check "keeps the rest of worker.yaml" grep -q 'Pairing this machine fills in gateway_url' "$PAIR_HOME/fleet/worker.yaml"
+check "the paired machine is online" online_on system.hostname 4
+check "opens the worker's page" grep -q "worker ui --config $PAIR_HOME/fleet/worker.yaml --wait 15s" "$STUB_LOG"
+refute "the code can't be used twice" sh -c "FLEET_INSTALL_ROOT='$ROOT' PATH='$SERVER_PATH' '$ROOT/usr/local/bin/fleet-pair' --wait 0 | grep -q '$CODE'"
+
+echo "Skipping the pairing code"
+SKIP_ROOT="$WORK/skip-root"
+SKIP_HOME="$WORK/skip-home"
+mkdir -p "$SKIP_ROOT/run/systemd/system" "$SKIP_HOME"
+echo "" >"$WORK/skip-tty"
+OUT="$WORK/skip.out"
+FLEET_GATEWAY_URL="$TEST_GATEWAY" FLEET_INSTALL_TTY="$WORK/skip-tty" run_linux_install "$SKIP_ROOT" "$SKIP_HOME" >"$OUT" 2>&1
+RESULT=$?
+check "installs without pairing" test "$RESULT" -eq 0
+[ "$RESULT" -eq 0 ] || sed 's/^/    /' "$OUT" >&2
+check "says it skipped" grep -q 'Skipped. You can pair this machine later from its page' "$OUT"
+check "says it isn't paired yet" grep -q 'not paired with a gateway yet' "$OUT"
+check "says how to pair from a terminal" grep -q "fleet-worker pair --config $SKIP_HOME/fleet/worker.yaml" "$OUT"
+check "the worker is running anyway" kill -0 "$(cat "$SKIP_ROOT/worker.pid")"
+refute "saves no token" test -s "$SKIP_HOME/fleet/token"
+check "no more machines came online" online_on system.hostname 4
+
+echo "From a release, with no gateway yet"
+# Nothing names a gateway, so the installer asks, and the answer here is none.
+REL_ROOT="$WORK/rel-root"
+REL_HOME="$WORK/rel-home"
+mkdir -p "$REL_ROOT/run/systemd/system" "$REL_HOME"
+sed 's|@@RELEASE_URL@@|https://releases.example.com/v1|' "$REPO/deploy/install-worker.sh" >"$PUBLISHED/install-worker.sh"
+OUT="$WORK/rel.out"
+FLEET_INSTALL_TTY="$WORK/skip-tty" FLEET_INSTALL_ROOT="$REL_ROOT" HOME="$REL_HOME" PATH="$LINUX_STUBS:$PATH" sh "$PUBLISHED/install-worker.sh" >"$OUT" 2>&1
+RESULT=$?
+check "installs with no gateway" test "$RESULT" -eq 0
+[ "$RESULT" -eq 0 ] || sed 's/^/    /' "$OUT" >&2
+check "asks for the gateway's address" grep -q "Gateway address (the server's IP address or domain; press Enter to skip)" "$OUT"
+check "leaves the gateway to be filled in" grep -qx 'gateway_url: ""' "$REL_HOME/fleet/worker.yaml"
+check "names the machine after its host" grep -q "^  name: $(hostname -s | tr -cd 'A-Za-z0-9_-')\$" "$REL_HOME/fleet/worker.yaml"
+check "says it isn't paired yet" grep -q 'not paired with a gateway yet' "$OUT"
+check "the worker is running, waiting to be paired" kill -0 "$(cat "$REL_ROOT/worker.pid")"
+OUT="$WORK/rel-nowhere.out"
+mkdir -p "$WORK/rel-root2/run/systemd/system"
+FLEET_NONINTERACTIVE=1 FLEET_INSTALL_ROOT="$WORK/rel-root2" HOME="$WORK/rel-home2" PATH="$LINUX_STUBS:$PATH" sh "$REPO/deploy/install-worker.sh" >"$OUT" 2>&1
+check "stops when there's nowhere to download from" grep -q "nowhere to download the worker from" "$OUT"
 
 echo
 if [ "$FAILURES" -eq 0 ]; then

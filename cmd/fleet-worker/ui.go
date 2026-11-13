@@ -23,6 +23,7 @@ func uiCommand(args []string) error {
 	flags := flag.NewFlagSet("ui", flag.ContinueOnError)
 	configPath := flags.String("config", "worker.yaml", "path to the worker manifest")
 	noOpen := flags.Bool("no-open", false, "print the address instead of opening a browser")
+	wait := flags.Duration("wait", 0, "how long to wait for a worker that's still starting")
 	flags.Usage = func() {
 		fmt.Fprintln(flags.Output(), "usage: fleet-worker ui [--config worker.yaml] [--no-open]\n\nOpens the running worker's configuration page. The address works once, for two minutes.")
 		flags.PrintDefaults()
@@ -38,6 +39,10 @@ func uiCommand(args []string) error {
 		return fmt.Errorf("the configuration page is off; remove ui_listen: off from %s and restart the worker", *configPath)
 	}
 	state, err := worker.ReadUIState(manifest.StateDir)
+	for deadline := time.Now().Add(*wait); err != nil && time.Now().Before(deadline); {
+		time.Sleep(300 * time.Millisecond)
+		state, err = worker.ReadUIState(manifest.StateDir)
+	}
 	if errors.Is(err, fs.ErrNotExist) {
 		return errors.New("the worker isn't running, or its page couldn't start (see the worker's log); start the worker first")
 	}

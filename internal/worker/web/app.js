@@ -30,6 +30,10 @@ const STATES = {
   failed: { label: "Failed", tone: "critical", icon: "cross" },
   connected: { label: "Connected to the gateway", tone: "good", icon: "check" },
   disconnected: { label: "Not connected to the gateway", tone: "warning", icon: "alert" },
+  unpaired: { label: "Not paired with a gateway yet", tone: "warning", icon: "alert" },
+  rejected: { label: "The gateway no longer knows this machine", tone: "critical", icon: "cross" },
+  ok: { label: "Worked", tone: "good", icon: "check" },
+  skipped: { label: "Skipped", tone: "neutral", icon: "slash" },
 };
 
 const KINDS = { cli: "Program", http: "HTTP API", http_async: "HTTP job queue" };
@@ -245,7 +249,7 @@ function signedOut(message) {
 
 function show(next) {
   view = next;
-  for (const name of ["tools", "editor", "activity", "machine"]) {
+  for (const name of ["tools", "editor", "connection", "activity", "machine"]) {
     $(`view-${name}`).hidden = name !== next;
   }
   for (const tab of document.querySelectorAll(".tab")) {
@@ -259,6 +263,7 @@ function show(next) {
     logTimer = setInterval(refreshLogs, LOG_MS);
   }
   if (next === "machine") renderMachine();
+  if (next === "connection") renderConnection();
   window.scrollTo(0, 0);
 }
 
@@ -281,6 +286,18 @@ window.addEventListener("beforeunload", (event) => {
 
 // --- Status and the tools list ---
 
+let firstStatus = true;
+
+function connectionState() {
+  if (!status.paired) return "unpaired";
+  if (status.connected) return "connected";
+  return status.rejected ? "rejected" : "disconnected";
+}
+
+function gatewayHost() {
+  try { return new URL(status.gateway).host; } catch { return status.gateway; }
+}
+
 async function refreshStatus() {
   try {
     status = await api("GET", "api/status");
@@ -291,12 +308,18 @@ async function refreshStatus() {
     return;
   }
   $("node-name").textContent = status.node;
-  document.title = `${status.node} · Worker tools`;
-  const conn = status.connected
-    ? badge("connected", `Connected to ${new URL(status.gateway).host}`)
-    : badge("disconnected", `Not connected to ${new URL(status.gateway).host}`);
-  conn.title = status.connected ? `Since ${new Date(status.connected_since).toLocaleString()}` : "The worker keeps trying to connect. See the log.";
+  document.title = `${status.node} · Worker`;
+  const state = connectionState();
+  const conn = badge(state, state === "connected" ? `Connected to ${gatewayHost()}`
+    : state === "disconnected" ? `Not connected to ${gatewayHost()}` : undefined);
+  conn.title = state === "connected" ? `Since ${new Date(status.connected_since).toLocaleString()}` : "Open the Connection tab.";
   $("connection").replaceChildren(conn);
+  // A machine that isn't paired can't do anything yet, so start where that's fixed.
+  if (firstStatus) {
+    firstStatus = false;
+    if (state === "unpaired" || state === "rejected") show("connection");
+  }
+  if (view === "connection") renderConnection();
   const activityTab = document.querySelector('.tab[data-view="activity"]');
   activityTab.textContent = status.running.length ? `Activity (${status.running.length})` : "Activity";
   renderTools();
@@ -1397,13 +1420,179 @@ async function refreshLogs() {
   if (follow) log.scrollTop = log.scrollHeight;
 }
 
+// --- Connection ---
+
+const pair = { open: false, waitingForCode: false, busy: false };
+
+function pairMethod() {
+  return document.querySelector('input[name="pair-method"]:checked').value;
+}
+
+function pairProblem(message) {
+  $("pair-problem").textContent = message || "";
+  $("pair-problem").hidden = !message;
+}
+
+function renderConnection() {
+  if (!status) return;
+  const state = connectionState();
+  const sentences = {
+    connected: `Connected to ${gatewayHost()} as ${status.node}.`,
+    disconnected: `Not connected to ${gatewayHost()}.`,
+    rejected: `${gatewayHost()} no longer knows this machine.`,
+    unpaired: "This machine isn't connected to a gateway yet.",
+  };
+  $("conn-state").replaceChildren(badge(state, sentences[state]));
+  const details = {
+    connected: `Since ${new Date(status.connected_since).toLocaleString()}. Agents can use this machine's tools through the gateway.`,
+    disconnected: `The worker keeps trying by itself. ${status.connection_error ? `The last try failed: ${status.connection_error}` : "It's connecting now."}`,
+    rejected: "Its token was revoked or the gateway was reinstalled. Pair it again below.",
+    unpaired: "Enter the gateway's address below to pair it. Until then, its tools can be set up and tried here, but agents can't reach them.",
+  };
+  $("conn-detail").textContent = details[state];
+  const mustPair = state === "unpaired" || state === "rejected";
+  $("conn-actions").hidden = mustPair || pair.open;
+  $("pair-form").hidden = !(mustPair || pair.open);
+  $("pair-cancel-row").hidden = mustPair;
+  if (!$("pair-gateway").value && status.gateway && document.activeElement !== $("pair-gateway")) {
+    $("pair-gateway").value = status.gateway;
+  }
+  const method = pairMethod();
+  $("pair-code-ask").hidden = method !== "code" || pair.waitingForCode;
+  $("pair-code-enter").hidden = method !== "code" || !pair.waitingForCode;
+  $("pair-key-pane").hidden = method !== "key";
+  $("mcp-test").disabled = !status.paired || mcp.running;
+  if (status.paired) {
+    const url = `${status.gateway}/mcp`;
+    $("mcp-url").textContent = url;
+    $("mcp-command").textContent = `claude mcp add --transport http fleet ${url} --header "Authorization: Bearer YOUR_API_KEY"`;
+  }
+  $("mcp-howto").hidden = !status.paired;
+}
+
+async function pairRequest(buttonID, busyText, run) {
+  if (pair.busy) return;
+  const b = $(buttonID);
+  const text = b.textContent;
+  pair.busy = true;
+  b.disabled = true;
+  b.textContent = busyText;
+  pairProblem("");
+  try {
+    await run();
+  } catch (err) {
+    if (err.status !== 401) pairProblem(err.message);
+  } finally {
+    pair.busy = false;
+    b.disabled = false;
+    b.textContent = text;
+  }
+}
+
+function startPairing() {
+  return pairRequest("pair-start", "Asking the gateway…", async () => {
+    const r = await api("POST", "api/pair/start", { gateway: $("pair-gateway").value, name: "" });
+    $("pair-gateway").value = r.gateway;
+    $("pair-name").textContent = r.name;
+    $("pair-code").value = "";
+    pair.waitingForCode = true;
+    renderConnection();
+    $("pair-code").focus();
+  });
+}
+
+async function paired(r) {
+  pair.open = false;
+  pair.waitingForCode = false;
+  $("pair-code").value = "";
+  $("pair-key").value = "";
+  toast(`Paired with ${new URL(r.gateway).host} as ${r.node}`);
+  await refreshStatus();
+}
+
+$("pair-start").addEventListener("click", startPairing);
+$("pair-again").addEventListener("click", () => {
+  pair.waitingForCode = false;
+  pairProblem("");
+  renderConnection();
+  startPairing();
+});
+$("pair-confirm").addEventListener("click", () => pairRequest("pair-confirm", "Pairing…", async () => {
+  try {
+    await paired(await api("POST", "api/pair/confirm", { code: $("pair-code").value }));
+  } catch (err) {
+    if (err.status === 410 || err.status === 409) {
+      pair.waitingForCode = false;
+      renderConnection();
+    }
+    throw err;
+  }
+}));
+$("pair-key-go").addEventListener("click", () => pairRequest("pair-key-go", "Connecting…", async () => {
+  await paired(await api("POST", "api/pair/key", { gateway: $("pair-gateway").value, key: $("pair-key").value }));
+}));
+$("pair-gateway").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") if (pairMethod() === "code") $("pair-start").click(); else $("pair-key").focus();
+});
+$("pair-gateway").addEventListener("input", () => {
+  // A code belongs to the gateway it was asked from.
+  if (pair.waitingForCode) {
+    pair.waitingForCode = false;
+    renderConnection();
+  }
+});
+$("pair-code").addEventListener("keydown", (event) => { if (event.key === "Enter") $("pair-confirm").click(); });
+$("pair-key").addEventListener("keydown", (event) => { if (event.key === "Enter") $("pair-key-go").click(); });
+for (const radio of document.querySelectorAll('input[name="pair-method"]')) {
+  radio.addEventListener("change", () => { pairProblem(""); renderConnection(); });
+}
+$("conn-change").addEventListener("click", () => {
+  pair.open = true;
+  renderConnection();
+  $("pair-gateway").focus();
+});
+$("pair-cancel").addEventListener("click", () => {
+  pair.open = false;
+  pair.waitingForCode = false;
+  pairProblem("");
+  renderConnection();
+});
+
+const mcp = { running: false };
+
+$("mcp-test").addEventListener("click", async () => {
+  if (mcp.running) return;
+  mcp.running = true;
+  const b = $("mcp-test");
+  b.disabled = true;
+  b.textContent = "Testing…";
+  $("mcp-verdict").replaceChildren();
+  $("mcp-steps").replaceChildren();
+  try {
+    const r = await api("POST", "api/mcp-test", {});
+    $("mcp-steps").replaceChildren(...r.steps.map((s) => el("li", "",
+      el("div", "step-state", badge(s.state), el("div", "step-time", s.state === "skipped" ? "" : `${s.ms} ms`)),
+      el("div", "step-name", s.name),
+      el("div", "step-detail", s.detail || ""))));
+    $("mcp-verdict").replaceChildren(r.ok
+      ? badge("ok", "Agents can reach this machine through MCP")
+      : badge("failed", "The test didn't pass"));
+  } catch (err) {
+    if (err.status !== 401) $("mcp-verdict").replaceChildren(badge("failed", err.message));
+  } finally {
+    mcp.running = false;
+    b.textContent = "Run the test again";
+    b.disabled = !status || !status.paired;
+  }
+});
+
 // --- This machine ---
 
 function renderFacts() {
   if (!status) return;
   const facts = [
     ["Machine", status.node],
-    ["Gateway", status.gateway],
+    ["Gateway", status.gateway || "Not paired yet"],
     ["Connection", status.connected ? `Connected since ${new Date(status.connected_since).toLocaleString()}` : "Not connected"],
     ["Jobs at once", String(status.max_jobs)],
     ["Settings file", status.config_file],

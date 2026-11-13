@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Registers a new machine on an installed gateway and prints the commands to run
-# on that machine. Run it on the gateway server.
+# Registers a new machine on an installed gateway and prints its token, with the
+# commands that install a worker using it. Run it on the gateway server.
 #
 #   fleet-add-worker mac-mini-2
+#
+# A machine doesn't need this to join: its installer can pair with a code that
+# fleet-pair shows. A token is for joining with no questions asked, such as from
+# a script, or for pasting into the worker's page.
 set -euo pipefail
 
 # Only the install script's tests set this, to install into a scratch directory.
@@ -23,7 +27,16 @@ if [ ! -f "$ROOT/srv/fleet/gateway-url" ]; then
 fi
 URL="$(cat "$ROOT/srv/fleet/gateway-url")"
 
-if ! token="$(sudo -u fleet "$ROOT/usr/local/bin/fleet-gateway" node add "$NAME" --data "$ROOT/var/lib/fleet" 2>/dev/null)"; then
+# The gateway's data belongs to the fleet account.
+as_fleet() {
+	if [ "$(id -u)" -eq 0 ]; then
+		runuser -u fleet -- "$@"
+	else
+		sudo -u fleet "$@"
+	fi
+}
+
+if ! token="$(as_fleet "$ROOT/usr/local/bin/fleet-gateway" node add "$NAME" --data "$ROOT/var/lib/fleet" 2>/dev/null)"; then
 	cat >&2 <<EOF
 add-worker: couldn't create a token for '$NAME'. If that name is already registered,
 choose another one, or revoke it first:
@@ -34,15 +47,22 @@ EOF
 fi
 
 cat <<EOF
-Run one of these on the new machine, as the user the worker should run as. Each
-contains the machine's token, which isn't shown again.
+This is the token for $NAME. It isn't shown again:
+
+  $token
+
+If the worker is already installed on that machine, open its page, and on the
+Connection tab choose "With a key from the server" and paste the token.
+
+Otherwise, run one of these on the new machine, as the user the worker should
+run as. Each contains the token.
 
 On a Mac or a Linux machine with systemd, in a terminal:
 
   curl -fsSL $URL/install/worker.sh | FLEET_NODE_NAME=$NAME FLEET_NODE_TOKEN=$token sh
 
 On Linux, the worker runs as a service under the account that runs this, which
-needs sudo. Or, as root, put FLEET_WORKER_USER=ACCOUNT before sh to choose it.
+needs sudo. As root, it runs as root, or put FLEET_WORKER_USER=ACCOUNT before sh.
 
 On Windows, in PowerShell opened with "Run as administrator":
 

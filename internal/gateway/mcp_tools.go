@@ -95,7 +95,7 @@ func (g *Gateway) mcpToolList(ctx context.Context, key *APIKey) ([]mcpTool, erro
 	offers := map[string]*offer{}
 	var names []string
 	for _, row := range rows {
-		if !keyAllows(key, row.Name) {
+		if !keyAllows(key, row.Name) || (key.Node != "" && row.NodeID != key.Node) {
 			continue
 		}
 		o := offers[row.Name]
@@ -111,6 +111,10 @@ func (g *Gateway) mcpToolList(ctx context.Context, key *APIKey) ([]mcpTool, erro
 	sort.Strings(names)
 
 	builtins := g.builtinTools(len(names) > 0 && anyTakesFiles(offers, func(o *offer) []string { return o.inputFiles }))
+	if key.Node != "" {
+		// A machine testing its connection gets its own tools and nothing else.
+		builtins = nil
+	}
 	taken := map[string]bool{}
 	for _, t := range builtins {
 		taken[t.name] = true
@@ -323,10 +327,10 @@ func (req *mcpRequest) runCapability(ctx context.Context, tool *mcpTool, argumen
 	}
 	// A job no machine can take now would only wait in the queue, so say why
 	// instead, while the agent can still do something about it.
-	if !g.onlineNodes().offers(tool.capability, nil, "") {
+	if !g.onlineNodes().offers(tool.capability, nil, req.key.Node) {
 		return toolError("%s", g.unavailableReason(ctx, tool.capability)), nil
 	}
-	view, _, failure := g.submitJob(ctx, req.key, createJobRequest{Capability: tool.capability, Input: input, Files: files})
+	view, _, failure := g.submitJob(ctx, req.key, createJobRequest{Capability: tool.capability, Input: input, Files: files, testNode: req.key.Node})
 	if failure != nil {
 		if failure.err != nil {
 			g.logError(ctx, failure.message, failure.err)

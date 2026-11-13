@@ -239,3 +239,27 @@ dialog label { font-weight: 500; font-size: 13px; display: block; margin-top: 12
   .meter { border: 1px solid CanvasText; }
   .meter > span { background: Highlight; }
 }
+
+.panel { padding: 16px 18px; display: grid; gap: 8px; overflow-x: visible; min-width: 0; }
+/* Sentences here are long, so unlike a badge in a table they may wrap. */
+.panel .status { white-space: normal; align-items: start; }
+.panel .status svg { margin-top: 3px; }
+.panel > * { margin-top: 0; margin-bottom: 0; min-width: 0; }
+.panel pre.command { margin: 0; }
+.panel h3 { margin-top: 8px; }
+.panel .field { max-width: 460px; }
+.conn-state { font-size: 15px; }
+.choices { display: flex; flex-wrap: wrap; gap: 6px 20px; margin: 6px 0 2px; }
+.code-input { font: 600 20px/1.3 ui-monospace, "SF Mono", Menlo, Consolas, monospace !important; letter-spacing: 0.12em; text-transform: uppercase; max-width: 240px; }
+.steps { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 8px; }
+.steps:empty { display: none; }
+.steps li { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 2px 14px; padding-top: 8px; border-top: 1px solid var(--hairline); }
+.steps .step-name { font-weight: 600; grid-column: 2; }
+.steps .step-detail { grid-column: 2; color: var(--ink-2); font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.steps .step-time { color: var(--ink-2); font-size: 12px; font-variant-numeric: tabular-nums; }
+.steps .step-state { grid-row: span 2; }
+@media (max-width: 640px) {
+  .steps li { grid-template-columns: minmax(0, 1fr); }
+  .steps .step-name, .steps .step-detail { grid-column: 1; }
+  .steps .step-state { grid-row: auto; }
+}

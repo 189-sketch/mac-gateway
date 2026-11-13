@@ -53,6 +53,10 @@ func (g *Gateway) routes() http.Handler {
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "dashboard/", http.StatusFound)
 	})
+	mux.HandleFunc("POST /v1/pair", g.handlePairRequest)
+	mux.HandleFunc("POST /v1/pair/{id}", g.handlePairConfirm)
+	mux.HandleFunc("GET /v1/worker/identity", g.handleWorkerIdentity)
+	mux.HandleFunc("POST /v1/worker/mcp-test", g.handleWorkerMCPTest)
 	mux.HandleFunc("GET /v1/worker/connect", g.handleWorkerConnect)
 	mux.HandleFunc("PUT /v1/worker/attempts/{attempt}/artifacts/{name}", g.handleUploadArtifact)
 	mux.HandleFunc("HEAD /v1/worker/attempts/{attempt}/artifacts/{name}", g.handleUploadStatus)
@@ -198,6 +202,9 @@ type createJobRequest struct {
 	QueueTimeout   string            `json:"queue_timeout"`
 	Selector       map[string]string `json:"selector"`
 	Files          map[string]string `json:"files"`
+	// testNode, for a machine testing its own connection, is the only node that
+	// may run the job.
+	testNode string
 }
 
 func (g *Gateway) handleCreateJob(w http.ResponseWriter, r *http.Request, key *APIKey) {
@@ -265,6 +272,9 @@ func (g *Gateway) submitJob(ctx context.Context, key *APIKey, req createJobReque
 	if err != nil {
 		return nil, false, internalFailure("look up capability", err)
 	}
+	if req.testNode != "" {
+		offers = slices.DeleteFunc(offers, func(o CapabilityRow) bool { return o.NodeID != req.testNode })
+	}
 	if len(offers) == 0 {
 		return refuse(http.StatusNotFound, "UNKNOWN_CAPABILITY", "no node has registered "+req.Capability)
 	}
@@ -292,6 +302,7 @@ func (g *Gateway) submitJob(ctx context.Context, key *APIKey, req createJobReque
 		RequestHash:    hex.EncodeToString(hash.Sum(nil)),
 		QueueTimeout:   queueTimeout,
 		Files:          req.Files,
+		TestNode:       req.testNode,
 	})
 	if errors.Is(err, ErrFileUnavailable) {
 		return refuse(http.StatusUnprocessableEntity, "FILE_UNAVAILABLE", err.Error())

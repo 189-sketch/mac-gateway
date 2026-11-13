@@ -18,11 +18,12 @@
 # It installs the gateway and Caddy as services, and Caddy gets and renews an HTTPS
 # certificate from Let's Encrypt by itself, for an IP address too. It publishes the
 # worker installer at https://ADDRESS/install/. On a first install, it prints an API
-# key and the command to run on your first machine, named mac-mini-1 by default.
-# Run it as a normal user with sudo rights.
+# key and how to connect an agent through MCP. Then it prints the command to run
+# on each machine, and waits, showing the pairing code each machine needs.
+# Run it as root, or as a user with sudo rights.
 #
-# Re-running it upgrades the gateway and keeps existing data and credentials. It
-# only registers another machine if you pass a node name.
+# Re-running it upgrades the gateway and keeps existing data and credentials. A
+# node name makes a token for that machine, for joining without a pairing code.
 #
 # Before running it, open ports 80 and 443 in any cloud security group, and for a
 # domain, point its DNS at this server. This script can't do either for you. If
@@ -35,8 +36,24 @@
 # build-release.sh fills this in. It stays a placeholder in a checkout.
 RELEASE_URL="${FLEET_RELEASE_URL:-@@RELEASE_URL@@}"
 
-# Only the install script's tests set this, to install into a scratch directory.
+# Only the install script's tests set these: to install into a scratch directory,
+# and to answer the question without a terminal.
 ROOT="${FLEET_INSTALL_ROOT:-}"
+TTY="${FLEET_INSTALL_TTY:-/dev/tty}"
+
+# As root there's nothing to ask sudo for, and a minimal system may not have it.
+# This stands in for the two ways the script uses it.
+if [ "$(id -u)" -eq 0 ]; then
+	sudo() {
+		if [ "${1:-}" = "-u" ]; then
+			local user="$2"
+			shift 2
+			runuser -u "$user" -- "$@"
+		else
+			"$@"
+		fi
+	}
+fi
 
 die() {
 	echo "install-gateway: $*" >&2
@@ -83,7 +100,7 @@ build_from_source() {
 			CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -o "$BUNDLE/fleet-worker-linux-$arch" ./cmd/fleet-worker
 			CGO_ENABLED=0 GOOS=windows GOARCH="$arch" go build -trimpath -o "$BUNDLE/fleet-worker-windows-$arch.exe" ./cmd/fleet-worker
 		done
-		cp deploy/add-worker.sh deploy/install-worker.sh deploy/install-worker.ps1 deploy/fleet-gateway.service "$BUNDLE/"
+		cp deploy/add-worker.sh deploy/pair.sh deploy/install-worker.sh deploy/install-worker.ps1 deploy/fleet-gateway.service "$BUNDLE/"
 	)
 }
 
@@ -197,6 +214,40 @@ detect_public_ip() {
 	return 1
 }
 
+# interactive says whether there's a person to ask. Piped from curl, stdin is the
+# script itself, so questions are read from the terminal instead.
+interactive() {
+	[ -z "${FLEET_NONINTERACTIVE:-}" ] || return 1
+	[ -z "${FLEET_INSTALL_TTY:-}" ] || return 0
+	[ -t 1 ] && (: <"$TTY") 2>/dev/null
+}
+
+is_domain() {
+	[[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}$ ]]
+}
+
+# Asks for a domain, and prints it. Printing nothing means use the IP address,
+# which is what pressing Enter does. $1 is that address, or empty if unknown.
+ask_domain() {
+	local answer tries
+	for tries in 1 2 3; do
+		if [ -n "$1" ]; then
+			printf "Domain name for this server, if it has one (press Enter to use its IP address, %s): " "$1" >&2
+		else
+			printf "This server's public IP address, or its domain name: " >&2
+		fi
+		read -r answer || answer=""
+		answer="$(printf '%s' "$answer" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+		answer="${answer#https://}"
+		answer="${answer%/}"
+		if [ -z "$answer" ] || is_domain "$answer" || is_ipv4 "$answer"; then
+			printf '%s' "$answer"
+			return 0
+		fi
+		echo "'$answer' doesn't look like a domain name, such as fleet.example.com." >&2
+	done
+} <"$TTY"
+
 # Lines this script adds to the Caddyfile end with this, so it can find and
 # replace them, and leave the rest alone.
 CADDY_MARK='# fleet-gateway'
@@ -291,10 +342,14 @@ main() {
 
 	local address="${1:-}"
 	local node_name_given="${2:-}"
-	local node_name="${node_name_given:-mac-mini-1}"
+	local node_name="${node_name_given:-worker}"
 	[[ "$node_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "'$node_name' isn't a valid node name"
-	[ "$(id -u)" -ne 0 ] || die "run this as a normal user with sudo rights, not as root"
 	command -v curl >/dev/null || die "curl isn't installed"
+	if [ "$(id -u)" -eq 0 ]; then
+		command -v runuser >/dev/null || die "runuser isn't installed; it's part of util-linux"
+	else
+		command -v sudo >/dev/null || die "sudo isn't installed. Run this as root instead"
+	fi
 
 	# The address workers and agents use, and the one in installed workers' settings.
 	local previous_url=""
@@ -305,10 +360,22 @@ main() {
 		address="${previous_url#https://}"
 		step "Keeping the address from the last install, $address"
 	elif [ -z "$address" ]; then
-		step "No domain given, so finding this server's public IP address"
-		address="$(detect_public_ip)" ||
+		step "Finding this server's public IP address"
+		local found="" domain=""
+		found="$(detect_public_ip)" || found=""
+		if [ -n "$found" ]; then
+			echo "This server is at $found."
+		fi
+		# A domain is optional. The IP address works by itself, HTTPS included.
+		if interactive; then
+			domain="$(ask_domain "$found")"
+		fi
+		address="${domain:-$found}"
+		[ -n "$address" ] ||
 			die "couldn't find this server's public IP address. Give it, or a domain, as the first argument: install-gateway.sh ADDRESS"
-		echo "This server is at $address. If that's wrong, run this again with the right address."
+		if [ -z "$domain" ]; then
+			echo "Using $address. If that's wrong, run this again with the right address."
+		fi
 	fi
 
 	local mode
@@ -318,7 +385,7 @@ main() {
 		mode=ip
 	elif [[ "$address" == *:* ]]; then
 		die "IPv6 addresses aren't supported yet. Use this server's public IPv4 address, or a domain"
-	elif [[ "$address" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}$ ]]; then
+	elif is_domain "$address"; then
 		mode=domain
 	else
 		die "'$address' doesn't look like a domain name or an IPv4 address"
@@ -379,12 +446,13 @@ main() {
 	sudo install -d -m 755 "$ROOT/usr/local/bin" "$ROOT/etc/systemd/system"
 	sudo install -m 755 "$BUNDLE/fleet-gateway" "$ROOT/usr/local/bin/fleet-gateway"
 	sudo install -m 755 "$BUNDLE/add-worker.sh" "$ROOT/usr/local/bin/fleet-add-worker"
+	sudo install -m 755 "$BUNDLE/pair.sh" "$ROOT/usr/local/bin/fleet-pair"
 	sudo install -m 644 "$BUNDLE/fleet-gateway.service" "$ROOT/etc/systemd/system/fleet-gateway.service"
 	sudo install -d -m 700 "$ROOT/var/lib/fleet"
 	sudo chown fleet:fleet "$ROOT/var/lib/fleet"
 	if selinux_active; then
 		# Files keep a label from where they were made, and a wrong one stops a service.
-		sudo restorecon "$ROOT/usr/local/bin/fleet-gateway" "$ROOT/usr/local/bin/fleet-add-worker" "$ROOT/etc/systemd/system/fleet-gateway.service"
+		sudo restorecon "$ROOT/usr/local/bin/fleet-gateway" "$ROOT/usr/local/bin/fleet-add-worker" "$ROOT/usr/local/bin/fleet-pair" "$ROOT/etc/systemd/system/fleet-gateway.service"
 	fi
 	sudo systemctl daemon-reload
 	sudo systemctl enable fleet-gateway >/dev/null 2>&1
@@ -407,8 +475,12 @@ main() {
 	mkdir -p "$staging"
 	local binaries=(fleet-worker-darwin-arm64 fleet-worker-darwin-amd64 fleet-worker-linux-amd64 fleet-worker-linux-arm64 fleet-worker-windows-amd64.exe fleet-worker-windows-arm64.exe)
 	(cd "$BUNDLE" && cp "${binaries[@]}" "$staging/")
-	sed "s|@@GATEWAY_URL@@|$url|g" "$BUNDLE/install-worker.sh" >"$staging/worker.sh"
-	sed "s|@@GATEWAY_URL@@|$url|g" "$BUNDLE/install-worker.ps1" >"$staging/worker.ps1"
+	# A bundle from a release already names the release. From a checkout there's
+	# none, and the gateway is where workers download from anyway. The placeholder
+	# is spelled in two parts so building a release doesn't fill it in here too.
+	local no_release='@@RELEASE''_URL@@'
+	sed -e "s|@@GATEWAY_URL@@|$url|g" -e "s|$no_release||g" "$BUNDLE/install-worker.sh" >"$staging/worker.sh"
+	sed -e "s|@@GATEWAY_URL@@|$url|g" -e "s|$no_release||g" "$BUNDLE/install-worker.ps1" >"$staging/worker.ps1"
 	(cd "$staging" && sha256sum "${binaries[@]}" >SHA256SUMS)
 	sudo install -d -m 755 "$public"
 	(cd "$staging" && sudo install -m 644 "${binaries[@]}" SHA256SUMS worker.sh worker.ps1 "$public/")
@@ -493,27 +565,59 @@ MOVED
 
 	# Secrets are shown once only, so these print whether or not HTTPS is working yet.
 	echo
-	step "Creating an API key"
-	local key first_install=""
+	step "The gateway is installed at $url"
+	local key
 	if key="$(sudo -u fleet "$ROOT/usr/local/bin/fleet-gateway" key add agent --capabilities '*' --data "$ROOT/var/lib/fleet" 2>/dev/null)"; then
 		cat <<KEY
-Give these to your agent. The key isn't shown again:
 
-  export FLEET_URL=$url
-  export FLEET_API_KEY=$key
+1. Connect your agent, through MCP
 
-To use every tool from Claude Code, through MCP:
+   Address:  $url/mcp
+   API key:  $key
+
+   The key isn't shown again. Clients send it as "Authorization: Bearer KEY".
+   For Claude Code, run this where you use it:
 
   claude mcp add --transport http fleet $url/mcp --header "Authorization: Bearer $key"
 
-KEY
-		first_install=yes
-	else
-		echo "An API key named 'agent' already exists, so it was kept."
-		echo
-	fi
+   Or, as an entry in Claude Code's .mcp.json:
 
-	if [ -n "$first_install" ] || [ -n "$node_name_given" ]; then
+  {"mcpServers": {"fleet": {"type": "http", "url": "$url/mcp", "headers": {"Authorization": "Bearer $key"}}}}
+
+   For the fleet command:
+
+  export FLEET_URL=$url
+  export FLEET_API_KEY=$key
+KEY
+	else
+		cat <<KEY
+
+1. Connect your agent, through MCP
+
+   Address:  $url/mcp
+   API key:  the one printed when the gateway was first installed. An API key
+             named 'agent' already exists, so it was kept. To make another:
+             sudo -u fleet fleet-gateway key add NAME --capabilities '*' --data /var/lib/fleet
+KEY
+	fi
+	cat <<WORKER
+
+2. Add a machine
+
+   On a Mac or a Linux machine, in a terminal:
+
+  curl -fsSL $url/install/worker.sh | sh
+
+   On Windows, in PowerShell opened with "Run as administrator":
+
+  [Net.ServicePointManager]::SecurityProtocol = 'Tls12'; irm $url/install/worker.ps1 | iex
+
+   Each asks for a pairing code, which this server shows. To see the codes at
+   any time, run: sudo fleet-pair
+
+WORKER
+
+	if [ -n "$node_name_given" ]; then
 		"$ROOT/usr/local/bin/fleet-add-worker" "$node_name" || true
 	fi
 
@@ -533,6 +637,12 @@ Then see: sudo journalctl -u caddy -n 50
 Caddy keeps retrying the certificate, so you don't need to run this again.
 WARNING
 		exit 1
+	fi
+
+	# Stay to show pairing codes, which is all a new machine needs from here.
+	if interactive && [ -z "${FLEET_NO_WAIT:-}" ]; then
+		step "Waiting for a machine to pair. Its code will appear here. Press Ctrl-C to stop waiting; nothing is lost"
+		"$ROOT/usr/local/bin/fleet-pair" --wait 30m --until-connected || true
 	fi
 	step "Done"
 }

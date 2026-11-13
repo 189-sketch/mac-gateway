@@ -10,11 +10,12 @@ Workers only make outbound connections, so your home network needs no open ports
 
 This covers steps 1 to 3 of the design and most of the general tool model: the gateway, the worker, tools that wrap any command-line program or HTTP service with built-in templates, a configuration page on each worker, live reloading of tools, an MCP server so any agent can use every tool, progress streaming, cancellation, file transfer, the `fleet` command, a status dashboard, and workers for Mac, Linux and Windows.
 
-**What has been tested:** the suite runs the real gateway and worker on Linux, with a stand-in tool and a stand-in HTTP service, and the dashboard has been checked in headless Chromium. The Linux installer's tests run it against a real gateway and worker, with only systemd, sudo and SELinux stubbed. Claude Code 2.1.322 connects to the MCP server, but no model has called a tool through it yet.
+**What has been tested:** the suite runs the real gateway and worker on Linux, with a stand-in tool and a stand-in HTTP service, and the dashboard has been checked in headless Chromium. The Linux installer's tests run it against a real gateway and worker, with only systemd, sudo and SELinux stubbed, including pairing with a code read from the server and installing as root. The worker's Connection tab, pairing and MCP connection test have been checked in headless Chrome. Claude Code 2.1.322 connects to the MCP server, but no model has called a tool through it yet.
 
 **What hasn't:**
 - Nothing has run on a real Mac or through a real server install, so `say`, launchd, systemd and Caddy are untested. The Linux worker's systemd service hasn't been started by a real systemd either.
-- The Windows worker and its installer have been compiled but have never run on Windows.
+- The Windows worker and its installer have been compiled but have never run on Windows, and the Windows installer's new pairing steps haven't been run at all, because there's no PowerShell here.
+- Installing the Mac worker as root, as a LaunchDaemon, hasn't been run on a Mac.
 - The HTTP adapters haven't been used with a real service such as Ollama or ComfyUI.
 
 **Not built yet:**
@@ -41,25 +42,29 @@ Mac installs use a one-line command rather than a double-click download. A file 
 
 ### What you need
 
-- **Server:** Debian, Ubuntu, CentOS Stream 9 or newer, or a current RHEL-family system, on x86-64 or ARM64, with a normal (non-root) user who has `sudo`. On CentOS 7, CentOS 8 or CentOS Stream 8, whose package repositories have been retired, install Caddy and a `caddy` systemd service by hand first. Installing from a release doesn't need Go.
-- **An address:** the server's public IPv4 address is enough. A domain name with its DNS pointing at the server works too, and is better for a server whose IP address can change.
+- **Server:** Debian, Ubuntu, CentOS Stream 9 or newer, or a current RHEL-family system, on x86-64 or ARM64. Run the installer as root, or as a user who has `sudo`. On CentOS 7, CentOS 8 or CentOS Stream 8, whose package repositories have been retired, install Caddy and a `caddy` systemd service by hand first. Installing from a release doesn't need Go.
+- **An address:** the server's public IPv4 address is enough, HTTPS included. A domain name with its DNS pointing at the server works too, and is better for a server whose IP address can change.
 - **Firewall:** ports 80 and 443 open on the server, including in any cloud security group. The script opens them in firewalld if it's running, but it can't change other firewalls. Let's Encrypt checks the server through them before issuing its HTTPS certificate.
 - **Worker machine:** macOS 13 or newer on Apple silicon or Intel, Linux with systemd, or Windows 10 or 11 on x64 or ARM64. Your home network doesn't need any open ports.
 
-Run the commands below in your own terminal. They print secrets that are shown only once, so don't paste the output into chats or tickets.
+Run the commands below in your own terminal. The gateway's installer prints an API key that's shown only once, so don't paste its output into chats or tickets.
+
+### In short
+
+1. On the server, run the gateway's install command. Press Enter when it asks about a domain to use the server's IP address. It prints how to connect your agent through MCP, and the command for each machine, then waits.
+2. On each machine, run that command. Press Enter to use the gateway it came from, and type the pairing code the server's screen now shows.
+3. The worker's page opens. Its **Connection** tab has a button that tests, from that machine, that agents can reach its tools through MCP.
+
+Either code can be skipped. A machine that isn't paired runs anyway, and its page's Connection tab pairs it later.
 
 ### 1. Install the gateway
 
-Run one of these on the server. With no address, the script finds the server's public IP address and uses that. Or give a domain, such as `fleet.example.com`, or the IP address yourself, then optionally a name for your first machine, `mac-mini-1` by default.
+Run one of these on the server, as root or as a user with `sudo`:
 
 **One line, if the repo is public:**
 
 ```sh
-# On the server's IP address:
 curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.4.1/install-gateway.sh | bash
-
-# On a domain, naming the first machine:
-curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.4.1/install-gateway.sh | bash -s -- fleet.example.com mac-mini-1
 ```
 
 **From a downloaded bundle, which also works while the repo is private.** Download `fleet-server-linux-amd64.tar.gz` (or `-arm64`) from the [Releases page](https://github.com/189-sketch/mac-gateway/releases) while logged in, or use the GitHub CLI as below:
@@ -67,27 +72,30 @@ curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.4.1/in
 ```sh
 gh release download v0.4.1 -R 189-sketch/mac-gateway -p 'fleet-server-linux-amd64.tar.gz'
 tar -xzf fleet-server-linux-amd64.tar.gz
-./fleet-server-linux-amd64/install-gateway.sh fleet.example.com mac-mini-1
+./fleet-server-linux-amd64/install-gateway.sh
 ```
 
 **From source, which needs Go 1.27 or newer:**
 
 ```sh
-./deploy/install-gateway.sh fleet.example.com mac-mini-1
+./deploy/install-gateway.sh
 ```
+
+With no arguments, the script finds the server's public IP address, then asks whether the server has a domain name. Pressing Enter uses the IP address. To skip the question, give the address as an argument, such as `install-gateway.sh fleet.example.com` or `install-gateway.sh 203.0.113.10`.
 
 Whichever you use, the script does the following:
 
-1. Works out the address: the one you gave, the one from the last install, or this server's public IP address, which it asks `api.ipify.org` for, or failing that, `checkip.amazonaws.com` or `ifconfig.me`.
+1. Works out the address: the one you gave, the one from the last install, or this server's public IP address, which it asks `api.ipify.org` for, or failing that, `checkip.amazonaws.com` or `ifconfig.me`, and then the domain you type, if any.
 2. Gets the binaries, and verifies their checksums if it downloaded them.
-3. Installs the gateway as the `fleet-gateway` service, with its data in `/var/lib/fleet`.
+3. Installs the gateway as the `fleet-gateway` service, with its data in `/var/lib/fleet`, and the commands `fleet-pair` and `fleet-add-worker`.
 4. Installs Caddy if it's missing, from Caddy's own package repository, and sets up HTTPS. Caddy gets the certificate from Let's Encrypt and renews it by itself. Your existing Caddy sites are kept.
-5. Publishes the worker installer and worker binaries at `https://ADDRESS/install/`. They contain no secrets, and anyone can download them.
-6. Prints an API key for your agent, the command to add the gateway to Claude Code, and the command to run on your first machine.
+5. Publishes the worker installers and worker binaries at `https://ADDRESS/install/`. They contain no secrets, and anyone can download them.
+6. Prints how to connect your agent through MCP: the address, `https://ADDRESS/mcp`, an API key, and the command that adds it to Claude Code. Then it prints the command to install a worker.
+7. Waits, showing the pairing code of each machine that asks to pair, until one has connected. Press Ctrl-C to stop waiting; the gateway keeps running, and `sudo fleet-pair` shows the codes again whenever you need them.
 
 It stops before changing anything if another program is using port 80 or 443. It exits with a warning if the server isn't reachable over HTTPS yet, but still prints your credentials. In that case, fix DNS or the firewall; Caddy keeps retrying, so you don't need to run the script again. If the new Caddy config isn't valid, it puts the old one back and leaves Caddy as it was.
 
-Running it again with no address keeps the address it used before. Giving a different one moves the gateway there, but workers installed before keep the old address until you change `gateway_url` in their `worker.yaml`.
+Running it again with no address keeps the address it used before, and doesn't ask. Giving a different one moves the gateway there, but workers installed before keep the old address until they're paired again, from the Connection tab of their page.
 
 #### On an IP address
 
@@ -106,21 +114,41 @@ On CentOS and similar systems, the script also changes system settings that woul
 
 ### 2. Install the worker
 
-Use a dedicated standard (non-admin) macOS account with none of your personal files, because jobs run as that user and can read anything it can, including the token file.
+Jobs run as the account that installs the worker, and can read anything it can. A dedicated standard (non-admin) account with none of your personal files is safest. Installing as root works too, and then jobs run as root.
 
-Log in to that account on the Mac, open Terminal and paste the command the gateway script printed. It looks like this:
+On the Mac, open Terminal and paste the command the gateway's installer printed:
 
 ```sh
-curl -fsSL https://fleet.example.com/install/worker.sh | FLEET_NODE_NAME=mac-mini-1 FLEET_NODE_TOKEN=fn_... sh
+curl -fsSL https://fleet.example.com/install/worker.sh | sh
 ```
 
 The script does the following:
 
 1. Downloads the worker for your chip and verifies its checksum.
 2. Installs into `~/fleet`, with a `worker.yaml` that offers one service, `tts.say`.
-3. Starts the worker as a LaunchAgent, then waits until it has connected.
+3. Pairs the machine. It asks the gateway to pair, and the gateway's installer, still waiting on the server, shows a code such as `K7QM-3XPD`. Type it at the prompt; lower case and a missing dash are fine. Each code works once, for 10 minutes, and allows 5 tries.
+4. Starts the worker, waits until it has connected, and opens its page in your browser, signed in.
 
-The command contains the machine's token, so your shell history will too. To remove it, close Terminal, then delete that line from `~/.zsh_history`.
+Pressing Enter instead of a code skips pairing. The worker still starts, and its page opens on the **Connection** tab, where you can pair it later.
+
+Installed as a standard user, the worker is a LaunchAgent that runs while that user is logged in. Installed as root, with `sudo sh` at the end of the command, it's a LaunchDaemon that runs from boot as root, from `/var/root/fleet`.
+
+The script can also be run before there's a gateway, from the release: `curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.4.1/install-worker.sh | sh`. It then asks for the gateway's address, and pressing Enter skips that too.
+
+#### Pair a machine later
+
+On the worker's page, open the **Connection** tab and type the gateway's address: its IP address or domain. Then either:
+
+- **With a pairing code:** choose **Get a pairing code**, and type the code the server shows. If the gateway's installer has stopped waiting, run `sudo fleet-pair` on the server to see it.
+- **With a key from the server:** run `sudo fleet-add-worker NAME` on the server, and paste the token it prints. The machine takes that name.
+
+The worker connects straight away, without a restart. From a terminal, `~/fleet/fleet-worker pair --config ~/fleet/worker.yaml` does the same, and takes `--key` for a token.
+
+Anyone can ask the gateway to pair, so a request does nothing until someone types the code that only the server shows. The gateway never sends a machine its own code, keeps at most 3 waiting requests from one address and 20 in all, and doesn't log the codes.
+
+#### Test the MCP connection
+
+The **Connection** tab's **Run the test** button does what an agent does, from the worker's own machine: it opens the gateway's MCP endpoint over the internet, lists the machine's tools, and calls one that declares a test, showing what each step found. It uses a key the gateway makes for the test, which lasts two minutes, sees only that machine's tools, and runs calls only there, so no agent key is ever kept on a worker. The tab also shows the MCP address to give your agent.
 
 ### 3. Keep the Mac available
 
@@ -130,11 +158,13 @@ The script doesn't change your power settings, so do these yourself:
 sudo pmset -a sleep 0 disablesleep 1 autorestart 1
 ```
 
-Then turn on automatic login for the worker's account in System Settings. The worker runs inside a logged-in session, so without this it won't come back after a reboot or power cut.
+Then turn on automatic login for the worker's account in System Settings. The worker runs inside a logged-in session, so without this it won't come back after a reboot or power cut. A worker installed as root doesn't need this.
 
-### 4. Test it
+### 4. Test it from your agent
 
-You need the `fleet` command on the machine you test from. If the repo is public, this installs it to `~/.local/bin`:
+In Claude Code, after running the `claude mcp add` command the gateway's installer printed, run `/mcp` to see the gateway's tools, or ask Claude to use `tts.say`.
+
+To test from a terminal instead, you need the `fleet` command. If the repo is public, this installs it to `~/.local/bin`:
 
 ```sh
 curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.4.1/install-cli.sh | sh
@@ -154,33 +184,38 @@ You should get `hello.aiff` on the machine that ran the command. To confirm jobs
 
 ### Add another machine
 
-On the server:
+Run the same worker command on it, and type the code that `sudo fleet-pair` shows on the server. A machine is named after its hostname; if that name is taken, it gets `-2`, `-3` and so on.
+
+To add a machine without a code, such as from a script, make a token for it on the server:
 
 ```sh
-fleet-add-worker mac-mini-2
+sudo fleet-add-worker mac-mini-2
 ```
 
-It prints one command for a Mac or Linux machine and one for Windows. Run the one that fits the new machine.
+It prints the token, and commands that install a worker with it and ask nothing.
 
 ### Install on Linux
 
 The same command as for a Mac installs the worker on Linux with systemd, such as Ubuntu, Debian, CentOS Stream or RHEL, on x86-64 or ARM. Use it for a machine with a GPU, or one that runs tools that are easier on Linux.
 
-Jobs run as the account that runs the installer, and can read anything it can, so use a dedicated account that has your tools and models but no personal files. There are two ways:
+Jobs run as the account the worker runs as, and can read anything it can. There are three ways:
 
-- **As that account, if it can use sudo.** Log in as it and paste the command `fleet-add-worker` printed. The script asks for your sudo password once, to install the service.
-- **As root, for an account that can't use sudo.** Put `FLEET_WORKER_USER` before `sh`:
+- **As root.** Log in as root and paste the worker command. Jobs run as root, so offer only tools you'd trust with the whole machine.
+- **As your own account, if it can use sudo.** Paste the worker command. The script asks for your sudo password once, to install the service.
+- **As a dedicated account, which is safest.** As root, put `FLEET_WORKER_USER` before `sh`:
 
   ```sh
-  sudo useradd --create-home fleet-worker   # if you need a new account
-  curl -fsSL https://fleet.example.com/install/worker.sh | FLEET_WORKER_USER=fleet-worker FLEET_NODE_NAME=gpu-box-1 FLEET_NODE_TOKEN=fn_... sh
+  useradd --create-home fleet-worker   # if you need a new account
+  curl -fsSL https://fleet.example.com/install/worker.sh | FLEET_WORKER_USER=fleet-worker sh
   ```
+
+Each pairs the machine as on a Mac. On a machine with no screen, the script prints how to reach the worker's page from your own computer through an SSH tunnel, rather than opening it.
 
 The script does the following:
 
 1. Downloads the worker for your processor and verifies its checksum.
 2. Installs it as `/usr/local/bin/fleet-worker`, with a link to it at `~/fleet/fleet-worker`, so the same commands work as on a Mac. It's kept outside the home folder because SELinux, on by default on CentOS and RHEL, won't let a service run a program from one.
-3. Writes `~/fleet/worker.yaml`, which offers one test service, `system.hostname`, and saves the token where only that account can read it.
+3. Writes `~/fleet/worker.yaml`, which offers one test service, `system.hostname`, and pairs the machine, saving its token where only that account can read it.
 4. Installs a systemd service, `fleet-worker`, that runs as that account from boot with nobody logged in, restarts within 10 seconds after a crash, and waits until it has connected.
 
 Some things to know:
@@ -189,22 +224,24 @@ Some things to know:
 - **Jobs can't gain privileges**, so a tool can't use `sudo`. They keep the account's groups, so a GPU the account can use works.
 - **Stopping or restarting the service** stops running jobs. They're rerun only if their capability sets `retry_if_lost`.
 
-To restart it after changing `worker.yaml`, run `sudo systemctl restart fleet-worker`. To upgrade, run the same command again without the node name and token; as root, `FLEET_WORKER_USER` isn't needed either, because the account is read from the service.
+To restart it after changing `worker.yaml`, run `sudo systemctl restart fleet-worker`. To upgrade, run the same command again; as root, `FLEET_WORKER_USER` isn't needed, because the account is read from the service.
 
 ### Install on Windows
 
 This hasn't been run on real Windows yet, so expect to find rough edges.
 
-Run `fleet-add-worker windows-pc-1` on the server. Then, on the PC, log in as the account the worker should use, open PowerShell with **Run as administrator**, and paste the Windows command it printed:
+On the PC, log in as the account the worker should use, open PowerShell with **Run as administrator**, and paste the Windows command the gateway's installer printed:
 
 ```powershell
-[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; $env:FLEET_NODE_NAME = 'windows-pc-1'; $env:FLEET_NODE_TOKEN = 'fn_...'; irm https://fleet.example.com/install/worker.ps1 | iex
+[Net.ServicePointManager]::SecurityProtocol = 'Tls12'; irm https://fleet.example.com/install/worker.ps1 | iex
 ```
+
+It pairs the PC and opens the worker's page, as on a Mac.
 
 The script does the following:
 
 1. Downloads the worker for your processor and verifies its checksum.
-2. Installs into `%LOCALAPPDATA%\Fleet`, with a `worker.yaml` that offers one test service, `system.hostname`, and limits the token file to this user.
+2. Installs into `%LOCALAPPDATA%\Fleet`, with a `worker.yaml` that offers one test service, `system.hostname`, limits the token file to this user, and pairs the PC.
 3. Registers a scheduled task named **Fleet Worker**, which runs at boot as this user with limited rights, with nobody logged in, and comes back within 5 minutes after a crash.
 
 It needs administrator rights only to register the task. A scheduled task is used rather than a Windows service so the worker runs in your account, where your tools and models are installed. It can't reach network shares when started this way.
@@ -216,7 +253,7 @@ powercfg /change standby-timeout-ac 0
 powercfg /change hibernate-timeout-ac 0
 ```
 
-To upgrade, run the same command again without the node name and token. To uninstall, run `Unregister-ScheduledTask -TaskName 'Fleet Worker'`, then delete `%LOCALAPPDATA%\Fleet`.
+To upgrade, run the same command again. To uninstall, run `Unregister-ScheduledTask -TaskName 'Fleet Worker'`, then delete `%LOCALAPPDATA%\Fleet`.
 
 Some things work differently on Windows:
 
@@ -226,7 +263,7 @@ Some things work differently on Windows:
 
 ### Upgrade
 
-Upgrade the server first, by running the install command from a newer release without a node name. Then run this on each Mac and Linux machine, which needs no node name or token. Windows is covered under [Install on Windows](#install-on-windows).
+Upgrade the server first, by running the install command from a newer release. Then run this on each Mac and Linux machine. It keeps the machine's pairing, so it asks nothing. Windows is covered under [Install on Windows](#install-on-windows).
 
 ```sh
 curl -fsSL https://fleet.example.com/install/worker.sh | sh
@@ -311,7 +348,7 @@ On the server, this also deletes all jobs, results and credentials:
 
 ```sh
 sudo systemctl disable --now fleet-gateway
-sudo rm -rf /var/lib/fleet /srv/fleet /etc/systemd/system/fleet-gateway.service /usr/local/bin/fleet-gateway /usr/local/bin/fleet-add-worker /etc/caddy/fleet.caddy
+sudo rm -rf /var/lib/fleet /srv/fleet /etc/systemd/system/fleet-gateway.service /usr/local/bin/fleet-gateway /usr/local/bin/fleet-add-worker /usr/local/bin/fleet-pair /etc/caddy/fleet.caddy
 sudo sed -i -e '/^import fleet.caddy$/d' -e '/# fleet-gateway$/d' /etc/caddy/Caddyfile
 sudo systemctl reload caddy
 sudo userdel fleet

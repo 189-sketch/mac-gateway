@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -20,12 +21,13 @@ import (
 var version = "dev"
 
 func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "tools" || os.Args[1] == "ui") {
-		command := toolsCommand
-		if os.Args[1] == "ui" {
-			command = uiCommand
+	commands := map[string]func([]string) error{"tools": toolsCommand, "ui": uiCommand, "pair": pairCommand}
+	if len(os.Args) > 1 && commands[os.Args[1]] != nil {
+		err := commands[os.Args[1]](os.Args[2:])
+		if errors.Is(err, errSkipped) {
+			os.Exit(exitSkipped)
 		}
-		if err := command(os.Args[2:]); err != nil {
+		if err != nil {
 			fmt.Fprintln(os.Stderr, "fleet-worker:", err)
 			os.Exit(1)
 		}
@@ -104,8 +106,10 @@ func run(configPath, levelFlag string, output io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("log level: %w", err)
 	}
+	// A machine with no token starts anyway and waits to be paired, from its
+	// page or with `fleet-worker pair`.
 	token, err := manifest.ReadToken()
-	if err != nil {
+	if err != nil && !errors.Is(err, worker.ErrNoToken) {
 		return err
 	}
 	// Commands get a fresh environment, but drop this anyway as a second safeguard.

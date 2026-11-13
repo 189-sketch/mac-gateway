@@ -44,7 +44,11 @@ for arch in amd64 arm64; do
 	build windows arm64 fleet-worker "$bundle/fleet-worker-windows-arm64.exe"
 	sed "s|@@RELEASE_URL@@|$RELEASE_URL|g" deploy/install-gateway.sh >"$bundle/install-gateway.sh"
 	chmod 755 "$bundle/install-gateway.sh"
-	cp deploy/add-worker.sh deploy/install-worker.sh deploy/install-worker.ps1 deploy/fleet-gateway.service "$bundle/"
+	cp deploy/add-worker.sh deploy/pair.sh deploy/fleet-gateway.service "$bundle/"
+	# The gateway fills in its own address when it publishes these.
+	for script in install-worker.sh install-worker.ps1; do
+		sed "s|@@RELEASE_URL@@|$RELEASE_URL|g" "deploy/$script" >"$bundle/$script"
+	done
 	tar -C "$OUT" -czf "$OUT/$name.tar.gz" "$name"
 	rm -rf "$bundle"
 done
@@ -57,7 +61,14 @@ for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64; do
 done
 build windows amd64 fleet "$OUT/fleet-windows-amd64.exe"
 
-for script in install-gateway.sh install-cli.sh; do
+echo "==> Workers, for installing one before there's a gateway to get it from"
+for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64; do
+	build "${target%/*}" "${target#*/}" fleet-worker "$OUT/fleet-worker-${target%/*}-${target#*/}"
+done
+build windows amd64 fleet-worker "$OUT/fleet-worker-windows-amd64.exe"
+build windows arm64 fleet-worker "$OUT/fleet-worker-windows-arm64.exe"
+
+for script in install-gateway.sh install-cli.sh install-worker.sh install-worker.ps1; do
 	sed "s|@@RELEASE_URL@@|$RELEASE_URL|g" "deploy/$script" >"$OUT/$script"
 	chmod 755 "$OUT/$script"
 done
