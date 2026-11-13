@@ -64,13 +64,13 @@ Run one of these on the server, as root or as a user with `sudo`:
 **One line, if the repo is public:**
 
 ```sh
-curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.4.1/install-gateway.sh | bash
+curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.5.0/install-gateway.sh | bash
 ```
 
 **From a downloaded bundle, which also works while the repo is private.** Download `fleet-server-linux-amd64.tar.gz` (or `-arm64`) from the [Releases page](https://github.com/189-sketch/mac-gateway/releases) while logged in, or use the GitHub CLI as below:
 
 ```sh
-gh release download v0.4.1 -R 189-sketch/mac-gateway -p 'fleet-server-linux-amd64.tar.gz'
+gh release download v0.5.0 -R 189-sketch/mac-gateway -p 'fleet-server-linux-amd64.tar.gz'
 tar -xzf fleet-server-linux-amd64.tar.gz
 ./fleet-server-linux-amd64/install-gateway.sh
 ```
@@ -133,7 +133,7 @@ Pressing Enter instead of a code skips pairing. The worker still starts, and its
 
 Installed as a standard user, the worker is a LaunchAgent that runs while that user is logged in. Installed as root, with `sudo sh` at the end of the command, it's a LaunchDaemon that runs from boot as root, from `/var/root/fleet`.
 
-The script can also be run before there's a gateway, from the release: `curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.4.1/install-worker.sh | sh`. It then asks for the gateway's address, and pressing Enter skips that too.
+The script can also be run before there's a gateway, from the release: `curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.5.0/install-worker.sh | sh`. It then asks for the gateway's address, and pressing Enter skips that too.
 
 #### Pair a machine later
 
@@ -167,7 +167,7 @@ In Claude Code, after running the `claude mcp add` command the gateway's install
 To test from a terminal instead, you need the `fleet` command. If the repo is public, this installs it to `~/.local/bin`:
 
 ```sh
-curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.4.1/install-cli.sh | sh
+curl -fsSL https://github.com/189-sketch/mac-gateway/releases/download/v0.5.0/install-cli.sh | sh
 ```
 
 Otherwise, download `fleet-linux-amd64`, `fleet-darwin-arm64` or the one for your machine from the Releases page, or build it with `go build -o fleet ./cmd/fleet`. Then:
