@@ -276,12 +276,14 @@ Data, API keys, tokens and each machine's `worker.yaml` are kept. Running jobs o
 On the server:
 
 ```sh
-sudo -u fleet /usr/local/bin/fleet-gateway key add my-agent --capabilities 'tts.*,video.*' --data /var/lib/fleet
+sudo -u fleet /usr/local/bin/fleet-gateway key add my-agent --capabilities 'tts.*,video.*' --nodes 'mac-mini*' --data /var/lib/fleet
 sudo -u fleet /usr/local/bin/fleet-gateway key revoke my-agent --data /var/lib/fleet
 sudo -u fleet /usr/local/bin/fleet-gateway node revoke mac-mini-1 --data /var/lib/fleet
 ```
 
-`--capabilities` takes comma-separated patterns, and `'*'` allows everything. A key made with `--dashboard` instead can only view [the dashboard](#dashboard). Revoking takes effect within a heartbeat. A revoked name can't be registered again, so a replacement machine needs a new name.
+`--capabilities` and `--nodes` take comma-separated patterns, and `'*'` allows everything. `--nodes` is the machines the key's jobs may run on, and is `'*'` if left out. A key made with `--dashboard` instead can only view [the dashboard](#dashboard), and one made with `--admin` can also manage keys and machines there. Revoking takes effect within a heartbeat. A revoked name can't be registered again, so a replacement machine needs a new name.
+
+All of this can also be done on the dashboard with an admin key.
 
 ### See what a worker is doing
 
@@ -712,7 +714,7 @@ The command prints the jobs as JSON and exits with `0` if every test it started 
 With the API, `POST /v1/capabilities/{name}/test` takes an optional `node`, `queue_timeout` and `idempotency_key`, and answers with `tests` (the node and job for each) and `skipped`. If it can't start any, it answers `409 NOT_READY` when a machine is offline or not ready, or `422 NO_TEST` when none declares a usable test.
 
 - **It's an ordinary job.** Follow it, cancel it or download its results with the job's ID. It counts against the machine's limits, so it waits its turn on a busy machine. It runs on the machine it was started for, and no other.
-- **Callers can't change what it runs.** They choose only when it runs. The API key must be allowed to call the capability, and a dashboard key can't start tests.
+- **Callers can't change what it runs.** They choose only when it runs. The API key must be allowed to call the capability on that machine. A view-only dashboard key can't start tests; an admin key can, from the dashboard.
 - **Passing means the job finished.** The command exited with `0` and produced its outputs, or the service replied successfully. It doesn't judge the content, so download the result if you need to hear or see it.
 - **Tests only run when asked.** A test can use a lot of a machine's power, so connecting doesn't start one. To test regularly, run `fleet test` from cron.
 - **A capability with `input_files` can't declare a test**, because a test has no files to send.
@@ -803,13 +805,24 @@ Use `adapter: http_async` for a service that answers with a job ID and works in 
 
 The gateway serves a status page at `https://fleet.example.com/dashboard/`, showing machines, their load, and jobs with their progress and failures. It refreshes every 3 seconds while its tab is visible.
 
-It needs its own kind of key. On the server:
+It needs its own kind of key. The gateway installer prints an admin key. To make more, on the server:
 
 ```sh
-sudo -u fleet /usr/local/bin/fleet-gateway key add ops --dashboard --data /var/lib/fleet
+sudo -u fleet /usr/local/bin/fleet-gateway key add admin --admin --data /var/lib/fleet   # can manage
+sudo -u fleet /usr/local/bin/fleet-gateway key add ops --dashboard --data /var/lib/fleet  # can only view
 ```
 
 A dashboard key can see the status of every job from every agent, but can't run or cancel anything, and can't read job input, `result` values, command `output` or result files. Agent keys can't open the dashboard. The key is kept only in the browser tab and is forgotten when the tab closes.
+
+An admin key can also:
+
+- **Manage API keys**, on the API keys page. Make one for each person or agent, and choose which tools and which machines it may use: `*` (the default) means all, and patterns such as `tts.*` or `mac-*` work. A key sees and runs only the tools it's allowed, on the machines it's allowed; its jobs wait for one of those machines rather than going to another. A change applies to jobs submitted after it. Any API key can be shown again and copied, along with the MCP address and a ready-to-paste Claude Code command, and revoked.
+- **Test tools**, on a connected machine: click a tool marked ▶ to run its declared test, or **Test all tools**. A test runs what the machine declared, as an ordinary job submitted by the admin key, and the admin sees what it printed.
+- **Remove a machine** that's offline. Its token stops working and its tools stop being offered, as with `node revoke`. Pair it again to bring it back.
+
+**An admin key can show every API key, so it can do anything they can.** Give it only to people who manage the gateway, and use `--dashboard` keys for anyone who only needs to watch.
+
+API keys are kept sealed with a key in `/var/lib/fleet/secrets.key`, so a copy of the database alone doesn't give them away. Keys made before this version weren't kept, so they can't be shown; make new ones to replace them if you need to.
 
 **Error messages are visible to anyone with a dashboard key.** They can include what a command printed or a service replied, and that may quote part of a job's input.
 
@@ -832,7 +845,7 @@ The version is built into the binaries and into the download address in the inst
 | `cmd/` | The three programs: `fleet-gateway`, `fleet-worker` and `fleet` |
 | `internal/gateway/lifecycle.go` | Every job state transition: leases, fencing, revival and retries |
 | `internal/gateway/` | API, scheduler, worker connections and storage |
-| `internal/gateway/dashboard.go`, `internal/gateway/web/` | Dashboard API, and its page, which is built into the binary |
+| `internal/gateway/dashboard.go`, `dashboard_admin.go`, `keys.go`, `internal/gateway/web/` | Dashboard API, its admin actions and key storage, and its page, which is built into the binary |
 | `internal/worker/` | Manifest, command execution, event spool and connection |
 | `internal/worker/service.go`, `service_config.go` | The HTTP adapters |
 | `internal/worker/proc_unix.go`, `proc_windows.go` | Stopping commands, per operating system |

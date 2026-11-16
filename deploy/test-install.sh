@@ -102,6 +102,8 @@ run_gateway_install "$ROOT" fleet.example.com mac-one >"$OUT" 2>&1
 check "exits successfully" test $? -eq 0
 check "prints an API key" grep -q 'FLEET_API_KEY=fk_' "$OUT"
 check "prints the gateway URL" grep -q 'FLEET_URL=https://fleet.example.com' "$OUT"
+check "prints an admin key for the dashboard" grep -Eq '^   fd_[0-9a-f]{64}$' "$OUT"
+check "says where the dashboard is" grep -q 'Open https://fleet.example.com/dashboard/' "$OUT"
 check "prints the Mac command" grep -q 'curl -fsSL https://fleet.example.com/install/worker.sh | FLEET_NODE_NAME=mac-one FLEET_NODE_TOKEN=fn_' "$OUT"
 check "installs the gateway binary" test -x "$ROOT/usr/local/bin/fleet-gateway"
 check "installs the service" test -f "$ROOT/etc/systemd/system/fleet-gateway.service"
@@ -143,6 +145,8 @@ run_gateway_install "$ROOT" fleet.example.com >"$OUT" 2>&1
 check "exits successfully" test $? -eq 0
 refute "doesn't print another API key" grep -q 'FLEET_API_KEY=fk_' "$OUT"
 check "says the key was kept" grep -q 'already exists' "$OUT"
+refute "doesn't print another admin key" grep -Eq '^   fd_' "$OUT"
+check "says the admin key was kept" grep -q "admin key named 'admin' already exists" "$OUT"
 refute "doesn't register another node" grep -q 'FLEET_NODE_TOKEN' "$OUT"
 check "doesn't repeat the Caddy import" test "$(grep -cx 'import fleet.caddy' "$ROOT/etc/caddy/Caddyfile")" = 1
 

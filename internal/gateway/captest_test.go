@@ -35,10 +35,10 @@ func TestPickNodeKeepsATestOnItsMachine(t *testing.T) {
 // When a queued test runs out of time, the reason must be about its own machine.
 func TestOffersConsidersOnlyATestsOwnMachine(t *testing.T) {
 	online := onlineSet{nodes: []onlineNode{{id: "pc", capabilities: []string{"tts"}}}}
-	if !online.offers("tts", nil, "") || !online.offers("tts", nil, "pc") {
+	if !online.offers("tts", nil, "", nil) || !online.offers("tts", nil, "pc", nil) {
 		t.Error("should find the connected machine")
 	}
-	if online.offers("tts", nil, "mac") {
+	if online.offers("tts", nil, "mac", nil) {
 		t.Error("another machine being connected says nothing about this one")
 	}
 }

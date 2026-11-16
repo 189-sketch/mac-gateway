@@ -616,6 +616,31 @@ KEY
    any time, run: sudo fleet-pair
 
 WORKER
+	local admin
+	if admin="$(sudo -u fleet "$ROOT/usr/local/bin/fleet-gateway" key add admin --admin --data "$ROOT/var/lib/fleet" 2>/dev/null)"; then
+		cat <<ADMIN
+3. Manage it in a browser
+
+   Open $url/dashboard/ and sign in with this admin key:
+
+   $admin
+
+   It isn't shown again. There you can see machines and jobs, make an API key
+   for each person and choose which tools and machines it may use, see or copy
+   any API key, test tools, and remove machines that have gone.
+
+ADMIN
+	else
+		cat <<ADMIN
+3. Manage it in a browser
+
+   Open $url/dashboard/ and sign in with the admin key printed when the gateway
+   was first installed. An admin key named 'admin' already exists, so it was
+   kept. To make another:
+             sudo -u fleet fleet-gateway key add NAME --admin --data /var/lib/fleet
+
+ADMIN
+	fi
 
 	if [ -n "$node_name_given" ]; then
 		"$ROOT/usr/local/bin/fleet-add-worker" "$node_name" || true

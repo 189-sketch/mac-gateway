@@ -25,8 +25,9 @@ const usage = `usage:
   fleet-gateway serve [flags]
   fleet-gateway node add <name>      [--data DIR]   print a new node token
   fleet-gateway node revoke <name>   [--data DIR]
-  fleet-gateway key add <name> --capabilities 'tts.*,video.*' [--data DIR]   print a new API key
+  fleet-gateway key add <name> --capabilities 'tts.*,video.*' [--nodes 'mac-*'] [--data DIR]   print a new API key
   fleet-gateway key add <name> --dashboard [--data DIR]   print a new key for viewing the dashboard
+  fleet-gateway key add <name> --admin [--data DIR]       print a new dashboard key that can also manage keys and machines
   fleet-gateway key revoke <name>    [--data DIR]
   fleet-gateway pair [--data DIR] [--wait 15m] [--until-connected]   show the codes of machines asking to pair`
 
@@ -101,7 +102,9 @@ func manageCredential(kind, action, name string, args []string) error {
 	fs := flag.NewFlagSet(kind, flag.ContinueOnError)
 	dataDir := fs.String("data", gateway.DefaultConfig().DataDir, "data directory")
 	capabilities := fs.String("capabilities", "", "comma-separated capability patterns, such as tts.*")
+	nodes := fs.String("nodes", "*", "comma-separated machine name patterns the key's jobs may run on")
 	dashboard := fs.Bool("dashboard", false, "make a key that can only view the dashboard")
+	admin := fs.Bool("admin", false, "make a dashboard key that can also manage keys and machines, and start tests")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -125,18 +128,23 @@ func manageCredential(kind, action, name string, args []string) error {
 	case "node revoke":
 		return store.RevokeNode(ctx, name)
 	case "key add":
-		if *dashboard && *capabilities != "" {
-			return errors.New("a dashboard key can't run jobs, so don't combine --dashboard with --capabilities")
+		if *dashboard && *admin {
+			return errors.New("--admin makes a dashboard key already, so use one or the other")
+		}
+		if (*dashboard || *admin) && (*capabilities != "" || *nodes != "*") {
+			return errors.New("a dashboard key can't run jobs, so don't combine --dashboard or --admin with --capabilities or --nodes")
 		}
 		var secret string
 		var err error
 		switch {
+		case *admin:
+			secret, err = store.AddAdminKey(ctx, name)
 		case *dashboard:
 			secret, err = store.AddDashboardKey(ctx, name)
 		case *capabilities == "":
 			return errors.New("--capabilities is required; use '*' to allow all")
 		default:
-			secret, err = store.AddAPIKey(ctx, name, strings.Split(*capabilities, ","))
+			secret, err = store.AddScopedAPIKey(ctx, name, strings.Split(*capabilities, ","), strings.Split(*nodes, ","))
 		}
 		if err != nil {
 			return err

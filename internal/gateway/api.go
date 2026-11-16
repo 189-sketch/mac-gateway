@@ -49,6 +49,13 @@ func (g *Gateway) routes() http.Handler {
 	mux.HandleFunc("GET /v1/dashboard/overview", g.withDashboardKey(g.handleDashboardOverview))
 	mux.HandleFunc("GET /v1/dashboard/jobs", g.withDashboardKey(g.handleDashboardJobs))
 	mux.HandleFunc("GET /v1/dashboard/jobs/{id}", g.withDashboardKey(g.handleDashboardJob))
+	mux.HandleFunc("GET /v1/dashboard/keys", g.withAdminKey(g.handleListKeys))
+	mux.HandleFunc("POST /v1/dashboard/keys", g.withAdminKey(g.handleCreateKey))
+	mux.HandleFunc("GET /v1/dashboard/keys/{id}/secret", g.withAdminKey(g.handleKeySecret))
+	mux.HandleFunc("PUT /v1/dashboard/keys/{id}", g.withAdminKey(g.handleUpdateKey))
+	mux.HandleFunc("DELETE /v1/dashboard/keys/{id}", g.withAdminKey(g.handleRevokeKey))
+	mux.HandleFunc("DELETE /v1/dashboard/nodes/{name}", g.withAdminKey(g.handleRemoveNode))
+	mux.HandleFunc("POST /v1/dashboard/nodes/{name}/test", g.withAdminKey(g.handleTestNode))
 	mux.Handle("GET /dashboard/", dashboardHandler())
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "dashboard/", http.StatusFound)
@@ -171,7 +178,7 @@ func (g *Gateway) handleCapabilities(w http.ResponseWriter, r *http.Request, key
 	online := g.onlineNodes()
 	views := []capabilityView{}
 	for _, row := range rows {
-		if !keyAllows(key, row.Name) {
+		if !keyAllowsOffer(key, row) {
 			continue
 		}
 		if len(views) == 0 || views[len(views)-1].Name != row.Name {
@@ -278,6 +285,10 @@ func (g *Gateway) submitJob(ctx context.Context, key *APIKey, req createJobReque
 	if len(offers) == 0 {
 		return refuse(http.StatusNotFound, "UNKNOWN_CAPABILITY", "no node has registered "+req.Capability)
 	}
+	offers = slices.DeleteFunc(offers, func(o CapabilityRow) bool { return !nodeAllowed(key.NodePatterns, o.NodeName) })
+	if len(offers) == 0 {
+		return refuse(http.StatusForbidden, "FORBIDDEN", "this API key may not use any machine that offers "+req.Capability)
+	}
 	if status, code, message := checkOffers(offers, req.Selector, input, req.Files); code != "" {
 		return refuse(status, code, message)
 	}
@@ -303,6 +314,7 @@ func (g *Gateway) submitJob(ctx context.Context, key *APIKey, req createJobReque
 		QueueTimeout:   queueTimeout,
 		Files:          req.Files,
 		TestNode:       req.testNode,
+		Nodes:          key.NodePatterns,
 	})
 	if errors.Is(err, ErrFileUnavailable) {
 		return refuse(http.StatusUnprocessableEntity, "FILE_UNAVAILABLE", err.Error())

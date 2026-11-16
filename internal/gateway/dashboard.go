@@ -48,7 +48,7 @@ func dashboardHandler() http.Handler {
 // withDashboardKey admits only keys made for the dashboard. They're a separate
 // kind of key, and withKey refuses them: one can see every job's status, but it
 // can't run anything or read anyone's input or results.
-func (g *Gateway) withDashboardKey(next func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
+func (g *Gateway) withDashboardKey(next keyHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		secret := bearerToken(r)
@@ -69,7 +69,7 @@ func (g *Gateway) withDashboardKey(next func(http.ResponseWriter, *http.Request)
 			writeError(w, http.StatusForbidden, "FORBIDDEN", "this is an agent key; create a dashboard key with: fleet-gateway key add NAME --dashboard", false)
 			return
 		}
-		next(w, r)
+		next(w, r, key)
 	}
 }
 
@@ -87,6 +87,8 @@ type DashboardNode struct {
 	Capabilities []string               `json:"capabilities"`
 	// NotReady lists capabilities that failed the worker's own check, with why.
 	NotReady map[string]string `json:"not_ready,omitempty"`
+	// Testable lists capabilities that declare a test.
+	Testable []string `json:"testable,omitempty"`
 	// LastTests has the latest test of each capability that has been tested here.
 	LastTests  map[string]*LastTest `json:"last_tests,omitempty"`
 	LastSeenAt string               `json:"last_seen_at,omitempty"`
@@ -106,6 +108,13 @@ type DashboardOverview struct {
 	Recent       map[string]int  `json:"recent"`
 	Capabilities []string        `json:"capabilities"`
 	Storage      ResourceUse64   `json:"storage"`
+	Viewer       DashboardViewer `json:"viewer"`
+}
+
+// DashboardViewer says who is signed in, and so what the page may offer.
+type DashboardViewer struct {
+	Name  string `json:"name"`
+	Admin bool   `json:"admin"`
 }
 
 // ResourceUse64 is ResourceUse for sizes in bytes.
@@ -140,6 +149,10 @@ type DashboardJobDetail struct {
 	DashboardJob
 	Artifacts []DashboardArtifact `json:"artifacts"`
 	Events    []EventView         `json:"events"`
+	// For an admin, a test's exit code and the end of what it printed. A test runs
+	// what its worker declared, never anyone's input.
+	TestExitCode *int   `json:"test_exit_code,omitempty"`
+	TestOutput   string `json:"test_output,omitempty"`
 }
 
 // DashboardArtifact names a result file without offering it for download.
@@ -151,7 +164,7 @@ type DashboardArtifact struct {
 
 // --- Handlers ---
 
-func (g *Gateway) handleDashboardOverview(w http.ResponseWriter, r *http.Request) {
+func (g *Gateway) handleDashboardOverview(w http.ResponseWriter, r *http.Request, key *APIKey) {
 	ctx := r.Context()
 	view, err := g.store.dashboardOverview(ctx, g.onlineNodes())
 	if err != nil {
@@ -159,10 +172,11 @@ func (g *Gateway) handleDashboardOverview(w http.ResponseWriter, r *http.Request
 		return
 	}
 	view.Storage.Total = g.cfg.MaxArtifactBytes
+	view.Viewer = DashboardViewer{Name: key.Name, Admin: key.Admin}
 	writeJSON(w, http.StatusOK, view)
 }
 
-func (g *Gateway) handleDashboardJobs(w http.ResponseWriter, r *http.Request) {
+func (g *Gateway) handleDashboardJobs(w http.ResponseWriter, r *http.Request, _ *APIKey) {
 	query := r.URL.Query()
 	limit := defaultDashboardJobs
 	if raw := query.Get("limit"); raw != "" {
@@ -207,7 +221,7 @@ func (g *Gateway) handleDashboardJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs, "next": next})
 }
 
-func (g *Gateway) handleDashboardJob(w http.ResponseWriter, r *http.Request) {
+func (g *Gateway) handleDashboardJob(w http.ResponseWriter, r *http.Request, key *APIKey) {
 	detail, err := g.store.dashboardJobDetail(r.Context(), r.PathValue("id"))
 	if err != nil {
 		g.internalError(w, r, "read job", err)
@@ -216,6 +230,14 @@ func (g *Gateway) handleDashboardJob(w http.ResponseWriter, r *http.Request) {
 	if detail == nil {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "job not found", false)
 		return
+	}
+	if key.Admin && detail.Test && detail.Terminal {
+		outcome := JobView{ID: detail.ID, Status: detail.Status}
+		if err := g.store.jobOutcome(r.Context(), &outcome); err != nil {
+			g.internalError(w, r, "read test outcome", err)
+			return
+		}
+		detail.TestExitCode, detail.TestOutput = outcome.ExitCode, outcome.Output
 	}
 	writeJSON(w, http.StatusOK, detail)
 }
@@ -243,10 +265,14 @@ func (s *Store) dashboardOverview(ctx context.Context, online onlineSet) (*Dashb
 		nodeTests[key.nodeID][key.capability] = test
 	}
 	offered := map[string][]string{}
+	testable := map[string][]string{}
 	notReady := map[string]map[string]string{}
 	var capabilities []string
 	for _, offer := range offers {
 		offered[offer.NodeID] = append(offered[offer.NodeID], offer.Name)
+		if offer.TestInput != "" {
+			testable[offer.NodeID] = append(testable[offer.NodeID], offer.Name)
+		}
 		if offer.NotReady != "" {
 			if notReady[offer.NodeID] == nil {
 				notReady[offer.NodeID] = map[string]string{}
@@ -298,6 +324,7 @@ func (s *Store) dashboardOverview(ctx context.Context, online onlineSet) (*Dashb
 		node.Online = online.ids[id]
 		node.Capabilities = orEmptySlice(offered[id])
 		node.NotReady = notReady[id]
+		node.Testable = testable[id]
 		node.LastTests = nodeTests[id]
 		if lastSeen.Valid {
 			node.LastSeenAt = formatMS(lastSeen.Int64)

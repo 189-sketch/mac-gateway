@@ -17,17 +17,49 @@
     <p id="signin-error" class="form-error" role="alert" hidden></p>
     <button type="submit" class="primary">Sign in</button>
   </form>
-  <p class="hint">Create one on the gateway server:<br><code>sudo -u fleet /usr/local/bin/fleet-gateway key add ops --dashboard --data /var/lib/fleet</code></p>
-  <p class="hint">The key stays in this tab and is forgotten when you close it. It can only view status: it can't run jobs or read their input or results.</p>
+  <p class="hint">Create one on the gateway server. An admin key can also manage API keys, remove machines and run tests:<br><code>sudo -u fleet /usr/local/bin/fleet-gateway key add admin --admin --data /var/lib/fleet</code></p>
+  <p class="hint">A key made with <code>--dashboard</code> instead can only view status: it can't run jobs or read their input or results. The key stays in this tab and is forgotten when you close it.</p>
 </section>
 
 <div id="app" hidden>
   <header class="topbar">
     <h1>Fleet</h1>
+    <nav id="nav" class="nav" aria-label="Pages" hidden>
+      <a href="#" id="nav-overview" aria-current="page">Overview</a>
+      <a href="#keys" id="nav-keys">API keys</a>
+    </nav>
     <p id="freshness" class="freshness" role="status"></p>
+    <span id="viewer" class="viewer"></span>
     <button id="signout" type="button" class="quiet">Sign out</button>
   </header>
-  <main>
+  <main id="page-keys" hidden>
+    <section aria-labelledby="keys-title">
+      <div class="section-head">
+        <div>
+          <h2 id="keys-title">API keys</h2>
+          <p class="hint section-note">Each key is for one person or agent. It connects to <code id="mcp-url"></code> and can use only the tools and machines you allow. <code>*</code> means all.</p>
+        </div>
+        <button id="key-new" type="button" class="primary">New key</button>
+      </div>
+      <p id="keys-error" class="form-error" role="alert" hidden></p>
+      <div class="table-wrap">
+        <table class="jobs keys">
+          <thead>
+            <tr><th scope="col">Name</th><th scope="col">Tools</th><th scope="col">Machines</th><th scope="col">Jobs</th><th scope="col">Created</th><th scope="col" class="actions-col"><span class="visually-hidden">Actions</span></th></tr>
+          </thead>
+          <tbody id="key-rows"></tbody>
+        </table>
+      </div>
+      <p id="keys-empty" class="empty" hidden>No API keys yet. Make one for each person or agent that uses the tools.</p>
+    </section>
+    <section aria-labelledby="dash-keys-title">
+      <h2 id="dash-keys-title">Dashboard keys</h2>
+      <p class="hint section-note">Keys for signing in here. Make them on the server with <code>fleet-gateway key add NAME --dashboard</code>, or <code>--admin</code> for one that can manage.</p>
+      <ul id="dash-key-rows" class="dash-keys"></ul>
+    </section>
+  </main>
+  <main id="page-overview">
+    <p id="action-note" class="action-note" role="status" hidden></p>
     <section aria-label="Summary"><dl id="tiles" class="tiles"></dl></section>
 
     <section aria-labelledby="machines-title">
@@ -80,6 +112,56 @@
     <button id="detail-close" type="button" class="quiet">Close</button>
   </div>
   <div id="detail-body"></div>
+</dialog>
+
+<dialog id="key-form-dialog" aria-labelledby="key-form-title">
+  <form id="key-form" method="dialog">
+    <div class="detail-head">
+      <h2 id="key-form-title">New API key</h2>
+      <button id="key-form-close" type="button" class="quiet">Cancel</button>
+    </div>
+    <div class="form-grid">
+      <label for="key-name">Name</label>
+      <div>
+        <input id="key-name" autocomplete="off" spellcheck="false" maxlength="64" required placeholder="alice, or claude-on-laptop">
+        <p class="hint field-hint">Who or what will use it. It's shown next to each job they submit.</p>
+      </div>
+      <label for="key-tools">Tools</label>
+      <div>
+        <input id="key-tools" autocomplete="off" spellcheck="false" value="*">
+        <p class="hint field-hint">Comma-separated names or patterns, such as <code>tts.*</code>. Click to add or remove:</p>
+        <div id="key-tools-pick" class="pick"></div>
+      </div>
+      <label for="key-nodes">Machines</label>
+      <div>
+        <input id="key-nodes" autocomplete="off" spellcheck="false" value="*">
+        <p class="hint field-hint">Its jobs run only on these. Click to add or remove:</p>
+        <div id="key-nodes-pick" class="pick"></div>
+      </div>
+    </div>
+    <p id="key-form-error" class="form-error" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button id="key-form-submit" type="submit" class="primary">Create key</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="secret-dialog" aria-labelledby="secret-title">
+  <div class="detail-head">
+    <h2 id="secret-title"></h2>
+    <button id="secret-close" type="button" class="quiet">Close</button>
+  </div>
+  <div id="secret-body"></div>
+</dialog>
+
+<dialog id="confirm-dialog" aria-labelledby="confirm-title">
+  <h2 id="confirm-title"></h2>
+  <p id="confirm-text"></p>
+  <p id="confirm-error" class="form-error" role="alert" hidden></p>
+  <div class="dialog-actions">
+    <button id="confirm-cancel" type="button" class="quiet">Cancel</button>
+    <button id="confirm-ok" type="button" class="danger"></button>
+  </div>
 </dialog>
 <script src="app.js"></script>
 </body>

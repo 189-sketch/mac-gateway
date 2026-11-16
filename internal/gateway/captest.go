@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 )
@@ -64,6 +65,11 @@ func (g *Gateway) handleTestCapability(w http.ResponseWriter, r *http.Request, k
 	}
 	if len(offers) == 0 {
 		writeError(w, http.StatusNotFound, "UNKNOWN_CAPABILITY", "no node has registered "+capability, false)
+		return
+	}
+	offers = slices.DeleteFunc(offers, func(o CapabilityRow) bool { return !nodeAllowed(key.NodePatterns, o.NodeName) })
+	if len(offers) == 0 {
+		writeError(w, http.StatusForbidden, "FORBIDDEN", "this API key may not use any machine that offers "+capability, false)
 		return
 	}
 	if req.Node != "" {
@@ -167,6 +173,7 @@ func (g *Gateway) startTest(ctx context.Context, key *APIKey, offer CapabilityRo
 		RequestHash:    hex.EncodeToString(hash.Sum(nil)),
 		QueueTimeout:   queueTimeout,
 		TestNode:       offer.NodeID,
+		Nodes:          key.NodePatterns,
 	})
 	if err != nil {
 		return nil, false, err

@@ -29,6 +29,8 @@ const ICONS = {
   cross: "M3.5 3.5l9 9M12.5 3.5l-9 9",
   clock: "M8 2.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11zM8 5v3.2l2.2 1.3",
   slash: "M8 2.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11zM4.2 4.2l7.6 7.6",
+  copy: "M5.5 5.5h7v7h-7zM3.5 10.5v-7h7",
+  eye: "M1.5 8s2.4-4.5 6.5-4.5 6.5 4.5 6.5 4.5-2.4 4.5-6.5 4.5S1.5 8 1.5 8zM8 6.2a1.8 1.8 0 1 0 0 3.6 1.8 1.8 0 0 0 0-3.6z",
 };
 
 const $ = (id) => document.getElementById(id);
@@ -139,16 +141,35 @@ function saveKey(key) {
 
 class AuthError extends Error {}
 
-async function api(path, key = loadKey()) {
-  const response = await fetch(`../v1/dashboard/${path}`, { headers: { Authorization: `Bearer ${key}` } });
-  const body = await response.json().catch(() => null);
-  if (response.status === 401 || response.status === 403) {
-    throw new AuthError((body && body.error && body.error.message) || "That key wasn't accepted.");
+class APIError extends Error {
+  constructor(message, status, body) {
+    super(message);
+    this.status = status;
+    this.body = body;
   }
-  if (!response.ok) {
-    throw new Error((body && body.error && body.error.message) || `The gateway answered ${response.status}.`);
+}
+
+async function api(path, key = loadKey(), options = {}) {
+  const init = { method: options.method || "GET", headers: { Authorization: `Bearer ${key}` } };
+  if (options.body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(options.body);
+  }
+  const response = await fetch(`../v1/dashboard/${path}`, init);
+  const body = response.status === 204 ? {} : await response.json().catch(() => null);
+  const message = body && body.error && body.error.message;
+  // A 403 on an admin action means this key may only view, which isn't a reason to sign out.
+  if (response.status === 401 || (response.status === 403 && init.method === "GET" && !path.startsWith("keys"))) {
+    throw new AuthError(message || "That key wasn't accepted.");
+  }
+  if (!response.ok && !(options.accept || []).includes(response.status)) {
+    throw new APIError(message || `The gateway answered ${response.status}.`, response.status, body);
   }
   return body;
+}
+
+function act(path, method, body, accept) {
+  return api(path, loadKey(), { method, body, accept });
 }
 
 // --- State ---
@@ -162,6 +183,11 @@ const state = {
   timer: 0,
   generation: 0, // Replies to a request made before a filter changed are ignored.
   extraPages: 0,
+  admin: false,
+  page: "overview",
+  keys: null,
+  pending: new Set(), // Machine actions waiting for the gateway, as "node" or "node/tool".
+  note: null, // { text, tone, until }: what the last machine action did.
 };
 
 function showSignin(message) {
@@ -211,6 +237,56 @@ function testNote(name, test) {
   return el("p", "not-ready-note", `${name} test failed ${ago(test.at)}${why}`);
 }
 
+function actionButton(label, className, data, disabled, title) {
+  const button = el("button", className, label);
+  button.type = "button";
+  Object.assign(button.dataset, data);
+  button.disabled = Boolean(disabled);
+  if (title) button.title = title;
+  return button;
+}
+
+function toolChip(node, name, notReady, testable) {
+  const warn = notReady ? el("span", "status status-warning", icon("alert")) : null;
+  if (!state.admin || !node.online || !testable) return el("li", notReady ? "not-ready" : null, warn, name);
+  const busy = state.pending.has(`${node.name}/${name}`) || state.pending.has(node.name);
+  const button = actionButton(null, "chip-test", { node: node.name, tool: name }, busy || notReady,
+    notReady ? `${name} isn't ready, so it can't be tested` : `Run ${name}'s test on ${node.name}`);
+  button.append(el("span", "status status-accent", icon("play")), name);
+  return el("li", "testable", button);
+}
+
+function machineActions(node) {
+  if (!state.admin) return null;
+  const actions = el("div", "machine-actions");
+  if (node.online) {
+    const testable = node.testable || [];
+    const busy = state.pending.has(node.name);
+    actions.append(actionButton(busy ? "Testing…" : "Test all tools", "quiet small", { testNode: node.name }, busy || testable.length === 0,
+      testable.length === 0 ? "None of this machine's tools declares a test" : `Run the test of each of ${node.name}'s tools`));
+  } else {
+    actions.append(actionButton("Remove", "quiet small danger-text", { removeNode: node.name }, state.pending.has(node.name),
+      `Remove ${node.name}; its token stops working`));
+  }
+  return actions;
+}
+
+function renderNote() {
+  const line = $("action-note");
+  if (!state.note || Date.now() > state.note.until) {
+    line.hidden = true;
+    return;
+  }
+  line.hidden = false;
+  line.className = `action-note tone-${state.note.tone}`;
+  line.textContent = state.note.text;
+}
+
+function setNote(text, tone = "good") {
+  state.note = { text, tone, until: Date.now() + 15000 };
+  renderNote();
+}
+
 function renderMachines(overview) {
   if (overview.nodes.length === 0) {
     $("machines").replaceChildren(el("p", "empty", "No machines yet. Add one on the gateway server with fleet-add-worker."));
@@ -230,17 +306,23 @@ function renderMachines(overview) {
     for (const name of Object.keys(node.resources).sort()) card.append(usage(name, node.resources[name]));
     if (node.capabilities.length > 0) {
       const notReady = node.not_ready || {};
-      card.append(el("ul", "chips", ...node.capabilities.map((name) => {
-        if (!notReady[name]) return el("li", null, name);
-        return el("li", "not-ready", el("span", "status status-warning", icon("alert")), name);
-      })));
+      const testable = new Set(node.testable || []);
+      card.append(el("ul", "chips", ...node.capabilities.map((name) => toolChip(node, name, notReady[name], testable.has(name)))));
       // Spelled out, because a phone has no hover and an icon alone doesn't say why.
       for (const name of Object.keys(notReady).sort()) {
         card.append(el("p", "not-ready-note", `${name} isn't ready: ${notReady[name]}`));
       }
       const tests = node.last_tests || {};
-      for (const name of Object.keys(tests).sort()) card.append(testNote(name, tests[name]));
+      for (const name of Object.keys(tests).sort()) {
+        const note = testNote(name, tests[name]);
+        note.dataset.job = tests[name].job_id;
+        note.classList.add("opens");
+        note.title = "Show this test";
+        card.append(note);
+      }
     }
+    const actions = machineActions(node);
+    if (actions) card.append(actions);
     return card;
   }));
 }
@@ -379,6 +461,10 @@ function renderDetail(job) {
   if (job.error) {
     parts.push(el("pre", "message", `${job.error.code}\n${job.error.message || ""}`));
   }
+  if (job.test_output || typeof job.test_exit_code === "number") {
+    parts.push(el("h3", null, typeof job.test_exit_code === "number" ? `Test output (exit code ${job.test_exit_code})` : "Test output"));
+    parts.push(el("pre", "output", job.test_output || "(nothing printed)"));
+  }
   if (job.artifacts.length > 0) {
     parts.push(el("h3", null, "Result files"));
     parts.push(el("ul", "files", ...job.artifacts.map((file) =>
@@ -420,6 +506,7 @@ async function refresh() {
   const [overview, list] = await Promise.all([api("overview"), api(jobsQuery(limit))]);
   if (generation !== state.generation) return;
   state.overview = overview;
+  setViewer(overview.viewer);
   state.jobs = list.jobs;
   state.next = list.next;
   state.lastSuccess = Date.now();
@@ -428,6 +515,7 @@ async function refresh() {
   syncOptions($("filter-capability"), overview.capabilities);
   syncOptions($("filter-node"), overview.nodes.map((node) => node.name));
   renderJobs();
+  renderNote();
   if (state.openJob && $("detail").open) {
     const job = await api(`jobs/${encodeURIComponent(state.openJob)}`);
     if (state.openJob === job.id && $("detail").open) renderDetail(job);
@@ -472,13 +560,365 @@ async function openDetail(jobID) {
   }
 }
 
+// --- Signed-in viewer and pages ---
+
+function setViewer(viewer) {
+  state.admin = Boolean(viewer && viewer.admin);
+  // Only the limited kind is called out; an admin key is what the page is built for.
+  $("viewer").textContent = viewer && viewer.name ? `${viewer.name}${state.admin ? "" : " · view only"}` : "";
+  $("viewer").title = viewer && viewer.name ? `Signed in with the ${state.admin ? "admin" : "view-only"} key "${viewer.name}"` : "";
+  $("nav").hidden = !state.admin;
+  if (!state.admin && state.page === "keys") route();
+}
+
+function route() {
+  const wanted = location.hash === "#keys" && state.admin ? "keys" : "overview";
+  state.page = wanted;
+  $("page-overview").hidden = wanted !== "overview";
+  $("page-keys").hidden = wanted !== "keys";
+  for (const [id, page] of [["nav-overview", "overview"], ["nav-keys", "keys"]]) {
+    if (page === wanted) $(id).setAttribute("aria-current", "page");
+    else $(id).removeAttribute("aria-current");
+  }
+  if (wanted === "keys") loadKeys();
+}
+
+window.addEventListener("hashchange", () => { if (!$("app").hidden) route(); });
+
+// --- Confirmation ---
+
+let confirmAction = null;
+
+function askConfirm(title, text, okLabel, action) {
+  $("confirm-title").textContent = title;
+  $("confirm-text").textContent = text;
+  $("confirm-ok").textContent = okLabel;
+  $("confirm-ok").disabled = false;
+  $("confirm-error").hidden = true;
+  confirmAction = action;
+  $("confirm-dialog").showModal();
+}
+
+$("confirm-cancel").addEventListener("click", () => $("confirm-dialog").close());
+$("confirm-ok").addEventListener("click", async () => {
+  if (!confirmAction) return;
+  $("confirm-ok").disabled = true;
+  try {
+    await confirmAction();
+    $("confirm-dialog").close();
+  } catch (error) {
+    if (error instanceof AuthError) return showSignin(error.message);
+    $("confirm-error").hidden = false;
+    $("confirm-error").textContent = error.message;
+    $("confirm-ok").disabled = false;
+  }
+});
+$("confirm-dialog").addEventListener("close", () => { confirmAction = null; });
+
+// --- Machine actions ---
+
+async function testOnMachine(nodeName, tool) {
+  const pendingKey = tool ? `${nodeName}/${tool}` : nodeName;
+  state.pending.add(pendingKey);
+  if (state.overview) renderMachines(state.overview);
+  try {
+    const body = await act(`nodes/${encodeURIComponent(nodeName)}/test`, "POST", tool ? { capability: tool } : {}, [422]);
+    const started = body.tests || [];
+    const skipped = body.skipped || [];
+    const parts = [];
+    if (started.length === 1) {
+      parts.push(`${started[0].already ? "Already testing" : "Testing"} ${started[0].capability} on ${nodeName}.`);
+    } else if (started.length > 1) {
+      parts.push(`Testing ${started.length} tools on ${nodeName}.`);
+    }
+    for (const skip of skipped) parts.push(`${skip.capability}: ${skip.reason}.`);
+    setNote(parts.join(" ") || "Nothing to test.", started.length ? "good" : "warning");
+    if (started.length === 1) openDetail(started[0].job.id);
+  } catch (error) {
+    if (error instanceof AuthError) return showSignin(error.message);
+    setNote(error.message, "critical");
+  } finally {
+    state.pending.delete(pendingKey);
+    tick();
+  }
+}
+
+function removeMachine(nodeName) {
+  askConfirm(`Remove ${nodeName}?`,
+    `${nodeName} is offline. Removing it stops its token from working, so it can't connect again, and its tools are no longer offered. Its past jobs stay in the list. To add the machine back, pair it again.`,
+    "Remove machine",
+    async () => {
+      await act(`nodes/${encodeURIComponent(nodeName)}`, "DELETE");
+      setNote(`Removed ${nodeName}.`);
+      tick();
+    });
+}
+
+// --- Copying ---
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // Without a secure context or permission, fall back to a selection.
+    const area = el("textarea", "copy-buffer");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    // Outside an open modal dialog, the page is inert and can't be selected.
+    (document.querySelector("dialog[open]") || document.body).append(area);
+    area.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch { ok = false; }
+    area.remove();
+    return ok;
+  }
+}
+
+function flash(button, text) {
+  const label = button.querySelector(".label") || button;
+  const before = label.textContent;
+  label.textContent = text;
+  button.classList.add("flashed");
+  setTimeout(() => { label.textContent = before; button.classList.remove("flashed"); }, 1500);
+}
+
+function copyButton(label, getText, className = "quiet small") {
+  const button = el("button", `${className} copy`, icon("copy"), el("span", "label", label));
+  button.type = "button";
+  button.addEventListener("click", async () => {
+    try {
+      flash(button, (await copyText(await getText())) ? "Copied" : "Copy failed");
+    } catch (error) {
+      if (error instanceof AuthError) return showSignin(error.message);
+      flash(button, "Couldn't get key");
+      $("keys-error").hidden = false;
+      $("keys-error").textContent = error.message;
+    }
+  });
+  return button;
+}
+
+// --- API keys ---
+
+const secrets = new Map(); // Key ID to secret, for this page view only.
+
+async function keySecret(id) {
+  if (!secrets.has(id)) {
+    const body = await act(`keys/${encodeURIComponent(id)}/secret`, "GET");
+    secrets.set(id, body.secret);
+  }
+  return secrets.get(id);
+}
+
+async function loadKeys() {
+  try {
+    const body = await api("keys");
+    state.keys = body;
+    $("keys-error").hidden = true;
+    renderKeys();
+  } catch (error) {
+    if (error instanceof AuthError) return showSignin(error.message);
+    $("keys-error").hidden = false;
+    $("keys-error").textContent = error.message;
+  }
+}
+
+function patternList(patterns) {
+  if (patterns.length === 1 && patterns[0] === "*") return el("span", "all", "All");
+  return el("ul", "chips inline", ...patterns.map((p) => el("li", null, p)));
+}
+
+function renderKeys() {
+  const { keys, self, mcp_url: mcpURL } = state.keys;
+  $("mcp-url").textContent = mcpURL;
+  const agents = keys.filter((key) => key.kind === "agent");
+  $("key-rows").replaceChildren(...agents.map((key) => {
+    const view = actionButton(null, "quiet small", { viewKey: key.id }, !key.viewable,
+      key.viewable ? `Show ${key.name}'s key` : "This key was made before keys were kept, so it can't be shown. Make a new one to replace it.");
+    view.append(icon("eye"), el("span", "label", "View"));
+    const actions = el("div", "row-actions", view);
+    if (key.viewable) actions.append(copyButton("Copy", () => keySecret(key.id)));
+    actions.append(actionButton("Edit", "quiet small", { editKey: key.id }),
+      actionButton("Revoke", "quiet small danger-text", { revokeKey: key.id }));
+    const used = key.jobs ? `${key.jobs}` : "None";
+    const usedCell = labelled("Jobs", used);
+    if (key.last_job_at) usedCell.append(el("span", "when sub", ` · last ${ago(key.last_job_at)}`));
+    return el("tr", null,
+      labelled("Name", el("span", "key-name", key.name)),
+      labelled("Tools", patternList(key.tools)),
+      labelled("Machines", patternList(key.nodes)),
+      usedCell,
+      labelled("Created", key.created_at ? timeText(key.created_at, "when") : el("span", "when", "–")),
+      labelled("", actions));
+  }));
+  $("keys-empty").hidden = agents.length > 0;
+
+  const dashboards = keys.filter((key) => key.kind !== "agent");
+  $("dash-key-rows").replaceChildren(...dashboards.map((key) => {
+    const kind = key.kind === "admin" ? "Admin" : "View only";
+    const row = el("li", null, el("span", "key-name", key.name), el("span", "kind", kind));
+    if (key.id === self) row.append(el("span", "hint", "You're signed in with this key"));
+    else row.append(actionButton("Revoke", "quiet small danger-text", { revokeKey: key.id }));
+    return row;
+  }));
+  if (dashboards.length === 0) $("dash-key-rows").replaceChildren(el("li", "hint", "None."));
+}
+
+function keyByID(id) {
+  return state.keys && state.keys.keys.find((key) => key.id === id);
+}
+
+function codeLine(label, text) {
+  return el("div", "secret-line",
+    el("div", "secret-label", el("span", null, label), copyButton("Copy", () => text)),
+    el("pre", "secret-text", text));
+}
+
+function showSecret(title, name, secret, mcpURL, fresh) {
+  $("secret-title").textContent = title;
+  const parts = [];
+  if (fresh) parts.push(el("p", "hint", `Give this to ${name}. You can see it again here at any time while the key exists.`));
+  parts.push(codeLine("API key", secret));
+  parts.push(codeLine("MCP address", mcpURL));
+  parts.push(codeLine("Claude Code", `claude mcp add --transport http fleet ${mcpURL} --header "Authorization: Bearer ${secret}"`));
+  parts.push(codeLine(".mcp.json", JSON.stringify({ mcpServers: { fleet: { type: "http", url: mcpURL, headers: { Authorization: `Bearer ${secret}` } } } }, null, 2)));
+  parts.push(el("p", "privacy", "Anyone with this key can use the tools it allows. If it gets out, revoke it and make a new one."));
+  $("secret-body").replaceChildren(...parts);
+  if (!$("secret-dialog").open) $("secret-dialog").showModal();
+}
+
+async function viewKey(id) {
+  const key = keyByID(id);
+  try {
+    const secret = await keySecret(id);
+    showSecret(key ? key.name : "API key", key ? key.name : "", secret, state.keys.mcp_url, false);
+  } catch (error) {
+    if (error instanceof AuthError) return showSignin(error.message);
+    $("keys-error").hidden = false;
+    $("keys-error").textContent = error.message;
+  }
+}
+
+// The key form both makes keys and changes them. editing holds the key being changed.
+let editing = null;
+
+function splitPatterns(text) {
+  return text.split(",").map((p) => p.trim()).filter(Boolean);
+}
+
+function renderPick(inputID, pickID, names) {
+  const input = $(inputID);
+  const chosen = new Set(splitPatterns(input.value));
+  $(pickID).replaceChildren(...["*", ...names].map((name) => {
+    const button = el("button", "pick-chip", name === "*" ? "All" : name);
+    button.type = "button";
+    button.dataset.value = name;
+    button.setAttribute("aria-pressed", String(chosen.has(name)));
+    return button;
+  }));
+  if (names.length === 0) $(pickID).append(el("span", "hint", "Nothing is connected yet."));
+}
+
+function togglePick(inputID, value) {
+  let chosen = splitPatterns($(inputID).value);
+  if (chosen.includes(value)) chosen = chosen.filter((p) => p !== value);
+  else if (value === "*") chosen = ["*"];
+  else chosen = [...chosen.filter((p) => p !== "*"), value];
+  $(inputID).value = chosen.join(", ");
+}
+
+function syncPicks() {
+  const overview = state.overview || { capabilities: [], nodes: [] };
+  renderPick("key-tools", "key-tools-pick", overview.capabilities);
+  renderPick("key-nodes", "key-nodes-pick", overview.nodes.map((node) => node.name));
+}
+
+function openKeyForm(key) {
+  editing = key || null;
+  $("key-form-title").textContent = key ? `Change what ${key.name} can use` : "New API key";
+  $("key-form-submit").textContent = key ? "Save" : "Create key";
+  $("key-name").value = key ? key.name : "";
+  $("key-name").disabled = Boolean(key);
+  $("key-tools").value = key ? key.tools.join(", ") : "*";
+  $("key-nodes").value = key ? key.nodes.join(", ") : "*";
+  $("key-form-error").hidden = true;
+  $("key-form-submit").disabled = false;
+  syncPicks();
+  $("key-form-dialog").showModal();
+  (key ? $("key-tools") : $("key-name")).focus();
+}
+
+$("key-new").addEventListener("click", () => openKeyForm(null));
+$("key-form-close").addEventListener("click", () => $("key-form-dialog").close());
+for (const [input, pick] of [["key-tools", "key-tools-pick"], ["key-nodes", "key-nodes-pick"]]) {
+  $(pick).addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-value]");
+    if (!button) return;
+    togglePick(input, button.dataset.value);
+    syncPicks();
+  });
+  $(input).addEventListener("input", syncPicks);
+}
+
+$("key-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const tools = splitPatterns($("key-tools").value);
+  const nodes = splitPatterns($("key-nodes").value);
+  $("key-form-submit").disabled = true;
+  try {
+    if (editing) {
+      await act(`keys/${encodeURIComponent(editing.id)}`, "PUT", { tools, nodes });
+      $("key-form-dialog").close();
+    } else {
+      const name = $("key-name").value.trim();
+      const body = await act("keys", "POST", { name, tools, nodes });
+      secrets.set(body.id, body.secret);
+      $("key-form-dialog").close();
+      showSecret(`Key for ${body.name}`, body.name, body.secret, body.mcp_url, true);
+    }
+    loadKeys();
+  } catch (error) {
+    if (error instanceof AuthError) return showSignin(error.message);
+    $("key-form-error").hidden = false;
+    $("key-form-error").textContent = error.message;
+    $("key-form-submit").disabled = false;
+  }
+});
+
+function revokeKey(id) {
+  const key = keyByID(id);
+  if (!key) return;
+  const what = key.kind === "agent" ? "Agents using it lose access straight away. Jobs it already started keep running." : "It can't sign in to this page any more.";
+  askConfirm(`Revoke ${key.name}'s key?`, `${what} This can't be undone, and the name can't be used for a new key.`, "Revoke key", async () => {
+    await act(`keys/${encodeURIComponent(id)}`, "DELETE");
+    secrets.delete(id);
+    loadKeys();
+  });
+}
+
+$("page-keys").addEventListener("click", (event) => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  if (button.dataset.viewKey) viewKey(button.dataset.viewKey);
+  else if (button.dataset.editKey) openKeyForm(keyByID(button.dataset.editKey));
+  else if (button.dataset.revokeKey) revokeKey(button.dataset.revokeKey);
+});
+
+$("secret-close").addEventListener("click", () => $("secret-dialog").close());
+for (const id of ["secret-dialog", "key-form-dialog", "confirm-dialog"]) {
+  $(id).addEventListener("click", (event) => {
+    if (event.target === $(id)) $(id).close(); // A click on the backdrop.
+  });
+}
+
 // --- Events ---
 
 $("signin-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const key = $("key").value.trim();
   try {
-    await api("overview", key);
+    setViewer((await api("overview", key)).viewer);
   } catch (error) {
     $("signin-error").hidden = false;
     $("signin-error").textContent = error instanceof AuthError ? error.message : "Can't reach the gateway. Try again.";
@@ -486,6 +926,7 @@ $("signin-form").addEventListener("submit", async (event) => {
   }
   saveKey(key);
   showApp();
+  route();
   tick();
 });
 
@@ -493,6 +934,8 @@ $("signout").addEventListener("click", () => {
   saveKey("");
   state.jobs = [];
   state.overview = null;
+  state.keys = null;
+  state.admin = false;
   state.lastSuccess = 0;
   showSignin("");
 });
@@ -524,6 +967,15 @@ $("job-rows").addEventListener("click", (event) => {
   if (row && row.dataset.job) openDetail(row.dataset.job);
 });
 
+$("machines").addEventListener("click", (event) => {
+  const target = event.target.closest("button, [data-job]");
+  if (!target) return;
+  if (target.dataset.tool) testOnMachine(target.dataset.node, target.dataset.tool);
+  else if (target.dataset.testNode) testOnMachine(target.dataset.testNode, "");
+  else if (target.dataset.removeNode) removeMachine(target.dataset.removeNode);
+  else if (target.dataset.job) openDetail(target.dataset.job);
+});
+
 $("detail-close").addEventListener("click", () => $("detail").close());
 $("detail").addEventListener("close", () => { state.openJob = ""; });
 $("detail").addEventListener("click", (event) => {
@@ -543,8 +995,9 @@ setInterval(() => { if (!$("app").hidden) renderFreshness(); }, 1000);
     return;
   }
   try {
-    await api("overview", key);
+    setViewer((await api("overview", key)).viewer);
     showApp();
+    route();
     tick();
   } catch (error) {
     if (error instanceof AuthError) {

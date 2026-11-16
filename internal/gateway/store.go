@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -157,6 +158,8 @@ CREATE INDEX IF NOT EXISTS job_files_file ON job_files(file_id);
 // query while iterating rows or inside another transaction's scope.
 type Store struct {
 	db *sql.DB
+	// box seals agent keys, so the dashboard can show them again.
+	box *secretBox
 }
 
 // OpenStore opens or creates the database in dataDir.
@@ -204,7 +207,26 @@ func OpenStore(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("upgrade schema: %w", err)
 	}
-	return &Store{db: db}, nil
+	for _, column := range []struct{ table, name, definition string }{
+		// Machine name patterns a key may use. Keys made before this could use any.
+		{"api_keys", "nodes", `TEXT NOT NULL DEFAULT '["*"]'`},
+		{"api_keys", "admin", "INTEGER NOT NULL DEFAULT 0"},
+		{"api_keys", "secret_box", "TEXT NOT NULL DEFAULT ''"},
+		{"api_keys", "created_ms", "INTEGER"},
+		// The machine patterns of the key that submitted a job, which the scheduler keeps to.
+		{"jobs", "nodes", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := ensureColumn(db, column.table, column.name, column.definition); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("upgrade schema: %w", err)
+		}
+	}
+	box, err := loadSecretBox(dataDir)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("load key for stored secrets: %w", err)
+	}
+	return &Store{db: db, box: box}, nil
 }
 
 // Close closes the database.
@@ -264,26 +286,59 @@ func (s *Store) RevokeNode(ctx context.Context, name string) error {
 	return requireOneRow(s.db.ExecContext(ctx, `UPDATE nodes SET revoked_ms = ? WHERE name = ? AND revoked_ms IS NULL`, nowMS(), name))
 }
 
-// AddAPIKey creates an agent key limited to capability glob patterns.
+// AddAPIKey creates an agent key limited to capability glob patterns, on any machine.
 func (s *Store) AddAPIKey(ctx context.Context, name string, patterns []string) (string, error) {
-	secret, hash := newSecret("fk_")
-	encoded, err := json.Marshal(patterns)
+	return s.AddScopedAPIKey(ctx, name, patterns, []string{"*"})
+}
+
+// AddScopedAPIKey creates an agent key limited to capability and machine name
+// glob patterns. Its secret is kept sealed, so the dashboard can show it again.
+func (s *Store) AddScopedAPIKey(ctx context.Context, name string, tools, nodes []string) (string, error) {
+	if err := checkKeyName(name); err != nil {
+		return "", err
+	}
+	tools, err := cleanPatterns("tools", tools)
 	if err != nil {
 		return "", err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO api_keys (id, name, key_hash, capabilities) VALUES (?, ?, ?, ?)`, newID("key_"), name, hash, string(encoded))
+	if nodes, err = cleanPatterns("machines", nodes); err != nil {
+		return "", err
+	}
+	secret, hash := newSecret("fk_")
+	sealed, err := s.box.seal(secret)
 	if err != nil {
-		return "", fmt.Errorf("add key %q: %w", name, err)
+		return "", err
+	}
+	encodedTools, _ := json.Marshal(tools)
+	encodedNodes, _ := json.Marshal(nodes)
+	_, err = s.db.ExecContext(ctx, `INSERT INTO api_keys (id, name, key_hash, capabilities, nodes, secret_box, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		newID("key_"), name, hash, string(encodedTools), string(encodedNodes), sealed, nowMS())
+	if err != nil {
+		return "", keyInsertError(name, err)
 	}
 	return secret, nil
 }
 
 // AddDashboardKey creates a key that can view the dashboard and do nothing else.
 func (s *Store) AddDashboardKey(ctx context.Context, name string) (string, error) {
+	return s.addDashboardKey(ctx, name, false)
+}
+
+// AddAdminKey creates a dashboard key that can also manage keys and machines and
+// start tests. It can see every agent key, so it can do whatever they can.
+func (s *Store) AddAdminKey(ctx context.Context, name string) (string, error) {
+	return s.addDashboardKey(ctx, name, true)
+}
+
+func (s *Store) addDashboardKey(ctx context.Context, name string, admin bool) (string, error) {
+	if err := checkKeyName(name); err != nil {
+		return "", err
+	}
 	secret, hash := newSecret("fd_")
-	_, err := s.db.ExecContext(ctx, `INSERT INTO api_keys (id, name, key_hash, capabilities, dashboard) VALUES (?, ?, ?, '[]', 1)`, newID("key_"), name, hash)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO api_keys (id, name, key_hash, capabilities, dashboard, admin, created_ms) VALUES (?, ?, ?, '[]', 1, ?, ?)`,
+		newID("key_"), name, hash, boolInt(admin), nowMS())
 	if err != nil {
-		return "", fmt.Errorf("add key %q: %w", name, err)
+		return "", keyInsertError(name, err)
 	}
 	return secret, nil
 }
@@ -325,9 +380,13 @@ func (s *Store) NodeByToken(ctx context.Context, token string) (*Node, error) {
 
 // APIKey is an authenticated agent identity.
 type APIKey struct {
-	ID        string
-	Patterns  []string
-	Dashboard bool // Can view the dashboard, and can't use the agent API.
+	ID       string
+	Name     string
+	Patterns []string
+	// NodePatterns limits which machines may run the key's jobs. Empty allows any.
+	NodePatterns []string
+	Dashboard    bool // Can view the dashboard, and can't use the agent API.
+	Admin        bool // A dashboard key that can also manage keys and machines.
 	// Node is set on the short-lived key a machine uses to test its own connection.
 	// Such a key sees and runs only that machine's tools.
 	Node string
@@ -336,8 +395,9 @@ type APIKey struct {
 // APIKeyBySecret returns the active key matching a secret.
 func (s *Store) APIKeyBySecret(ctx context.Context, secret string) (*APIKey, error) {
 	var k APIKey
-	var patterns string
-	err := s.db.QueryRowContext(ctx, `SELECT id, capabilities, dashboard FROM api_keys WHERE key_hash = ? AND revoked_ms IS NULL`, hashSecret(secret)).Scan(&k.ID, &patterns, &k.Dashboard)
+	var patterns, nodes string
+	err := s.db.QueryRowContext(ctx, `SELECT id, name, capabilities, nodes, dashboard, admin FROM api_keys WHERE key_hash = ? AND revoked_ms IS NULL`, hashSecret(secret)).
+		Scan(&k.ID, &k.Name, &patterns, &nodes, &k.Dashboard, &k.Admin)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -345,6 +405,9 @@ func (s *Store) APIKeyBySecret(ctx context.Context, secret string) (*APIKey, err
 		return nil, err
 	}
 	if err := json.Unmarshal([]byte(patterns), &k.Patterns); err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(nodes), &k.NodePatterns); err != nil {
 		return nil, err
 	}
 	return &k, nil
@@ -478,6 +541,7 @@ type NewJob struct {
 	QueueTimeout   time.Duration
 	Files          map[string]string // Input field name to file ID.
 	TestNode       string            // For a test, the only node that may run it.
+	Nodes          []string          // Machine name patterns that may run it. Empty allows any.
 }
 
 // ErrIdempotencyConflict means a key was reused for a different request.
@@ -512,10 +576,18 @@ func (s *Store) CreateJob(ctx context.Context, j NewJob) (id string, created boo
 		if j.TestNode != "" {
 			testNode = j.TestNode
 		}
-		_, err := tx.Exec(`INSERT INTO jobs (id, api_key_id, capability, input, selector, idempotency_key, request_hash, status, queue_timeout_ms, queue_deadline_ms, created_ms, test_node)
-			VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		nodes := ""
+		if len(j.Nodes) > 0 && !slices.Contains(j.Nodes, "*") {
+			raw, err := json.Marshal(j.Nodes)
+			if err != nil {
+				return err
+			}
+			nodes = string(raw)
+		}
+		_, err := tx.Exec(`INSERT INTO jobs (id, api_key_id, capability, input, selector, idempotency_key, request_hash, status, queue_timeout_ms, queue_deadline_ms, created_ms, test_node, nodes)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			id, j.APIKeyID, j.Capability, j.Input, j.Selector, key, j.RequestHash, StatusQueued,
-			j.QueueTimeout.Milliseconds(), now+j.QueueTimeout.Milliseconds(), now, testNode)
+			j.QueueTimeout.Milliseconds(), now+j.QueueTimeout.Milliseconds(), now, testNode, nodes)
 		if err != nil {
 			return err
 		}

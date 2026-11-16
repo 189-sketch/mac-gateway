@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -95,7 +96,7 @@ func (g *Gateway) mcpToolList(ctx context.Context, key *APIKey) ([]mcpTool, erro
 	offers := map[string]*offer{}
 	var names []string
 	for _, row := range rows {
-		if !keyAllows(key, row.Name) || (key.Node != "" && row.NodeID != key.Node) {
+		if !keyAllowsOffer(key, row) {
 			continue
 		}
 		o := offers[row.Name]
@@ -327,8 +328,8 @@ func (req *mcpRequest) runCapability(ctx context.Context, tool *mcpTool, argumen
 	}
 	// A job no machine can take now would only wait in the queue, so say why
 	// instead, while the agent can still do something about it.
-	if !g.onlineNodes().offers(tool.capability, nil, req.key.Node) {
-		return toolError("%s", g.unavailableReason(ctx, tool.capability)), nil
+	if !g.onlineNodes().offers(tool.capability, nil, req.key.Node, req.key.NodePatterns) {
+		return toolError("%s", g.unavailableReason(ctx, req.key, tool.capability)), nil
 	}
 	view, _, failure := g.submitJob(ctx, req.key, createJobRequest{Capability: tool.capability, Input: input, Files: files, testNode: req.key.Node})
 	if failure != nil {
@@ -343,8 +344,9 @@ func (req *mcpRequest) runCapability(ctx context.Context, tool *mcpTool, argumen
 }
 
 // unavailableReason says why no machine can run a capability now.
-func (g *Gateway) unavailableReason(ctx context.Context, capability string) string {
+func (g *Gateway) unavailableReason(ctx context.Context, key *APIKey, capability string) string {
 	rows, err := g.store.CapabilityRows(ctx, capability)
+	rows = slices.DeleteFunc(rows, func(row CapabilityRow) bool { return !keyAllowsOffer(key, row) })
 	if err != nil || len(rows) == 0 {
 		return fmt.Sprintf("No machine offers %s any more.", capability)
 	}
@@ -706,7 +708,7 @@ func (req *mcpRequest) status(ctx context.Context) (map[string]any, *rpcError) {
 	byNode := map[string]*machine{}
 	var order []string
 	for _, row := range rows {
-		if !keyAllows(req.key, row.Name) {
+		if !keyAllowsOffer(req.key, row) {
 			continue
 		}
 		m := byNode[row.NodeName]
